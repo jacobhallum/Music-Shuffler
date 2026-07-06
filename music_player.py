@@ -26,6 +26,7 @@ import re
 import queue
 from collections import deque
 from shuffle_core import CustomShuffleAlgorithm
+import playlist_queue
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
@@ -480,6 +481,8 @@ class MusicPlayerGUI:
         self.filtered_playlist = []    # For search filtering
         self._search_job = None        # For search debouncing
         self.current_index = 0
+        self.queued_count = 0          # Manually-queued tracks right after current_index
+        self.is_temp_view = False      # True when current_playlist is a taken-over search view
 
         # Recent play history for shuffle history guard (Task 5)
         # Stores (normalized_filepath, artist_key_or_None) tuples
@@ -492,10 +495,6 @@ class MusicPlayerGUI:
         self._metadata_lock = threading.Lock()  # Protects self.player_metadata
         self._tracks_lock = threading.Lock()  # Protects self.all_tracks during scan
 
-        # Up Next queue
-        self.up_next = deque()
-        self.up_next_set = set()  # Filepath deduplication
-        
         # Library stats
         self.total_tracks = 0
         self.total_artists = 0
@@ -3261,7 +3260,7 @@ class MusicPlayerGUI:
         ttk.Button(btn_frame, text="Apply Filter", command=apply_filter).grid(row=0, column=0, padx=5)
         ttk.Button(btn_frame, text="Reset to All", command=reset_filter).grid(row=0, column=1, padx=5)
     
-    def apply_shuffle(self, algo=None):
+    def apply_shuffle(self, algo=None, auto_play=False):
         """Apply selected shuffle algorithm"""
         if not self.all_tracks:
             messagebox.showwarning("Warning", "No tracks loaded")
@@ -3297,7 +3296,7 @@ class MusicPlayerGUI:
                             # If this shuffle is stale, ensure nav isn't left disabled
                             self._set_navigation_enabled(True)
                             return
-                        self._apply_shuffle_results(result, algo)
+                        self._apply_shuffle_results(result, algo, auto_play=auto_play)
                     
                     try:
                         self.root.after(0, apply_if_latest)
@@ -3319,22 +3318,24 @@ class MusicPlayerGUI:
         
         # Non-smart shuffles should never leave nav disabled
         self._set_navigation_enabled(True)
-        
+
         currently_playing_track = None
         if self.is_playing and self.current_playlist and 0 <= self.current_index < len(self.current_playlist):
             currently_playing_track = self.current_playlist[self.current_index]
-        
+
         # Only Truly Random remains (everything else is Smart Shuffle)
         self.current_playlist = CustomShuffleAlgorithm.truly_random(self.all_tracks)
-        
+        self.queued_count = 0
+        self.is_temp_view = False
+
         # Move currently playing track to position 0
-        if currently_playing_track:
+        if currently_playing_track and not auto_play:
             try:
                 # Find and remove the currently playing track from the shuffled playlist
-                playing_index = next(i for i, t in enumerate(self.current_playlist) 
+                playing_index = next(i for i, t in enumerate(self.current_playlist)
                                    if self._norm_path(t.filepath) == self._norm_path(currently_playing_track.filepath))
                 self.current_playlist.pop(playing_index)
-                
+
                 # Insert it at the beginning
                 self.current_playlist.insert(0, currently_playing_track)
                 self.current_index = 0
@@ -3342,28 +3343,31 @@ class MusicPlayerGUI:
                 self.current_index = 0
         else:
             self.current_index = 0
-        
+
         # Clear search filter to show full shuffled playlist
         self.filtered_playlist = []
         self.search_var.set('')
-        
+
         self.display_playlist()
         self.status_label.config(text=f"✓ {algo} applied to {len(self.current_playlist)} tracks")
+
+        if auto_play:
+            self.play_track_at_index(0)
     
-    def _apply_shuffle_results(self, playlist, algo):
+    def _apply_shuffle_results(self, playlist, algo, auto_play=False):
         """Apply shuffle results on main thread"""
         currently_playing_track = None
         if self.is_playing and self.current_playlist and 0 <= self.current_index < len(self.current_playlist):
             currently_playing_track = self.current_playlist[self.current_index]
-        
+
         # Move currently playing track to position 0
-        if currently_playing_track:
+        if currently_playing_track and not auto_play:
             try:
                 # Find and remove the currently playing track from the shuffled playlist
-                playing_index = next(i for i, t in enumerate(playlist) 
+                playing_index = next(i for i, t in enumerate(playlist)
                                    if self._norm_path(t.filepath) == self._norm_path(currently_playing_track.filepath))
                 playlist.pop(playing_index)
-                
+
                 # Insert it at the beginning
                 playlist.insert(0, currently_playing_track)
                 self.current_index = 0
@@ -3372,14 +3376,19 @@ class MusicPlayerGUI:
                 self.current_index = 0
         else:
             self.current_index = 0
-        
+
         self.current_playlist = playlist
+        self.queued_count = 0
+        self.is_temp_view = False
         self.filtered_playlist = []  # Clear search filter
         self.search_var.set('')  # Clear search box
         self.display_playlist()
         self.status_label.config(text=f"✓ {algo} applied to {len(self.current_playlist)} tracks")
-        
+
         self._set_navigation_enabled(True)
+
+        if auto_play:
+            self.play_track_at_index(0)
     
     def display_playlist(self):
         """Display playlist in treeview"""
@@ -3414,19 +3423,26 @@ class MusicPlayerGUI:
         if selection:
             item = selection[0]
             display_index = int(self.playlist_tree.item(item, 'text')) - 1
-            
-            # If search is active, map from filtered view to actual playlist
+
+            # If search is active, the displayed (filtered) list takes over as
+            # the main playlist, in displayed order, starting at the click.
             if self.filtered_playlist:
                 if display_index < len(self.filtered_playlist):
-                    clicked_track = self.filtered_playlist[display_index]
-                    # Find this track in the actual playlist
-                    try:
-                        actual_index = self.current_playlist.index(clicked_track)
-                        self.play_track_at_index(actual_index)
-                    except ValueError:
-                        pass
+                    self._takeover_playlist(self.filtered_playlist, display_index)
             else:
+                self.queued_count = 0
                 self.play_track_at_index(display_index)
+
+    def _takeover_playlist(self, tracks, start_index):
+        """Make the given (displayed) track order the main playlist and play
+        from start_index. Used when a search/filtered view is clicked."""
+        self.current_playlist = list(tracks)
+        self.filtered_playlist = []
+        self.search_var.set('')
+        self.queued_count = 0
+        self.is_temp_view = True
+        self.display_playlist()
+        self.play_track_at_index(start_index)
     
     def _schedule_filter(self):
         """Schedule a debounced search filter update"""
@@ -3475,24 +3491,11 @@ class MusicPlayerGUI:
         self.search_entry.focus()
     
     def _play_first_result(self):
-        """Play first search result when Enter is pressed"""
+        """Play first search result when Enter is pressed - takes over the playlist"""
         if not self.filtered_playlist:
             return
 
-        first_track = self.filtered_playlist[0]
-        target_fp = self._norm_path(first_track.filepath)
-
-        # Task 2: use _norm_path for reliable cross-case/separator comparison
-        for i, track in enumerate(self.current_playlist):
-            if self._norm_path(getattr(track, 'filepath', '')) == target_fp:
-                self.play_track_at_index(i)
-                return
-
-        # Fallback: track not found in current playlist (shouldn't happen post-Task 2)
-        self.current_playlist = [first_track]
-        self.current_index = 0
-        self.play_track_at_index(0)
-        self.display_playlist()
+        self._takeover_playlist(self.filtered_playlist, 0)
     
     # Up Next Queue Methods
     
@@ -3541,13 +3544,20 @@ class MusicPlayerGUI:
             self.queue_track(track, play_next=False)
     
     def queue_track(self, track, play_next=False):
-        """Add track to Up Next queue"""
+        """Move track into the queued block right after the current song"""
         fp = getattr(track, 'filepath', None)
         if not fp:
             return
 
         # Task 2: normalise paths for reliable cross-case/separator comparison
         norm_fp = self._norm_path(fp)
+
+        if not self.current_playlist:
+            self.current_playlist = [track]
+            self.current_index = 0
+            self.is_temp_view = False
+            self.play_track_at_index(0)
+            return
 
         # Don't queue currently playing track
         if 0 <= self.current_index < len(self.current_playlist):
@@ -3556,62 +3566,84 @@ class MusicPlayerGUI:
                 self.status_label.config(text="Cannot queue currently playing track")
                 return
 
-        # Check if already queued (deduplication via normalised path set)
-        if norm_fp in self.up_next_set:
-            self.status_label.config(text="Already in Up Next")
-            return
+        existing_index = None
+        for i, t in enumerate(self.current_playlist):
+            if self._norm_path(getattr(t, 'filepath', '')) == norm_fp:
+                existing_index = i
+                break
+
+        remove_index, insert_index, new_current_index, new_queued_count = (
+            playlist_queue.queue_target(
+                self.current_index, self.queued_count, play_next, existing_index
+            )
+        )
+
+        if remove_index is not None:
+            self.current_playlist.pop(remove_index)
+        self.current_playlist.insert(insert_index, track)
+        self.current_index = new_current_index
+        self.queued_count = new_queued_count
 
         if play_next:
-            self.up_next.appendleft(track)
             self.status_label.config(text=f"▶ Will play next: {track.title}")
         else:
-            self.up_next.append(track)
-            self.status_label.config(text=f"Added to Up Next ({len(self.up_next)} queued)")
+            self.status_label.config(text=f"Added to Up Next ({self.queued_count} queued)")
 
-        self.up_next_set.add(norm_fp)
+        self.display_playlist()
     
+    def _get_queued_tracks(self):
+        """Tracks in the queued block right after the current song"""
+        start = self.current_index + 1
+        end = start + self.queued_count
+        return self.current_playlist[start:end]
+
     def view_up_next(self):
         """Show Up Next queue in a dialog"""
+        queued = self._get_queued_tracks()
+
         dialog = tk.Toplevel(self.root)
         dialog.title("Up Next Queue")
         dialog.geometry("500x400")
-        
-        if not self.up_next:
-            ttk.Label(dialog, text="Up Next queue is empty", 
+
+        if not queued:
+            ttk.Label(dialog, text="Up Next queue is empty",
                      font=('Arial', 12)).pack(pady=50)
             ttk.Button(dialog, text="Close", command=dialog.destroy).pack()
             return
-        
-        ttk.Label(dialog, text=f"{len(self.up_next)} tracks in queue:", 
+
+        ttk.Label(dialog, text=f"{len(queued)} tracks in queue:",
                  font=('Arial', 12, 'bold')).pack(pady=10)
-        
+
         # List of queued tracks
         frame = ttk.Frame(dialog, padding=10)
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
         listbox = tk.Listbox(frame, font=('Arial', 10))
         listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
+
         scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=listbox.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         listbox.config(yscrollcommand=scrollbar.set)
-        
-        for i, track in enumerate(self.up_next, 1):
+
+        for i, track in enumerate(queued, 1):
             listbox.insert(tk.END, f"{i}. {track.artist} - {track.title}")
-        
+
         # Buttons
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(pady=10)
-        ttk.Button(btn_frame, text="Clear Queue", 
+        ttk.Button(btn_frame, text="Clear Queue",
                   command=lambda: (self.clear_up_next(), dialog.destroy())).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Close", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
-    
+
     def clear_up_next(self):
         """Clear Up Next queue"""
-        count = len(self.up_next)
-        self.up_next.clear()
-        self.up_next_set.clear()
+        count = self.queued_count
         if count > 0:
+            start = self.current_index + 1
+            end = start + count
+            del self.current_playlist[start:end]
+            self.queued_count = 0
+            self.display_playlist()
             self.status_label.config(text=f"Cleared {count} tracks from Up Next")
         else:
             self.status_label.config(text="Up Next queue already empty")
@@ -3827,39 +3859,22 @@ class MusicPlayerGUI:
                 self._update_track_metadata(track)
                 print(f"⏭ Skipped: {track.title} (skips: {track.skips})")
         
-        # Up Next queue takes priority
-        if self.up_next:
-            next_track = self.up_next.popleft()
-            fp = getattr(next_track, 'filepath', None)
-            if fp:
-                norm_fp = self._norm_path(fp)
-                self.up_next_set.discard(norm_fp)
-            
-            # Try to find track in current playlist
-            idx = None
-            norm_fp = self._norm_path(fp)
-            for i, t in enumerate(self.current_playlist):
-                track_fp = getattr(t, 'filepath', None)
-                if track_fp and self._norm_path(track_fp) == norm_fp:
-                    idx = i
-                    break
-            
-            if idx is not None:
-                # Track is in current playlist - play it
-                self.current_index = idx
-                self.play_track_at_index(self.current_index)
-                print(f"▶ Playing from Up Next: {next_track.title}")
-            else:
-                # Track not in current playlist - add it temporarily
-                self.current_playlist.insert(self.current_index + 1, next_track)
-                self.current_index += 1
-                self.play_track_at_index(self.current_index)
-                print(f"▶ Playing from Up Next: {next_track.title}")
-                self.display_playlist()
+        action, new_index, new_queued_count, new_is_temp_view = playlist_queue.advance(
+            self.current_index, len(self.current_playlist), self.queued_count, self.is_temp_view
+        )
+
+        if action == 'stop':
             return
-        
-        # Normal next track behavior
-        self.current_index = (self.current_index + 1) % len(self.current_playlist)
+
+        if action == 'reshuffle':
+            self.queued_count = 0
+            self.is_temp_view = False
+            self.apply_shuffle(auto_play=True)
+            return
+
+        self.current_index = new_index
+        self.queued_count = new_queued_count
+        self.is_temp_view = new_is_temp_view
         self.play_track_at_index(self.current_index)
     
     def previous_track(self):
@@ -3871,7 +3886,10 @@ class MusicPlayerGUI:
             print("⚠ Navigation disabled during shuffle")
             return
         
-        self.current_index = (self.current_index - 1) % len(self.current_playlist)
+        self.current_index = playlist_queue.previous_position(
+            self.current_index, len(self.current_playlist)
+        )
+        self.queued_count = 0
         self.play_track_at_index(self.current_index)
     
     def start_update_thread(self):
