@@ -6,6 +6,7 @@ Old/
 
 # Compiled binaries
 *.exe
+*.spec
 dist/
 build/
 

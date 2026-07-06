@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from utlities.library_manager import (
     TrackInfo, AlbumInfo, DRMError,
     iTunesXMLReader, MetadataWriter, iTunesCOMRefresher,
-    LibraryManagerApp, _extract_artwork_bytes,
+    LibraryManagerApp, _extract_artwork_bytes, _renumber_disc,
 )
 
 
@@ -411,6 +411,99 @@ class TestLibraryManagerAppState(unittest.TestCase):
         self.assertEqual(app._albums[0].key, new_key)
         self.assertEqual(app._albums[0].album_name, 'New Album')
         self.assertEqual(app._albums[0].display_artist, 'New Artist')
+
+
+class TestRenumberDisc(unittest.TestCase):
+
+    def _make_track(self, file_path, track_number):
+        return TrackInfo(
+            title='t', artist='a', album='al', album_artist='a',
+            year='2020', genre='g', composer='c', comment='',
+            track_number=track_number, disc_number=0, bpm=0, rating=0,
+            date_added=None, file_path=file_path,
+        )
+
+    def test_drm_track_keeps_original_number_and_does_not_shift_later_tracks(self):
+        # b's original number (99) is unrelated to its row position — a real
+        # DRM-purchased file can carry any leftover tag value. c and d must
+        # land on their own row position regardless, not be shifted to
+        # compact around b's failure (shifting cascades unpredictably and
+        # was reverted after it forced ~130 needless rewrites on a real
+        # library — see gotcha_library_manager_renumber.md).
+        t1 = self._make_track('one.mp3', 1)
+        t2 = self._make_track('two.mp3', 99)   # DRM — can't be renumbered
+        t3 = self._make_track('three.mp3', 3)
+        t4 = self._make_track('four.mp3', 4)
+
+        def write_track_number(track):
+            if track.file_path == 'two.mp3':
+                raise DRMError('drm')
+            return []
+
+        disc_tracks = [(0, t1), (1, t2), (2, t3), (3, t4)]
+        successful, drm_count, write_errors, file_written = _renumber_disc(
+            disc_tracks, write_track_number
+        )
+
+        self.assertEqual(drm_count, 1)
+        self.assertEqual(write_errors, [])
+        numbered = {track.file_path: num for _, num, track in successful}
+        self.assertEqual(numbered['one.mp3'], 1)
+        self.assertEqual(numbered['three.mp3'], 3)
+        self.assertEqual(numbered['four.mp3'], 4)
+        self.assertEqual(t2.track_number, 99)
+        self.assertEqual(file_written, [])  # 3 and 4 already matched their row position
+
+    def test_write_error_track_keeps_original_number_and_does_not_shift_later_tracks(self):
+        t1 = self._make_track('one.mp3', 1)
+        t2 = self._make_track('two.mp3', 99)   # write fails (non-DRM error)
+        t3 = self._make_track('three.mp3', 3)
+
+        def write_track_number(track):
+            if track.file_path == 'two.mp3':
+                return ['disk full']
+            return []
+
+        disc_tracks = [(0, t1), (1, t2), (2, t3)]
+        successful, drm_count, write_errors, file_written = _renumber_disc(
+            disc_tracks, write_track_number
+        )
+
+        self.assertEqual(drm_count, 0)
+        self.assertEqual(write_errors, ['disk full'])
+        numbered = {track.file_path: num for _, num, track in successful}
+        self.assertEqual(numbered['one.mp3'], 1)
+        self.assertEqual(numbered['three.mp3'], 3)
+        self.assertEqual(t2.track_number, 99)
+
+    def test_tracks_already_matching_row_position_are_not_rewritten(self):
+        tracks = [self._make_track(f'{i}.mp3', i) for i in range(1, 5)]
+        disc_tracks = list(enumerate(tracks))
+
+        def write_track_number(track):
+            raise AssertionError('should not attempt a write when already correct')
+
+        successful, drm_count, write_errors, file_written = _renumber_disc(
+            disc_tracks, write_track_number
+        )
+
+        self.assertEqual(len(successful), 4)
+        self.assertEqual(file_written, [])
+        self.assertEqual(write_errors, [])
+
+    def test_all_tracks_fail_returns_empty_successful(self):
+        t1 = self._make_track('one.mp3', 5)
+
+        def write_track_number(track):
+            raise DRMError('drm')
+
+        successful, drm_count, write_errors, file_written = _renumber_disc(
+            [(0, t1)], write_track_number
+        )
+
+        self.assertEqual(successful, [])
+        self.assertEqual(drm_count, 1)
+        self.assertEqual(t1.track_number, 5)
 
 
 class TestITunesCOMRefresher(unittest.TestCase):

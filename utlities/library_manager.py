@@ -9,6 +9,7 @@ from urllib.parse import unquote, urlparse
 from datetime import datetime
 from dataclasses import dataclass
 from collections import defaultdict
+from typing import Callable
 import io
 import base64
 
@@ -101,6 +102,58 @@ def _album_key_for_track(track: TrackInfo) -> tuple[str, str]:
         track.artist, track.album_artist, track.album, track.compilation
     )
     return key
+
+
+def _renumber_disc(
+    disc_tracks: list[tuple[int, TrackInfo]],
+    write_track_number: Callable[[TrackInfo], list[str]],
+) -> tuple[list[tuple[int, int, TrackInfo]], int, list[str], list[str]]:
+    """Assign track numbers 1..N to one disc's tracks by row position.
+
+    A track that can't be written (DRM or write error) keeps its original
+    number, leaving a gap at that position — later tracks are NOT shifted to
+    compact around it. Shifting was tried (twice) and reverted: a failed
+    track's retained original number rarely lines up with the compacted
+    sequence, and any attempt to route around it uses shared state that
+    cascades — one bad revert forced ~130 needless rewrites across an
+    otherwise-untouched real library (see gotcha_library_manager_renumber.md
+    in project memory). A leftover gap, or in rare cases a duplicate number
+    where a reverted track's original happens to match another track's row
+    position, is preferable to a cascading rewrite of the whole disc.
+    Returns (successful[(row, new_num, track)], drm_count, write_errors, file_written).
+    """
+    successful: list[tuple[int, int, TrackInfo]] = []
+    write_errors: list[str] = []
+    file_written: list[str] = []
+    drm_count = 0
+
+    for new_num, (row, track) in enumerate(disc_tracks, start=1):
+        orig_num = track.track_number
+        try:
+            if orig_num == new_num:
+                successful.append((row, new_num, track))
+                print(f'[library_manager]   --    {new_num:>3}  {Path(track.file_path).name} (unchanged)', flush=True)
+                continue
+            track.track_number = new_num
+            errs = write_track_number(track)
+            if errs:
+                write_errors.extend(errs)
+                track.track_number = orig_num
+                print(f'[library_manager]   SKIP  {Path(track.file_path).name}: {errs[0]}', flush=True)
+            else:
+                successful.append((row, new_num, track))
+                file_written.append(track.file_path)
+                print(f'[library_manager]   OK    {new_num:>3}  {Path(track.file_path).name}', flush=True)
+        except DRMError:
+            track.track_number = orig_num
+            drm_count += 1
+            print(f'[library_manager]   DRM   {Path(track.file_path).name}', flush=True)
+        except Exception as e:
+            track.track_number = orig_num
+            write_errors.append(str(e))
+            print(f'[library_manager]   ERR   {Path(track.file_path).name}: {e}', flush=True)
+
+    return successful, drm_count, write_errors, file_written
 
 
 # ── iTunesXMLReader ───────────────────────────────────────────────────────────
@@ -1162,31 +1215,13 @@ class LibraryManagerApp(QMainWindow):
         file_written: list[str] = []                        # paths actually written to disk (COM sync)
 
         for disc in sorted(by_disc.keys()):
-            for new_num, (row, track) in enumerate(by_disc[disc], start=1):
-                orig_num = track.track_number
-                try:
-                    if orig_num == new_num:
-                        successful.append((row, new_num, track))
-                        print(f'[library_manager]   --    {new_num:>3}  {Path(track.file_path).name} (unchanged)', flush=True)
-                        continue
-                    track.track_number = new_num
-                    errs = self._writer.write_track_number(track)
-                    if errs:
-                        write_errors.extend(errs)
-                        track.track_number = orig_num  # revert — file not written
-                        print(f'[library_manager]   SKIP  {Path(track.file_path).name}: {errs[0]}', flush=True)
-                    else:
-                        successful.append((row, new_num, track))
-                        file_written.append(track.file_path)
-                        print(f'[library_manager]   OK    {new_num:>3}  {Path(track.file_path).name}', flush=True)
-                except DRMError:
-                    track.track_number = orig_num
-                    drm_count += 1
-                    print(f'[library_manager]   DRM   {Path(track.file_path).name}', flush=True)
-                except Exception as e:
-                    track.track_number = orig_num
-                    write_errors.append(str(e))
-                    print(f'[library_manager]   ERR   {Path(track.file_path).name}: {e}', flush=True)
+            disc_successful, disc_drm, disc_errors, disc_written = _renumber_disc(
+                by_disc[disc], self._writer.write_track_number
+            )
+            successful.extend(disc_successful)
+            drm_count += disc_drm
+            write_errors.extend(disc_errors)
+            file_written.extend(disc_written)
 
         for row, new_num, _ in successful:
             self._song_table.item(row, 0).setText(str(new_num))
