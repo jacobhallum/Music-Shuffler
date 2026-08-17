@@ -27,6 +27,7 @@ import queue
 from collections import deque
 from shuffle_core import CustomShuffleAlgorithm
 import playlist_queue
+import appcommand
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
@@ -473,7 +474,17 @@ class MusicPlayerGUI:
         self.root.minsize(550, 650)
         self.root.resizable(False, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        
+
+        # WM_APPCOMMAND window subclass state (set up in _setup_wm_appcommand_hook)
+        self._appcmd_hwnd = None
+        self._appcmd_old_proc = None
+        self._appcmd_wndproc = None
+        self._appcmd_set_window_long = None
+        # Small deque, not a single slot: a burst of dial presses within one
+        # 50ms poll window must not silently overwrite/drop earlier presses.
+        self._appcmd_pending = deque()
+        self._appcmd_poll_job = None
+
         # Music library
         self.library_tracks = []       # Full scanned library (source of truth)
         self.all_tracks = []           # Active working subset (filtered view)
@@ -1331,7 +1342,9 @@ class MusicPlayerGUI:
         """Setup keyboard shortcuts for playback controls"""
         # Media keys (sent by fnlock from F5-F11) handle playback globally
         self._setup_global_media_keys()
-        
+        # Hardware media dial (sent by fnlock as a real WM_APPCOMMAND) — foreground-only
+        self._setup_wm_appcommand_hook()
+
         print("Keyboard shortcuts enabled:")
         print("  Media keys control playback globally (works out of focus)")
     
@@ -1348,11 +1361,6 @@ class MusicPlayerGUI:
         def ui_call(fn, label):
             print(f"[MEDIA KEY] {label} triggered → dispatching to UI thread")
             self.root.after(0, fn)
-
-        def _key_hook(event):
-            if event.event_type == 'down':
-                print(f"[KEY HOOK] name={repr(event.name)} scan={event.scan_code}")
-        keyboard.hook(_key_hook)
 
         # F5-F8: intercept raw F-keys before fnlock translates them (keyboard lib
         # hook installs after fnlock so fires first in Windows LIFO hook chain).
@@ -1390,7 +1398,127 @@ class MusicPlayerGUI:
                 print(f"  {key}")
             print("  Try running as administrator")
             print("  Or close other apps using these keys")
-    
+
+    def _setup_wm_appcommand_hook(self):
+        """Subclass this window's WNDPROC to receive WM_APPCOMMAND (hardware media dial).
+
+        Unlike the global keyboard hook above, WM_APPCOMMAND is only delivered to the
+        foreground window — this only fires while the app is focused. Focus-independent
+        control would require registering with Windows' System Media Transport Controls
+        (SMTC) instead; not done here, deliberately, to keep this change small.
+        """
+        try:
+            import ctypes
+            from ctypes import wintypes
+        except ImportError:
+            return
+
+        try:
+            self.root.update_idletasks()
+            raw_hwnd = self.root.winfo_id()
+
+            LRESULT = ctypes.c_ssize_t
+            LONG_PTR = ctypes.c_ssize_t
+            GWLP_WNDPROC = -4
+            GA_ROOT = 2
+
+            WNDPROC = ctypes.WINFUNCTYPE(
+                LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            )
+
+            user32 = ctypes.WinDLL('user32', use_last_error=True)
+
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+
+            user32.CallWindowProcW.argtypes = [
+                LONG_PTR, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
+            ]
+            user32.CallWindowProcW.restype = LRESULT
+
+            set_window_long = getattr(user32, 'SetWindowLongPtrW', None) or user32.SetWindowLongW
+            set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
+            set_window_long.restype = LONG_PTR
+
+            # winfo_id() can return a child HWND; WM_APPCOMMAND bubbles up to the
+            # top-level via DefWindowProc, so a child-window subclass would never see it.
+            hwnd = user32.GetAncestor(raw_hwnd, GA_ROOT) or raw_hwnd
+
+            actions = {
+                'play_pause': (self.toggle_play_pause, 'Play/Pause (dial)'),
+                'next': (self.next_track, 'Next (dial)'),
+                'previous': (self.previous_track, 'Previous (dial)'),
+                'stop': (self.stop, 'Stop (dial)'),
+            }
+
+            def wndproc_callback(hwnd_arg, msg, wparam, lparam):
+                # WM_APPCOMMAND arrives via a cross-process SendMessage, so Windows
+                # calls this callback reentrantly, nested inside Tcl's own blocked
+                # GetMessage wait (Tcl releases the GIL while waiting for messages).
+                # Reacquiring the GIL to run this Python code is fine (that's what
+                # ctypes' callback trampoline is for), but calling back into
+                # Tkinter/Tcl itself (e.g. root.after) from this nested context
+                # corrupts Tcl's own saved thread-state and crashes the process with
+                # an unrecoverable "GIL is released" fatal error the moment control
+                # returns to Tcl's notifier. So: touch nothing Tcl-related here.
+                # Just record the action and return — a root.after-scheduled poller
+                # (running in Tcl's own normal, non-reentrant loop) does the dispatch.
+                try:
+                    if msg == appcommand.WM_APPCOMMAND:
+                        cmd = appcommand.appcommand_from_lparam(lparam)
+                        action_name = appcommand.action_for_cmd(cmd)
+                        print(f"[APPCOMMAND] cmd={cmd} action={action_name}", flush=True)
+                        entry = actions.get(action_name)
+                        if entry is not None:
+                            self._appcmd_pending.append(entry)
+                            return 1
+                    if self._appcmd_old_proc:
+                        return user32.CallWindowProcW(self._appcmd_old_proc, hwnd_arg, msg, wparam, lparam)
+                except Exception as e:
+                    print(f"⚠ Error handling window message (msg={msg}): {e}", flush=True)
+                return 0
+
+            # Keep a strong reference before installing — a GC'd ctypes callback
+            # crashes the app on the next message delivered to this window.
+            self._appcmd_wndproc = WNDPROC(wndproc_callback)
+            callback_ptr = ctypes.cast(self._appcmd_wndproc, ctypes.c_void_p).value
+
+            ctypes.set_last_error(0)
+            old_proc = set_window_long(hwnd, GWLP_WNDPROC, callback_ptr)
+            if old_proc == 0 and ctypes.get_last_error() != 0:
+                print("⚠ Media dial hook disabled: SetWindowLong failed")
+                self._appcmd_wndproc = None
+                return
+
+            self._appcmd_hwnd = hwnd
+            self._appcmd_old_proc = old_proc
+            self._appcmd_set_window_long = set_window_long
+            print("✓ Media dial hook enabled (works only while window is focused)")
+            self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
+        except Exception as e:
+            print(f"⚠ Media dial hook disabled: {e}")
+            self._appcmd_wndproc = None
+            self._appcmd_old_proc = None
+
+    def _poll_appcommand_pending(self):
+        """Dispatch media-dial actions recorded by the WNDPROC hook.
+
+        Runs entirely within Tk's own normal event loop turn (scheduled via
+        root.after), never inside the reentrant WNDPROC callback itself — see
+        the comment in _setup_wm_appcommand_hook for why that split is required.
+        """
+        while self._appcmd_pending:
+            fn, label = self._appcmd_pending.popleft()
+            print(f"[APPCOMMAND] {label} triggered → dispatching to UI thread")
+            try:
+                fn()
+            except Exception as e:
+                print(f"⚠ Error running dial action '{label}': {e}")
+        try:
+            self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
+        except tk.TclError:
+            pass
+
     def _set_dark_title_bar(self):
         """Set title bar color to match theme (Windows 10/11)"""
         try:
@@ -2304,6 +2432,28 @@ class MusicPlayerGUI:
             import keyboard
             keyboard.unhook_all_hotkeys()
         except (ImportError, Exception):
+            pass
+
+        # Stop the media-dial poll loop before the window is destroyed.
+        if self._appcmd_poll_job:
+            try:
+                self.root.after_cancel(self._appcmd_poll_job)
+            except Exception:
+                pass
+            self._appcmd_poll_job = None
+
+        # Restore original WNDPROC before the window is destroyed — restoring
+        # after destroy() would target a dead HWND. Only drop the callback
+        # reference once restore actually succeeds: if it fails, the window is
+        # still subclassed to our proc, so a GC'd callback would crash on the
+        # next message (including the ones destroy() itself generates).
+        try:
+            if self._appcmd_old_proc and self._appcmd_set_window_long and self._appcmd_hwnd:
+                GWLP_WNDPROC = -4
+                self._appcmd_set_window_long(self._appcmd_hwnd, GWLP_WNDPROC, self._appcmd_old_proc)
+                self._appcmd_old_proc = None
+                self._appcmd_wndproc = None
+        except Exception:
             pass
 
         try:
@@ -4024,6 +4174,15 @@ class MusicPlayerGUI:
 
 
 def main():
+    # Console codepage (e.g. cp1252) can't encode the ✓/⚠ glyphs used in status
+    # prints below; this raises UnicodeEncodeError whenever stdout isn't a real
+    # console (piped, redirected to a file). Force UTF-8 so those prints never crash.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, ValueError):
+            pass
+
     print("="*70)
     print("Custom Shuffle Music Player V2 - Starting...")
     print("Unified metadata system - all tracks tracked equally")
