@@ -11,7 +11,7 @@ V2 CHANGES (2025-01):
 FEATURES:
 - Smart Shuffle v2 with novelty curve fix (0-play tracks = 0.5, not 1.0)
 - Background .m4a pre-conversion (iTunes Media folder)
-- Global media keys (F5-F8)
+- Media keys: F9-F11 global (volume), F5-F8 + hardware dial foreground-only (via fnlock/WM_APPCOMMAND)
 - Search & filter (8K+ library)
 - Up Next queue system
 - Album artwork display
@@ -1340,16 +1340,23 @@ class MusicPlayerGUI:
     
     def setup_keyboard_shortcuts(self):
         """Setup keyboard shortcuts for playback controls"""
-        # Media keys (sent by fnlock from F5-F11) handle playback globally
+        # Volume keys (fnlock-translated F9-F11) handle volume globally, even unfocused
         self._setup_global_media_keys()
-        # Hardware media dial (sent by fnlock as a real WM_APPCOMMAND) — foreground-only
+        # Transport keys (F5-F8) and the hardware media dial both arrive as a real
+        # WM_APPCOMMAND — fnlock owns the physical-key-to-action mapping, this app
+        # just reacts to whatever command it actually sends. Foreground-only.
         self._setup_wm_appcommand_hook()
 
         print("Keyboard shortcuts enabled:")
-        print("  Media keys control playback globally (works out of focus)")
-    
+        print("  Volume keys work globally (out of focus); transport keys/dial need focus")
+
     def _setup_global_media_keys(self):
-        """Enable media keys even when the window is not focused"""
+        """Enable the volume keys even when the window is not focused.
+
+        Transport keys (F5-F8) and the dial are handled separately, via the real
+        WM_APPCOMMAND message (_setup_wm_appcommand_hook) rather than raw keys here
+        — see that method's docstring for why.
+        """
         try:
             import keyboard
         except ImportError:
@@ -1362,14 +1369,15 @@ class MusicPlayerGUI:
             print(f"[MEDIA KEY] {label} triggered → dispatching to UI thread")
             self.root.after(0, fn)
 
-        # F5-F8: intercept raw F-keys before fnlock translates them (keyboard lib
-        # hook installs after fnlock so fires first in Windows LIFO hook chain).
-        # F9-F11: let fnlock translate to volume VKs, then catch those.
+        # Only the volume keys are handled here. F5-F8 used to be intercepted as
+        # raw F-keys too, but that raced fnlock's own remapping (this hook installs
+        # after fnlock's, so it fires first in the Windows LIFO hook chain and
+        # swallows the key before fnlock can translate it) — meaning F5-F8 always
+        # did the hardcoded Previous/Next/Play-Pause/Stop below no matter how the
+        # user remapped them in fnlock's GUI. Fixed by not intercepting them here at
+        # all: fnlock sends the real WM_APPCOMMAND for whatever action it resolved
+        # to, and _setup_wm_appcommand_hook reacts to that instead.
         hotkeys = [
-            ('f5',          self.previous_track,   'Previous (F5)',    True),
-            ('f6',          self.next_track,        'Next (F6)',        True),
-            ('f7',          self.toggle_play_pause, 'Play/Pause (F7)', True),
-            ('f8',          self.stop,              'Stop (F8)',        True),
             ('volume mute', self.toggle_mute,       'Mute (F9)',       False),
             ('volume down', self.volume_down,       'Vol Down (F10)',  False),
             ('volume up',   self.volume_up,         'Vol Up (F11)',    False),
@@ -1400,12 +1408,17 @@ class MusicPlayerGUI:
             print("  Or close other apps using these keys")
 
     def _setup_wm_appcommand_hook(self):
-        """Subclass this window's WNDPROC to receive WM_APPCOMMAND (hardware media dial).
+        """Subclass this window's WNDPROC to receive WM_APPCOMMAND.
 
-        Unlike the global keyboard hook above, WM_APPCOMMAND is only delivered to the
-        foreground window — this only fires while the app is focused. Focus-independent
-        control would require registering with Windows' System Media Transport Controls
-        (SMTC) instead; not done here, deliberately, to keep this change small.
+        Handles both F5-F8 (transport keys, remapped by fnlock) and the hardware
+        media dial — fnlock forwards both the same way, as a real WM_APPCOMMAND,
+        so this app doesn't need to know or duplicate fnlock's physical-key mapping.
+
+        Unlike the global keyboard hook above (volume keys only), WM_APPCOMMAND is
+        only delivered to the foreground window — this only fires while the app is
+        focused. Focus-independent control would require registering with Windows'
+        System Media Transport Controls (SMTC) instead; not done here, deliberately,
+        to keep this change small.
         """
         try:
             import ctypes
@@ -1444,11 +1457,14 @@ class MusicPlayerGUI:
             # top-level via DefWindowProc, so a child-window subclass would never see it.
             hwnd = user32.GetAncestor(raw_hwnd, GA_ROOT) or raw_hwnd
 
+            # Labels are generic (not "(dial)") because this same WM_APPCOMMAND path
+            # now handles both the hardware dial and F5-F8 (fnlock forwards both the
+            # same way) — nothing here can tell which physical control sent it.
             actions = {
-                'play_pause': (self.toggle_play_pause, 'Play/Pause (dial)'),
-                'next': (self.next_track, 'Next (dial)'),
-                'previous': (self.previous_track, 'Previous (dial)'),
-                'stop': (self.stop, 'Stop (dial)'),
+                'play_pause': (self.toggle_play_pause, 'Play/Pause'),
+                'next': (self.next_track, 'Next'),
+                'previous': (self.previous_track, 'Previous'),
+                'stop': (self.stop, 'Stop'),
             }
 
             def wndproc_callback(hwnd_arg, msg, wparam, lparam):
@@ -1486,17 +1502,17 @@ class MusicPlayerGUI:
             ctypes.set_last_error(0)
             old_proc = set_window_long(hwnd, GWLP_WNDPROC, callback_ptr)
             if old_proc == 0 and ctypes.get_last_error() != 0:
-                print("⚠ Media dial hook disabled: SetWindowLong failed")
+                print("⚠ Media transport hook disabled: SetWindowLong failed")
                 self._appcmd_wndproc = None
                 return
 
             self._appcmd_hwnd = hwnd
             self._appcmd_old_proc = old_proc
             self._appcmd_set_window_long = set_window_long
-            print("✓ Media dial hook enabled (works only while window is focused)")
+            print("✓ Media transport hook enabled — F5-F8 + dial (works only while window is focused)")
             self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
         except Exception as e:
-            print(f"⚠ Media dial hook disabled: {e}")
+            print(f"⚠ Media transport hook disabled: {e}")
             self._appcmd_wndproc = None
             self._appcmd_old_proc = None
 
@@ -2916,7 +2932,7 @@ class MusicPlayerGUI:
         """Show keyboard shortcuts dialog"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Keyboard Shortcuts")
-        dialog.geometry("350x250")
+        dialog.geometry("380x320")
         dialog.resizable(False, False)
         
         dialog.transient(self.root)
@@ -2929,10 +2945,12 @@ class MusicPlayerGUI:
                  font=('Arial', 14, 'bold')).pack(pady=(0, 20))
         
         shortcuts = [
-            ("Media keys", "Control playback globally"),
-            ("", "(Play/Pause, Prev, Next, Stop)"),
+            ("F9-F11", "Volume (mute/down/up)"),
+            ("", "Works even when window not focused"),
             ("", ""),
-            ("", "Works even when window not focused")
+            ("F5-F8", "Prev/Next/Play-Pause/Stop"),
+            ("+ dial", "Whatever fnlock currently maps them to"),
+            ("", "Only works while this window is focused"),
         ]
         
         for key, action in shortcuts:
@@ -2957,14 +2975,15 @@ class MusicPlayerGUI:
         text = tk.Text(dialog, height=15, width=55, wrap=tk.WORD)
         text.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
 
-        text.insert(tk.END, "Expected hotkeys (fnlock F-key → media key):\n")
-        text.insert(tk.END, "  F5  → Media Prev\n")
-        text.insert(tk.END, "  F6  → Media Play/Pause\n")
-        text.insert(tk.END, "  F7  → Media Next\n")
-        text.insert(tk.END, "  F8  → Media Stop\n")
-        text.insert(tk.END, "  F9  → Volume Mute\n")
-        text.insert(tk.END, "  F10 → Volume Down\n")
-        text.insert(tk.END, "  F11 → Volume Up\n\n")
+        text.insert(tk.END, "F9  → Volume Mute\n")
+        text.insert(tk.END, "F10 → Volume Down\n")
+        text.insert(tk.END, "F11 → Volume Up\n")
+        text.insert(tk.END, "(F9-F11 work even when this window isn't focused)\n\n")
+        text.insert(tk.END, "F5-F8 and the hardware dial: this app doesn't assume a fixed\n")
+        text.insert(tk.END, "mapping for these — it reacts to whatever real media command\n")
+        text.insert(tk.END, "fnlock actually sends (its own GUI/config.ini controls which\n")
+        text.insert(tk.END, "F-key does what). Check fnlock's config to see the current\n")
+        text.insert(tk.END, "mapping. These only work while this window is focused.\n\n")
         text.insert(tk.END, "Press any F5-F11 key and check the console for output.\n\n")
         
         try:
@@ -4182,6 +4201,56 @@ def main():
             stream.reconfigure(encoding='utf-8', errors='replace')
         except (AttributeError, ValueError):
             pass
+
+    # Single-instance guard: a second launch would install its own competing
+    # keyboard hook and its own WM_APPCOMMAND-subclassed window fighting the
+    # first instance over the same input. Named mutex survival across the
+    # process's life is how Windows apps normally detect "already running".
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            ERROR_ALREADY_EXISTS = 183
+            SW_RESTORE = 9
+
+            kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+            kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+            ctypes.set_last_error(0)
+            # Intentionally unused beyond this point — kept alive only by staying in
+            # scope for main()'s lifetime (it blocks on root.mainloop() below), which
+            # is what keeps the mutex held for the life of the process. Windows
+            # releases it automatically on exit; no explicit CloseHandle needed.
+            _instance_mutex = kernel32.CreateMutexW(None, False, "MusicPlayerV2_iTunesShuffler_SingleInstance")
+
+            if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+                # A second instance MUST NOT start past this point — the mutex has
+                # already proven one is running. Any failure while trying to focus
+                # the existing window is cosmetic and must not fall through to
+                # starting a second instance, so it gets its own try/except that
+                # still returns either way (unlike the outer one, which is allowed
+                # to fall through to a normal start if the guard itself failed).
+                print("Music Player V2 is already running — switching to it.")
+                try:
+                    user32 = ctypes.WinDLL('user32', use_last_error=True)
+                    user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+                    user32.FindWindowW.restype = wintypes.HWND
+                    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+                    user32.ShowWindow.restype = wintypes.BOOL
+                    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+                    user32.SetForegroundWindow.restype = wintypes.BOOL
+
+                    hwnd = user32.FindWindowW(None, "Music Player V2")
+                    if hwnd:
+                        user32.ShowWindow(hwnd, SW_RESTORE)
+                        user32.SetForegroundWindow(hwnd)
+                except Exception as e:
+                    print(f"⚠ Couldn't focus the existing window: {e}")
+                return
+        except Exception as e:
+            print(f"⚠ Single-instance check failed, continuing anyway: {e}")
 
     print("="*70)
     print("Custom Shuffle Music Player V2 - Starting...")
