@@ -981,43 +981,23 @@ class MusicPlayerGUI:
     
     
     def _init_shuffle_config(self):
-        """Initialize shuffle configuration with defaults"""
-        # Default shuffle parameters
-        self.shuffle_config = {
-            # Weight parameters
-            'random_min': 0.20,
-            'random_range': 0.50,
-            'rating_weight': 0.55,
-            'novelty_weight': 0.55,
-            'recency_weight': 0.45,
-            'newness_weight': 0.20,
-            'loved_weight': 0.30,
-            'skip_penalty_weight': 0.40,
-            'artist_skip_weight': 0.10,
-            'bpm_bonus': 0.05,
+        """Initialize shuffle configuration from the shuffle_core defaults."""
+        from shuffle_core import normalize_shuffle_config
 
-            # Constraint parameters
-            'recent_artists': 3,
-            'recent_albums': 2,
-            'recent_genres': 2,
-            'lookahead': 400,
+        # Single source of truth lives in shuffle_core.
+        self.shuffle_config = normalize_shuffle_config(None)
 
-            # Adaptive spacing (Task 4)
-            'adaptive_constraints': True,
-
-            # History guard (Task 5)
-            'history_guard_size': 30,
-            'history_track_penalty': 0.35,
-            'history_artist_penalty': 0.15,
-        }
-        
-        # Load saved configuration if it exists
+        # Load and validate saved configuration if it exists
         if self.shuffle_config_file.exists():
             try:
                 import json
                 with open(self.shuffle_config_file, 'r') as f:
                     saved_config = json.load(f)
-                    self.shuffle_config.update(saved_config)
+                if not isinstance(saved_config, dict):
+                    raise ValueError("shuffle config is not a JSON object")
+                # normalize_shuffle_config clamps/validates every field and
+                # falls back per-key for malformed persisted values.
+                self.shuffle_config = normalize_shuffle_config(saved_config)
                 print("✓ Loaded shuffle configuration")
             except Exception as e:
                 print(f"⚠ Could not load shuffle config: {e}")
@@ -1169,43 +1149,32 @@ class MusicPlayerGUI:
         button_frame.pack(pady=15)
         
         def save_settings():
-            # Update config
+            from shuffle_core import normalize_shuffle_config
+            # Update + validate config (clamps out-of-range typed values)
+            candidate = dict(self.shuffle_config)
             for param, var in vars_dict.items():
-                self.shuffle_config[param] = var.get()
-            
-            # Save to file
+                candidate[param] = var.get()
+            self.shuffle_config = normalize_shuffle_config(candidate)
+
             if self._save_shuffle_config():
                 messagebox.showinfo("Saved", "Shuffle settings saved successfully!")
                 dialog.destroy()
+                # Apply immediately so the change is audible next shuffle.
+                try:
+                    if getattr(self, 'all_tracks', None):
+                        self.apply_shuffle()
+                except Exception as e:
+                    print(f"⚠ Could not re-apply shuffle after settings change: {e}")
             else:
                 messagebox.showerror("Error", "Failed to save shuffle settings")
-        
+
         def reset_defaults():
-            result = messagebox.askyesno("Reset to Defaults", 
+            result = messagebox.askyesno("Reset to Defaults",
                                         "Reset all shuffle parameters to default values?")
             if result:
-                defaults = {
-                    'random_min': 0.20,
-                    'random_range': 0.50,
-                    'rating_weight': 0.55,
-                    'novelty_weight': 0.55,
-                    'recency_weight': 0.45,
-                    'newness_weight': 0.20,
-                    'loved_weight': 0.30,
-                    'skip_penalty_weight': 0.40,
-                    'artist_skip_weight': 0.10,
-                    'bpm_bonus': 0.05,
-                    'recent_artists': 3,
-                    'recent_albums': 2,
-                    'recent_genres': 2,
-                    'lookahead': 400,
-                    'adaptive_constraints': True,
-                    'history_guard_size': 30,
-                    'history_track_penalty': 0.35,
-                    'history_artist_penalty': 0.15,
-                }
+                from shuffle_core import DEFAULT_SHUFFLE_CONFIG
                 for param, var in vars_dict.items():
-                    var.set(defaults.get(param, 0))
+                    var.set(DEFAULT_SHUFFLE_CONFIG.get(param, 0))
     
         ttk.Button(button_frame, text="Save", command=save_settings, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Reset Defaults", command=reset_defaults, width=15).pack(side=tk.LEFT, padx=5)

@@ -2,15 +2,21 @@
 shuffle_core.py - Custom shuffle algorithms (standalone, no GUI dependencies)
 
 Provides CustomShuffleAlgorithm with:
-  - smart_shuffle: Draft + Repair (O(n log n)) with adaptive spacing and history guard
-  - truly_random: Standard random shuffle
+  - smart_shuffle: bucketed stride-interleave (O(n log k) in unique artists).
+    Tracks are bucketed by artist and each bucket is ordered by an exponential
+    race on its preference weight; buckets are then interleaved by a
+    random-phase stride schedule with a hard per-artist cooldown, a hard
+    consecutive-run cap, and a soft album/genre tie-break.
+  - truly_random: standard random shuffle
 
-New in v2:
-  - adaptive_constraints: auto-scales spacing windows from library cardinality
-  - recent_history guard: penalises recently-played tracks/artists in weight phase
-  - Precomputed per-track keys: eliminates repeated string normalisation in repair pass
+Scoring modes (config['scoring_mode']):
+  - 'legacy'   : the historical additive preference score (default)
+  - 'weighted' : scale-free Boltzmann weights, strength via config['beta']
+
+Both modes share the interleave; they differ only in the per-track weight.
 """
 
+import heapq
 import math
 import os
 import random
@@ -235,17 +241,28 @@ def legacy_preference_score(track, cfg, *, now, base=0.0,
     return w
 
 
+def _boltzmann_weights(scores, beta):
+    """Scale-free race weights for ``weighted`` mode: w = exp(beta * clamp(z)).
+
+    ``scores`` is a list (one entry per track, by index); returns a list the
+    same length.  Floored at 2% of the median so nothing is effectively
+    excluded.  ``beta = 0`` -> flat weights (uniform within the stride schedule).
+    """
+    mean = sum(scores) / len(scores)
+    std = math.sqrt(sum((s - mean) ** 2 for s in scores) / len(scores)) or 1.0
+    raw = [math.exp(beta * max(-3.0, min(3.0, (s - mean) / std))) for s in scores]
+    floor = 0.02 * sorted(raw)[len(raw) // 2]
+    return [max(w, floor) for w in raw]
+
+
 class CustomShuffleAlgorithm:
     """Custom shuffle algorithms for music playback"""
 
     @staticmethod
     def smart_shuffle(tracks, config=None, recent_history=None, *, rng=None, now=None):
         """
-        Smart Shuffle v2 - Optimised for large libraries (15K+ tracks)
-
-        Uses Draft + Repair algorithm:
-          Phase 1: Weighted sort (O(n log n))
-          Phase 2: Fix clumping (O(n))
+        Bucketed stride-interleave shuffle - O(n log k) in unique artists,
+        well under a second on 15K+ track libraries at any artist skew.
 
         Parameters
         ----------
@@ -269,167 +286,186 @@ class CustomShuffleAlgorithm:
             return []
 
         cfg = normalize_shuffle_config(config)
-
         if rng is None:
             rng = random
-
-        # ---- Constraint windows ------------------------------------------------
-        RECENT_ARTISTS = cfg['recent_artists']
-        RECENT_ALBUMS  = cfg['recent_albums']
-        RECENT_GENRES  = cfg['recent_genres']
-        LOOKAHEAD      = cfg['lookahead']
-
         if now is None:
             now = time.time()
 
-        # ---- Precompute per-track keys (Task 7: avoids repeated normalisation) --
-        # Keys are stored as (artist_key, album_key, genre_key) indexed by id(t).
-        _pk = {}
+        n = len(tracks)
+        scoring_mode = cfg['scoring_mode']
+
+        # ---- Per-track (artist, album, genre) keys, indexed by position -------
+        pk = []
         for t in tracks:
-            a   = (t.artist or "").strip()
-            ak  = a.lower() if a and a.lower() not in UNKNOWN_ARTIST else None
+            a   = (getattr(t, 'artist', '') or "").strip().lower()
+            ak  = a if a and a not in UNKNOWN_ARTIST else None
 
-            alb  = (t.album or "").strip()
-            albl = alb.lower() if alb and alb.lower() not in UNKNOWN_ALBUM else None
-            albk = f"{ak}||{albl}" if albl is not None else None
+            alb  = (getattr(t, 'album', '') or "").strip().lower()
+            albk = f"{ak}||{alb}" if alb and alb not in UNKNOWN_ALBUM else None
 
-            g   = (getattr(t, 'genre', '') or '').strip()
-            gk  = g.lower() if g and g.lower() not in UNKNOWN_GENRE else None
+            g   = (getattr(t, 'genre', '') or "").strip().lower()
+            gk  = g if g and g not in UNKNOWN_GENRE else None
 
-            _pk[id(t)] = (ak, albk, gk)
+            pk.append((ak, albk, gk))
 
-        def artist_key(t): return _pk[id(t)][0]
-        def album_key(t):  return _pk[id(t)][1]
-        def genre_key(t):  return _pk[id(t)][2]
-
-        # ---- Adaptive constraint windows (Task 4) ------------------------------
-        if cfg['adaptive_constraints']:
-            unique_artists = len({v[0] for v in _pk.values() if v[0] is not None})
-            unique_albums  = len({v[1] for v in _pk.values() if v[1] is not None})
-            unique_genres  = len({v[2] for v in _pk.values() if v[2] is not None})
-
-            adaptive_artists = min(8, max(3, round(math.sqrt(unique_artists) / 2)))
-            adaptive_albums  = min(6, max(2, round(math.sqrt(unique_albums)  / 3)))
-            adaptive_genres  = min(4, max(1, round(math.sqrt(unique_genres)  / 4)))
-
-            RECENT_ARTISTS = max(RECENT_ARTISTS, adaptive_artists)
-            RECENT_ALBUMS  = max(RECENT_ALBUMS,  adaptive_albums)
-            RECENT_GENRES  = max(RECENT_GENRES,  adaptive_genres)
-
-        # ---- History guard sets (Task 5) ----------------------------------------
+        # ---- History guard sets (Task 5) -------------------------------------
         recent_track_set  = set()
         recent_artist_set = set()
         guard_size = cfg['history_guard_size']
         if recent_history and guard_size > 0:   # 0 explicitly disables the guard
-            recent_n = recent_history[-guard_size:] if len(recent_history) > guard_size else recent_history
-            # Normalise stored paths so comparisons work cross-platform (Windows
-            # normcase converts forward slashes → backslashes and lowercases).
+            recent_n = recent_history[-guard_size:]
             recent_track_set  = {os.path.normcase(os.path.normpath(fp)) for fp, _ in recent_n}
             recent_artist_set = {ak for _, ak in recent_n if ak is not None}
 
-        # ---- Artist-level skip rate aggregation --------------------------------
+        # ---- Artist-level skip-rate aggregation ------------------------------
         artist_plays = defaultdict(int)
         artist_skips = defaultdict(int)
-        for t in tracks:
-            ak = artist_key(t)
+        for i, t in enumerate(tracks):
+            ak = pk[i][0]
             if ak is None:
                 continue
             artist_plays[ak] += getattr(t, 'play_count', 0) or 0
             artist_skips[ak] += getattr(t, 'skips', 0) or 0
-
         artist_skip_rate = {
-            ak: math.tanh((artist_skips.get(ak, 0)) / (plays + 1.0))
+            ak: math.tanh(artist_skips.get(ak, 0) / (plays + 1.0))
             for ak, plays in artist_plays.items()
         }
 
-        # ---- PHASE 1: DRAFT (compute weight once per track, then sort) ----------
-        random_min   = cfg['random_min']
-        random_range = cfg['random_range']
-
-        def _compute_weight(t):
-            base = random_min + rng.random() * random_range
-            w = legacy_preference_score(
-                t, cfg, now=now, base=base,
+        # ---- Deterministic preference score per track (by index) -------------
+        scores = [
+            legacy_preference_score(
+                t, cfg, now=now,
                 artist_skip_rate=artist_skip_rate,
                 recent_tracks=recent_track_set,
                 recent_artists=recent_artist_set)
-            return max(w, 0.001)
+            for t in tracks
+        ]
 
-        # Weighted sort  O(n log n)
-        weighted_tracks = [(-_compute_weight(t), t) for t in tracks]
-        weighted_tracks.sort(key=lambda x: x[0])
-        draft = [t for _, t in weighted_tracks]
+        if scoring_mode == 'weighted':
+            race_weight = _boltzmann_weights(scores, cfg['beta'])
+        else:
+            race_weight = [max(s, 1e-6) for s in scores]
 
-        # ---- PHASE 2: REPAIR (fix clumping by swapping) -------------------------
-        result         = []
-        recent_artists = deque(maxlen=RECENT_ARTISTS)
-        recent_albums  = deque(maxlen=RECENT_ALBUMS)
-        recent_genres  = deque(maxlen=RECENT_GENRES)
+        # Cross-bucket bias: a fraction of a bucket's stride, bounded by tanh so
+        # phase randomness (spread == stride) can always overcome it - this is
+        # what stops the old rigid preference bands.
+        smean = sum(scores) / n
+        sstd = math.sqrt(sum((s - smean) ** 2 for s in scores) / n) or 1.0
+        if scoring_mode == 'weighted':
+            pref_bias = 0.40 * min(1.0, cfg['beta'] / 2.0)   # beta 0 -> no bias
+        else:
+            pref_bias = 0.40
 
-        i = 0
-        while i < len(draft):
-            track = draft[i]
+        def _pref_shift(idx):
+            z = max(-3.0, min(3.0, (scores[idx] - smean) / sstd))
+            return pref_bias * math.tanh(z)
 
-            def passes_constraints(t, relax_level):
-                """
-                0: all constraints enforced
-                1: relax genre
-                2: relax album
-                3: accept anything
-                """
-                if relax_level >= 3:
-                    return True
-                ak  = artist_key(t)
-                al  = album_key(t)
-                gk  = genre_key(t)
-                if ak is not None and ak in recent_artists:
-                    return False
-                if relax_level < 2 and al is not None and al in recent_albums:
-                    return False
-                if relax_level < 1 and gk is not None and gk in recent_genres:
-                    return False
-                return True
+        # ---- Bucket track indices by artist; unknown -> own singleton bucket -
+        buckets = {}
+        for i in range(n):
+            ak = pk[i][0]
+            buckets.setdefault(ak if ak is not None else f"\x00u\x00{i}", []).append(i)
 
-            placed = False
-            for relax_level in range(4):
-                if passes_constraints(track, relax_level):
-                    result.append(track)
-                    ak = artist_key(track)
-                    al = album_key(track)
-                    gk = genre_key(track)
-                    if ak is not None:
-                        recent_artists.append(ak)
-                    if al is not None:
-                        recent_albums.append(al)
-                    if gk is not None:
-                        recent_genres.append(gk)
-                    i += 1
-                    placed = True
-                    break
+        # Order each bucket by an exponential race (lower key = earlier).
+        for key, idxs in buckets.items():
+            idxs.sort(key=lambda i: -math.log(1.0 - rng.random()) / race_weight[i])
+            buckets[key] = deque(idxs)
 
-                swap_found = False
-                for j in range(i + 1, min(len(draft), i + 1 + LOOKAHEAD)):
-                    if passes_constraints(draft[j], relax_level):
-                        draft[i], draft[j] = draft[j], draft[i]
-                        track = draft[i]
-                        swap_found = True
-                        break
+        cd_ceiling = cfg['recent_artists']
+        if cfg['adaptive_constraints']:
+            cd_ceiling = max(cd_ceiling, 3)
+        max_run = max(2, cd_ceiling)
 
-                if swap_found:
-                    continue
+        meta = {}
+        for key, dq in buckets.items():
+            total = len(dq)
+            meta[key] = {
+                'stride':     n / total,
+                'pass':       (n / total) * rng.random(),   # random phase
+                'cd':         min(cd_ceiling, n // total - 1),
+                'cool_until': -1,
+            }
 
-            if not placed:
-                result.append(track)
-                ak = artist_key(track)
-                al = album_key(track)
-                gk = genre_key(track)
-                if ak is not None:
-                    recent_artists.append(ak)
-                if al is not None:
-                    recent_albums.append(al)
-                if gk is not None:
-                    recent_genres.append(gk)
-                i += 1
+        # Light cooldown seed from the recent-history tail (Task 3/4 replaces
+        # this with real fixed-prefix seeding).
+        if recent_history and cd_ceiling:
+            for back, entry in enumerate(reversed(recent_history[-cd_ceiling:])):
+                m = meta.get(entry[1])
+                if m is not None:
+                    m['cool_until'] = max(m['cool_until'], m['cd'] - (back + 1))
+
+        # Soft album/genre spacing: a small nudge applied at selection time
+        # (never a hard gate - a hard gate reintroduces the O(n*window) cliff).
+        recent_alb = deque(maxlen=max(1, cfg['recent_albums']))
+        recent_gen = deque(maxlen=max(1, cfg['recent_genres']))
+
+        def _avail_entry(key):
+            head = buckets[key][0]
+            priority = meta[key]['pass'] - meta[key]['stride'] * _pref_shift(head)
+            return (priority, -scores[head], -len(buckets[key]), key)
+
+        def _soft_cost(key):
+            _, albk, gk = pk[buckets[key][0]]
+            return ((albk is not None and albk in recent_alb)
+                    + (gk is not None and gk in recent_gen))
+
+        avail, cooling = [], []
+        for key, m in meta.items():
+            if m['cool_until'] >= 0:
+                heapq.heappush(cooling, (m['cool_until'], key))
+            else:
+                heapq.heappush(avail, _avail_entry(key))
+
+        result = []
+        run_key, run_len = None, 0
+        for pos in range(n):
+            while cooling and cooling[0][0] <= pos:
+                _, k = heapq.heappop(cooling)
+                if buckets[k]:
+                    heapq.heappush(avail, _avail_entry(k))
+
+            if avail:
+                # Pop up to 4 near-best candidates; among them prefer the one
+                # whose album/genre was least recently emitted (soft tie-break).
+                cand = [heapq.heappop(avail) for _ in range(min(4, len(avail)))]
+                pick = min(range(len(cand)),
+                           key=lambda j: cand[j][0] + _soft_cost(cand[j][3]))
+                key = cand[pick][3]
+                for j, entry in enumerate(cand):
+                    if j != pick:
+                        heapq.heappush(avail, entry)
+            else:                                   # fallback: never stall
+                key = heapq.heappop(cooling)[1]
+
+            # Hard run cap: never extend a same-artist run past max_run while
+            # any alternative bucket still has tracks.
+            if key == run_key and run_len >= max_run and (avail or cooling):
+                deferred = key
+                if avail:
+                    key = heapq.heappop(avail)[3]
+                else:
+                    # Force-release from cooldown: an intentional cooldown
+                    # bypass, justified because the run cap outranks spacing.
+                    key = heapq.heappop(cooling)[1]
+                heapq.heappush(avail, _avail_entry(deferred))
+
+            idx = buckets[key].popleft()
+            result.append(tracks[idx])
+            run_len = run_len + 1 if key == run_key else 1
+            run_key = key
+            if pk[idx][1] is not None:
+                recent_alb.append(pk[idx][1])
+            if pk[idx][2] is not None:
+                recent_gen.append(pk[idx][2])
+
+            m = meta[key]
+            m['pass'] += m['stride']
+            if buckets[key]:
+                if m['cd'] > 0:
+                    m['cool_until'] = pos + 1 + m['cd']
+                    heapq.heappush(cooling, (m['cool_until'], key))
+                else:
+                    heapq.heappush(avail, _avail_entry(key))
 
         return result
 

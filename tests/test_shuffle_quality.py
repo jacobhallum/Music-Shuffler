@@ -63,8 +63,7 @@ class TestBalancedTwoArtist(unittest.TestCase):
         return ([QTrack(f'/a{i}.mp3', 'A') for i in range(10)] +
                 [QTrack(f'/b{i}.mp3', 'B') for i in range(10)])
 
-    @unittest.expectedFailure  # fixed by Task 2b (stride-interleave)
-    def test_no_adjacent_repeats_across_seeds(self):
+    def test_no_adjacent_repeats_across_seeds(self):  # fixed: Task 2b
         total = 0
         for seed in range(100):
             out = CustomShuffleAlgorithm.smart_shuffle(
@@ -90,8 +89,7 @@ class TestSkewedLibrary(unittest.TestCase):
         return ([QTrack(f'/d{i}.mp3', 'Dom') for i in range(700)] +
                 [QTrack(f'/o{i}.mp3', f'Art{i % 30}') for i in range(300)])
 
-    @unittest.expectedFailure  # fixed by Task 2b (stride priority)
-    def test_dominant_artist_not_one_long_tail_run(self):
+    def test_dominant_artist_not_one_long_tail_run(self):  # fixed: Task 2b
         out = CustomShuffleAlgorithm.smart_shuffle(
             self._lib(), {}, rng=random.Random(0), now=NOW)
         self.assertLessEqual(_longest_run(out, lambda t: t.artist), 5,
@@ -135,10 +133,50 @@ class TestHistoryGuardSizeZero(unittest.TestCase):
                          "guard size 0 must be a no-op")
 
 
+class TestWeightedMode(unittest.TestCase):
+    """scoring_mode='weighted': favourites lead more often, but not always."""
+
+    def _pair_lib(self):
+        hi = QTrack('/hi.mp3', 'X', rating=100)
+        hi.loved = True
+        lo = QTrack('/lo.mp3', 'Y', rating=20)
+        lo.loved = False
+        return hi, lo
+
+    def test_favoured_leads_more_often_but_not_always(self):
+        hi_first = 0
+        for seed in range(400):
+            hi, lo = self._pair_lib()
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                [hi, lo], {'scoring_mode': 'weighted', 'beta': 1.5},
+                rng=random.Random(seed), now=NOW)
+            hi_first += (out[0].filepath == '/hi.mp3')
+        self.assertGreater(hi_first, 220, "favoured should usually lead")
+        self.assertLess(hi_first, 400, "but not deterministically")
+
+    def test_beta_zero_is_roughly_uniform(self):
+        hi_first = 0
+        for seed in range(400):
+            hi, lo = self._pair_lib()
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                [hi, lo], {'scoring_mode': 'weighted', 'beta': 0.0},
+                rng=random.Random(seed), now=NOW)
+            hi_first += (out[0].filepath == '/hi.mp3')
+        self.assertGreater(hi_first, 150)
+        self.assertLess(hi_first, 250)
+
+    def test_completeness_and_no_loss(self):
+        lib = [QTrack(f'/t{i}.mp3', f'Art{i % 12}', rating=(i % 5) * 20)
+               for i in range(120)]
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {'scoring_mode': 'weighted'}, rng=random.Random(1), now=NOW)
+        self.assertEqual(sorted(t.filepath for t in out),
+                         sorted(t.filepath for t in lib))
+
+
 class TestUnknownTagPositionalSpacing(unittest.TestCase):
 
-    @unittest.expectedFailure  # fixed by Task 2b (synthetic bucket + positional advance)
-    def test_unknown_artist_songs_advance_the_window(self):
+    def test_unknown_artist_songs_advance_the_window(self):  # fixed: Task 2b
         """Songs with no artist must still consume spacing positions.
 
         Layout: A, <unknown>, <unknown>, A, ...  With a positional window of 3
