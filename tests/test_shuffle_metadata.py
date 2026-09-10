@@ -17,6 +17,13 @@ import threading
 import unittest
 from pathlib import Path
 
+# music_player prints ✓/⚠ status lines; a cp1252 console would raise on them.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import plistlib

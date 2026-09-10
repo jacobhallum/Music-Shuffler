@@ -78,10 +78,24 @@ def save(path, favorites):
         raise
 
 
+_METADATA_DEFAULTS = {
+    'play_count': 0, 'rating': 0,
+    'skip_count': None, 'last_played': None, 'date_added': None,
+}
+
+
 def merge_into_metadata(favorites, player_metadata):
     """Overlay favorites onto an in-memory player_metadata dict (keyed by
-    normalised path).  Preferences win for `loved` / `loved_source`."""
+    normalised path).  Preferences win for `loved` / `loved_source`.
+
+    An entry created for a favorite whose track isn't in the library yet is
+    given the full default field set, so it isn't churned (written zeroed,
+    orphan-cleaned, re-created) on every startup.
+    """
     for norm_path, entry in favorites.items():
-        md = player_metadata.setdefault(norm_path, {})
+        md = player_metadata.get(norm_path)
+        if md is None:
+            md = dict(_METADATA_DEFAULTS)
+            player_metadata[norm_path] = md
         md['loved'] = entry['loved']
         md['loved_source'] = entry.get('source')

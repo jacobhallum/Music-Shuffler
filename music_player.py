@@ -127,9 +127,13 @@ class MusicTrack:
             elif isinstance(date_added, (int, float)):
                 self.date_added = int(date_added)
         
-        # Loved status (tri-state) + provenance
-        self.loved = metadata.get('loved', self.loved)
-        self.loved_source = metadata.get('loved_source', self.loved_source)
+        # Loved status (tri-state) + provenance.  A None in the player metadata
+        # means "no opinion recorded" - don't let it clobber a real loved tag
+        # already read from the file itself.
+        loved = metadata.get('loved')
+        if loved is not None:
+            self.loved = loved
+            self.loved_source = metadata.get('loved_source') or 'user'
 
     def _load_metadata(self):
         """Load metadata from the meta_path"""
@@ -1737,7 +1741,6 @@ class MusicPlayerGUI:
     def migrate_ratings_to_favorites(self):
         """One-time, opt-in: seed favorites from existing high iTunes ratings
         for tracks that have no favorite opinion yet (Task 7b)."""
-        RATING_THRESHOLD = 80  # 0-100 scale (4+ stars)
         candidates = []
         for t in getattr(self, 'library_tracks', []) or self.all_tracks:
             if getattr(t, 'loved', None) is not None:
@@ -1745,8 +1748,8 @@ class MusicPlayerGUI:
             if getattr(t, 'loved_source', None) not in (None, 'unknown'):
                 continue
             r = getattr(t, 'rating', 0) or 0
-            # Only migrate unambiguous 0-100 iTunes-scale ratings.
-            if 0 < r <= 100 and r >= RATING_THRESHOLD:
+            # 4+ stars on either common iTunes scale (0-100 or POPM 0-255).
+            if (0 < r <= 100 and r >= 80) or (100 < r <= 255 and r >= 204):
                 candidates.append(t)
 
         if not candidates:
@@ -1997,9 +2000,12 @@ class MusicPlayerGUI:
                             'date_added': _opt_int(track_data.get('date_added')),
                         }
 
-                print(f"✓ Loaded metadata for {len(tracks)} tracks"
-                      + (" (migrated from v1)" if schema_version < 2 else ""))
-                
+                try:
+                    print(f"Loaded metadata for {len(tracks)} tracks"
+                          + (" (migrated from v1)" if schema_version < 2 else ""))
+                except Exception:
+                    pass
+
                 # If we loaded from backup, restore it as main
                 if filepath == backup_file:
                     print("  Restored from backup file")
@@ -2012,9 +2018,14 @@ class MusicPlayerGUI:
                 return  # Success
                 
             except Exception as e:
-                print(f"⚠ Player metadata file corrupted (attempt {attempt}): {e}")
-                if filepath == self.player_metadata_file:
-                    print("  Trying backup file...")
+                # Status prints must never derail load (a cp1252 console makes
+                # the glyphs raise UnicodeEncodeError).
+                try:
+                    print(f"! Player metadata file corrupted (attempt {attempt}): {e}")
+                    if filepath == self.player_metadata_file:
+                        print("  Trying backup file...")
+                except Exception:
+                    pass
                 continue
         
         # Both files failed
