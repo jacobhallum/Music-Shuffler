@@ -107,8 +107,7 @@ class TestSkewedLibrary(unittest.TestCase):
 
 class TestHistoryGuardSizeZero(unittest.TestCase):
 
-    @unittest.expectedFailure  # fixed by Task 2a (normalize_shuffle_config: 0 disables)
-    def test_zero_guard_size_disables_history(self):
+    def test_zero_guard_size_disables_history(self):  # fixed: Task 2a
         """history_guard_size=0 must mean 'no guard', not '[-0:] == whole list'.
 
         Only the first 10 (unique-artist) tracks are 'recent'.  With the guard

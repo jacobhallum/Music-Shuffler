@@ -17,6 +17,223 @@ import random
 import time
 from collections import defaultdict, deque
 
+CONFIG_VERSION = 2
+
+# Single source of truth for shuffle defaults (music_player imports these).
+DEFAULT_SHUFFLE_CONFIG = {
+    'scoring_mode':          'legacy',   # 'legacy' | 'weighted'
+    'beta':                  1.0,        # weighted-mode preference strength (0-3)
+
+    'random_min':            0.20,
+    'random_range':          0.50,
+    'rating_weight':         0.55,
+    'novelty_weight':        0.55,
+    'recency_weight':        0.45,
+    'newness_weight':        0.20,
+    'loved_weight':          0.30,
+    'skip_penalty_weight':   0.40,
+    'artist_skip_weight':    0.10,
+    'bpm_bonus':             0.05,
+
+    'recent_artists':        3,
+    'recent_albums':         2,
+    'recent_genres':         2,
+    'lookahead':             400,
+    'adaptive_constraints':  True,
+
+    'history_guard_size':    30,
+    'history_track_penalty': 0.35,
+    'history_artist_penalty': 0.15,
+}
+
+_WINDOW_KEYS  = ('recent_artists', 'recent_albums', 'recent_genres')
+_WEIGHT_KEYS  = ('random_min', 'random_range', 'rating_weight', 'novelty_weight',
+                 'recency_weight', 'newness_weight', 'loved_weight',
+                 'skip_penalty_weight', 'artist_skip_weight', 'bpm_bonus',
+                 'history_track_penalty', 'history_artist_penalty', 'beta')
+_SCORING_MODES = ('legacy', 'weighted')
+_WINDOW_MAX = 50
+
+
+def _as_finite_float(value):
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def normalize_shuffle_config(config):
+    """Return a validated, clamped copy of *config* over the defaults.
+
+    - windows -> non-negative ints, capped at 50
+    - history_guard_size -> 0..200 (0 explicitly disables the guard)
+    - lookahead -> 1..1000
+    - weights -> finite floats >= 0 (non-finite / non-numeric fall back per field)
+    - scoring_mode -> 'legacy' | 'weighted' (anything else -> 'legacy')
+    - unknown keys pass through untouched (forward compatibility)
+    """
+    cfg = dict(DEFAULT_SHUFFLE_CONFIG)
+    cfg['config_version'] = CONFIG_VERSION
+    if config:
+        for k, v in config.items():
+            if k not in DEFAULT_SHUFFLE_CONFIG:
+                cfg[k] = v  # unknown key - leave as-is
+
+    src = config or {}
+
+    for k in _WINDOW_KEYS:
+        if k in src:
+            f = _as_finite_float(src[k])
+            cfg[k] = DEFAULT_SHUFFLE_CONFIG[k] if f is None \
+                else max(0, min(_WINDOW_MAX, int(f)))
+
+    if 'history_guard_size' in src:
+        f = _as_finite_float(src['history_guard_size'])
+        cfg['history_guard_size'] = DEFAULT_SHUFFLE_CONFIG['history_guard_size'] \
+            if f is None else max(0, min(200, int(f)))
+
+    if 'lookahead' in src:
+        f = _as_finite_float(src['lookahead'])
+        cfg['lookahead'] = DEFAULT_SHUFFLE_CONFIG['lookahead'] if f is None \
+            else max(1, min(1000, int(f)))
+
+    for k in _WEIGHT_KEYS:
+        if k in src:
+            f = _as_finite_float(src[k])
+            cfg[k] = DEFAULT_SHUFFLE_CONFIG[k] if f is None else max(0.0, f)
+
+    if 'adaptive_constraints' in src:
+        cfg['adaptive_constraints'] = bool(src['adaptive_constraints'])
+
+    if 'scoring_mode' in src:
+        cfg['scoring_mode'] = src['scoring_mode'] \
+            if src['scoring_mode'] in _SCORING_MODES else 'legacy'
+
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Tag-key normalisation
+# ---------------------------------------------------------------------------
+
+UNKNOWN_ARTIST = {"", "unknown artist"}
+UNKNOWN_ALBUM  = {"", "unknown album"}
+UNKNOWN_GENRE  = {"", "unknown"}
+
+
+def _norm_artist_key(track):
+    a = (getattr(track, 'artist', '') or "").strip()
+    al = a.lower()
+    return al if a and al not in UNKNOWN_ARTIST else None
+
+
+# ---------------------------------------------------------------------------
+# Deterministic scoring components (no RNG, no library aggregates)
+# ---------------------------------------------------------------------------
+
+def _norm_rating(r):
+    if r is None:
+        return 0.50
+    try:
+        r = int(r or 0)
+    except Exception:
+        return 0.50
+    if r == 0:
+        return 0.50
+    if r <= 5:
+        return max(0.0, min(1.0, r / 5.0))
+    if r <= 100:
+        return max(0.0, min(1.0, r / 100.0))
+    return max(0.0, min(1.0, r / 255.0))
+
+
+def _novelty_score(play_count):
+    if play_count is None:
+        return 0.60
+    try:
+        pc = int(play_count or 0)
+    except Exception:
+        return 0.60
+    return 1.0 / (1.0 + (max(pc, 0) + 1))
+
+
+def _recency_boost(last_played, now):
+    if last_played is None:
+        return 1.0
+    try:
+        lp = float(last_played)
+    except Exception:
+        return 1.0
+    if lp <= 0:
+        return 1.0
+    age_days = max(0.0, (now - lp) / 86400.0)
+    return 1.0 - math.exp(-age_days / 14.0)
+
+
+def _newness_boost(date_added, now):
+    if date_added is None:
+        return 0.20
+    try:
+        da = float(date_added)
+    except Exception:
+        return 0.20
+    if da <= 0:
+        return 0.20
+    age_days = max(0.0, (now - da) / 86400.0)
+    return 1.0 / (1.0 + (age_days / 30.0))
+
+
+def _skip_penalty(track):
+    pc = getattr(track, 'play_count', 0) or 0
+    sk = getattr(track, 'skips', 0) or 0
+    if sk == 0:
+        return 0.0
+    return 0.4 * math.tanh(sk / (pc + 1.0))
+
+
+def _love_score(loved):
+    if loved is None:
+        return 0.25
+    return 1.0 if loved else 0.0
+
+
+def legacy_preference_score(track, cfg, *, now, base=0.0,
+                            artist_skip_rate=None,
+                            recent_tracks=frozenset(),
+                            recent_artists=frozenset()):
+    """Deterministic legacy draft weight for one track (no RNG term).
+
+    ``base`` is added first so a caller can fold in its randomness with the
+    original accumulation order preserved (bit-identical legacy output).
+    ``artist_skip_rate`` maps normalised artist key -> tanh skip rate.
+    ``recent_tracks`` / ``recent_artists`` are the history-guard sets
+    (normalised paths / normalised artist keys).
+    """
+    w = base
+    w += cfg['rating_weight']       * _norm_rating(getattr(track, 'rating', None))
+    w += cfg['novelty_weight']      * _novelty_score(getattr(track, 'play_count', None))
+    w += cfg['recency_weight']      * _recency_boost(getattr(track, 'last_played', None), now)
+    w += cfg['newness_weight']      * _newness_boost(getattr(track, 'date_added', None), now)
+    w += cfg['loved_weight']        * _love_score(getattr(track, 'loved', None))
+    w -= cfg['skip_penalty_weight'] * _skip_penalty(track)
+
+    ak = _norm_artist_key(track)
+    if ak is not None and artist_skip_rate:
+        w -= cfg['artist_skip_weight'] * artist_skip_rate.get(ak, 0.0)
+
+    if (getattr(track, 'bpm', 0) or 0) > 0:
+        w += cfg['bpm_bonus']
+
+    if recent_tracks:
+        nfp = os.path.normcase(os.path.normpath(getattr(track, 'filepath', '') or ''))
+        if nfp in recent_tracks:
+            w -= cfg['history_track_penalty']
+    if recent_artists and ak is not None and ak in recent_artists:
+        w -= cfg['history_artist_penalty']
+
+    return w
+
 
 class CustomShuffleAlgorithm:
     """Custom shuffle algorithms for music playback"""
@@ -51,87 +268,19 @@ class CustomShuffleAlgorithm:
         if not tracks:
             return []
 
-        if config is None:
-            config = {}
+        cfg = normalize_shuffle_config(config)
 
         if rng is None:
             rng = random
 
         # ---- Constraint windows ------------------------------------------------
-        RECENT_ARTISTS = config.get('recent_artists', 3)
-        RECENT_ALBUMS  = config.get('recent_albums',  2)
-        RECENT_GENRES  = config.get('recent_genres',  2)
-        LOOKAHEAD      = config.get('lookahead', 400)
-
-        # Unknown value sentinels (don't constrain missing tags)
-        UNKNOWN_ARTIST = {"", "unknown artist"}
-        UNKNOWN_ALBUM  = {"", "unknown album"}
-        UNKNOWN_GENRE  = {"", "unknown"}
+        RECENT_ARTISTS = cfg['recent_artists']
+        RECENT_ALBUMS  = cfg['recent_albums']
+        RECENT_GENRES  = cfg['recent_genres']
+        LOOKAHEAD      = cfg['lookahead']
 
         if now is None:
             now = time.time()
-
-        # ---- Helper / scoring functions ----------------------------------------
-        def _norm_rating(r):
-            if r is None:
-                return 0.50
-            try:
-                r = int(r or 0)
-            except Exception:
-                return 0.50
-            if r == 0:
-                return 0.50
-            if r <= 5:
-                return max(0.0, min(1.0, r / 5.0))
-            if r <= 100:
-                return max(0.0, min(1.0, r / 100.0))
-            return max(0.0, min(1.0, r / 255.0))
-
-        def _novelty_score(play_count):
-            if play_count is None:
-                return 0.60
-            try:
-                pc = int(play_count or 0)
-            except Exception:
-                return 0.60
-            pc_eff = max(pc, 0) + 1
-            return 1.0 / (1.0 + pc_eff)
-
-        def _recency_boost(last_played):
-            if last_played is None:
-                return 1.0
-            try:
-                lp = float(last_played)
-            except Exception:
-                return 1.0
-            if lp <= 0:
-                return 1.0
-            age_days = max(0.0, (now - lp) / 86400.0)
-            return 1.0 - math.exp(-age_days / 14.0)
-
-        def _newness_boost(date_added):
-            if date_added is None:
-                return 0.20
-            try:
-                da = float(date_added)
-            except Exception:
-                return 0.20
-            if da <= 0:
-                return 0.20
-            age_days = max(0.0, (now - da) / 86400.0)
-            return 1.0 / (1.0 + (age_days / 30.0))
-
-        def _skip_penalty(t):
-            pc = getattr(t, 'play_count', 0) or 0
-            sk = getattr(t, 'skips', 0) or 0
-            if sk == 0:
-                return 0.0
-            return 0.4 * math.tanh(sk / (pc + 1.0))
-
-        def _love_score(loved):
-            if loved is None:
-                return 0.25
-            return 1.0 if loved else 0.0
 
         # ---- Precompute per-track keys (Task 7: avoids repeated normalisation) --
         # Keys are stored as (artist_key, album_key, genre_key) indexed by id(t).
@@ -154,7 +303,7 @@ class CustomShuffleAlgorithm:
         def genre_key(t):  return _pk[id(t)][2]
 
         # ---- Adaptive constraint windows (Task 4) ------------------------------
-        if config.get('adaptive_constraints', True):
+        if cfg['adaptive_constraints']:
             unique_artists = len({v[0] for v in _pk.values() if v[0] is not None})
             unique_albums  = len({v[1] for v in _pk.values() if v[1] is not None})
             unique_genres  = len({v[2] for v in _pk.values() if v[2] is not None})
@@ -170,8 +319,8 @@ class CustomShuffleAlgorithm:
         # ---- History guard sets (Task 5) ----------------------------------------
         recent_track_set  = set()
         recent_artist_set = set()
-        if recent_history:
-            guard_size = config.get('history_guard_size', 30)
+        guard_size = cfg['history_guard_size']
+        if recent_history and guard_size > 0:   # 0 explicitly disables the guard
             recent_n = recent_history[-guard_size:] if len(recent_history) > guard_size else recent_history
             # Normalise stored paths so comparisons work cross-platform (Windows
             # normcase converts forward slashes → backslashes and lowercases).
@@ -194,36 +343,16 @@ class CustomShuffleAlgorithm:
         }
 
         # ---- PHASE 1: DRAFT (compute weight once per track, then sort) ----------
-        track_penalty_w  = config.get('history_track_penalty',  0.35)
-        artist_penalty_w = config.get('history_artist_penalty', 0.15)
+        random_min   = cfg['random_min']
+        random_range = cfg['random_range']
 
         def _compute_weight(t):
-            random_min   = config.get('random_min',   0.20)
-            random_range = config.get('random_range', 0.50)
-            w = random_min + rng.random() * random_range
-
-            w += config.get('rating_weight',       0.55) * _norm_rating(getattr(t, 'rating', None))
-            w += config.get('novelty_weight',      0.55) * _novelty_score(getattr(t, 'play_count', None))
-            w += config.get('recency_weight',      0.45) * _recency_boost(getattr(t, 'last_played', None))
-            w += config.get('newness_weight',      0.20) * _newness_boost(getattr(t, 'date_added', None))
-            w += config.get('loved_weight',        0.30) * _love_score(getattr(t, 'loved', None))
-            w -= config.get('skip_penalty_weight', 0.40) * _skip_penalty(t)
-
-            ak = artist_key(t)
-            if ak is not None:
-                w -= config.get('artist_skip_weight', 0.10) * artist_skip_rate.get(ak, 0.0)
-
-            if (getattr(t, 'bpm', 0) or 0) > 0:
-                w += config.get('bpm_bonus', 0.05)
-
-            # History guard penalties (Task 5)
-            if recent_track_set:
-                norm_fp = os.path.normcase(os.path.normpath(getattr(t, 'filepath', '') or ''))
-                if norm_fp in recent_track_set:
-                    w -= track_penalty_w
-                if ak is not None and ak in recent_artist_set:
-                    w -= artist_penalty_w
-
+            base = random_min + rng.random() * random_range
+            w = legacy_preference_score(
+                t, cfg, now=now, base=base,
+                artist_skip_rate=artist_skip_rate,
+                recent_tracks=recent_track_set,
+                recent_artists=recent_artist_set)
             return max(w, 0.001)
 
         # Weighted sort  O(n log n)
