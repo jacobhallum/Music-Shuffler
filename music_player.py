@@ -89,6 +89,7 @@ class MusicTrack:
         
         # Optional metadata (only if stored in-file). None = unknown.
         self.loved = None        # bool|None
+        self.loved_source = None  # 'user' | 'migrated' | None (Task 7a)
         self.last_played = None  # epoch seconds|None
         self.skips = None        # int|None
         self.date_added = None   # epoch seconds|None
@@ -126,9 +127,10 @@ class MusicTrack:
             elif isinstance(date_added, (int, float)):
                 self.date_added = int(date_added)
         
-        # Loved status
+        # Loved status (tri-state) + provenance
         self.loved = metadata.get('loved', self.loved)
-    
+        self.loved_source = metadata.get('loved_source', self.loved_source)
+
     def _load_metadata(self):
         """Load metadata from the meta_path"""
         try:
@@ -427,6 +429,7 @@ class MusicTrack:
             'bpm': self.bpm,
             'track_number': self.track_number,
             'loved': self.loved,
+            'loved_source': self.loved_source,
             'last_played': self.last_played,
             'skips': self.skips,
             'date_added': self.date_added,
@@ -452,6 +455,7 @@ class MusicTrack:
         track.bpm = data.get('bpm', 0)
         track.track_number = data.get('track_number')
         track.loved = data.get('loved')
+        track.loved_source = data.get('loved_source')
         track.last_played = data.get('last_played')
         track.skips = data.get('skips')
         track.date_added = data.get('date_added')
@@ -1684,10 +1688,13 @@ class MusicPlayerGUI:
             return
         
         track = self.current_playlist[self.current_index]
-        
-        # Toggle loved status
+
+        # Toggle loved status. A button press is always an explicit user
+        # opinion, so record provenance (Task 7a) - distinguishes a real
+        # "not a favourite" from "never touched".
         track.loved = not track.loved if track.loved is not None else True
-        
+        track.loved_source = 'user'
+
         # Update button - use unicode hearts that respond to foreground color
         if track.loved:
             self.love_button.config(text="♥", foreground="red", font=('Arial', 14, 'bold'))
@@ -1864,22 +1871,57 @@ class MusicPlayerGUI:
                     data = plistlib.load(f)
                 
                 tracks = data.get('tracks', {})
+                schema_version = int(data.get('schema_version', 1))
 
-                # Thread-safe write to metadata
+                if schema_version < 2 and filepath == self.player_metadata_file:
+                    # One-time keep of the pre-tri-state file so the loved
+                    # reclassification below is recoverable (Task 7a).
+                    try:
+                        import shutil
+                        v1 = self.player_metadata_file.with_suffix('.xml.v1backup')
+                        if not v1.exists():
+                            shutil.copy2(self.player_metadata_file, v1)
+                    except (OSError, IOError):
+                        pass
+
+                def _opt_int(v):
+                    if v in (None, ''):
+                        return None
+                    v = int(v)
+                    # v1 stored "unknown" as 0 for these fields; a real 0 and
+                    # "never set" score identically, so fold both to None.
+                    if schema_version < 2 and v == 0:
+                        return None
+                    return v
+
+                def _load_loved(td):
+                    raw = td.get('loved', None)
+                    src = td.get('loved_source', None)
+                    if schema_version >= 2:
+                        return raw, src
+                    # v1: a bare False has no provenance (mix of real "not a
+                    # favourite" and playback-coerced unknown) -> treat as
+                    # unknown; a True was almost certainly a deliberate heart.
+                    if raw is True:
+                        return True, 'user'
+                    return None, None
+
                 with self._metadata_lock:
                     for filepath_key, track_data in tracks.items():
-                        # Normalize key for storage
                         key = self._norm_path(filepath_key)
+                        loved, loved_source = _load_loved(track_data)
                         self.player_metadata[key] = {
                             'play_count': int(track_data.get('play_count', 0)),
-                            'skip_count': int(track_data.get('skip_count', 0)),
+                            'skip_count': _opt_int(track_data.get('skip_count')),
                             'rating': int(track_data.get('rating', 0)),
-                            'last_played': int(track_data.get('last_played', 0)),
-                            'loved': bool(track_data.get('loved', False)),
-                            'date_added': int(track_data.get('date_added', 0)),
+                            'last_played': _opt_int(track_data.get('last_played')),
+                            'loved': loved,
+                            'loved_source': loved_source,
+                            'date_added': _opt_int(track_data.get('date_added')),
                         }
 
-                print(f"✓ Loaded metadata for {len(tracks)} tracks")
+                print(f"✓ Loaded metadata for {len(tracks)} tracks"
+                      + (" (migrated from v1)" if schema_version < 2 else ""))
                 
                 # If we loaded from backup, restore it as main
                 if filepath == backup_file:
@@ -1918,14 +1960,21 @@ class MusicPlayerGUI:
 
             tracks_out = {}
             for filepath_norm, track_data in metadata_copy.items():
-                tracks_out[filepath_norm] = {
+                entry = {
                     'play_count': int(track_data.get('play_count') or 0),
-                    'skip_count': int(track_data.get('skip_count') or 0),
                     'rating': int(track_data.get('rating') or 0),
-                    'last_played': int(track_data.get('last_played') or 0),
-                    'loved': bool(track_data.get('loved', False)),  # Ensure boolean
-                    'date_added': int(track_data.get('date_added') or 0),
                 }
+                # Tri-state fields: only written when known, so a missing key
+                # reads back as None ("never set") rather than 0/False (Task 7a).
+                for k in ('skip_count', 'last_played', 'date_added'):
+                    v = track_data.get(k)
+                    if v is not None:
+                        entry[k] = int(v)
+                if track_data.get('loved') is not None:
+                    entry['loved'] = bool(track_data['loved'])
+                if track_data.get('loved_source') is not None:
+                    entry['loved_source'] = str(track_data['loved_source'])
+                tracks_out[filepath_norm] = entry
             
             # Create backup of existing file before overwriting
             if self.player_metadata_file.exists():
@@ -1939,7 +1988,7 @@ class MusicPlayerGUI:
             # Atomic write: write to temp file, then replace
             tmp_path = self.player_metadata_file.with_suffix(self.player_metadata_file.suffix + '.tmp')
             with open(tmp_path, 'wb') as f:
-                plistlib.dump({'tracks': tracks_out}, f)
+                plistlib.dump({'schema_version': 2, 'tracks': tracks_out}, f)
             
             # Verify the temp file before replacing
             if tmp_path.stat().st_size < 100:
@@ -1957,24 +2006,29 @@ class MusicPlayerGUI:
                 pass
 
     def _update_track_metadata(self, track):
-        """Update metadata for any track (unified system)"""
-        filepath_to_check = getattr(track, 'original_filepath', track.filepath)
+        """Update metadata for any track (unified system).
 
-        # Normalize key for storage
+        Tri-state fields (loved, skips, last_played, date_added) keep ``None``
+        for "unknown / never set" - collapsing them to 0/False was corrupting
+        the shuffle taste signal on every playback (Task 7a).
+        """
+        filepath_to_check = getattr(track, 'original_filepath', track.filepath)
         fp = self._norm_path(filepath_to_check)
 
-        # Store metadata in memory (thread-safe)
+        def _int_or_none(v):
+            return None if v is None else int(v)
+
         with self._metadata_lock:
             self.player_metadata[fp] = {
                 'play_count': int(getattr(track, 'play_count', 0) or 0),
-                'skip_count': int(getattr(track, 'skips', 0) or 0),
+                'skip_count': _int_or_none(getattr(track, 'skips', None)),
                 'rating': int(getattr(track, 'rating', 0) or 0),
-                'last_played': int(getattr(track, 'last_played', 0) or 0),
-                'loved': bool(getattr(track, 'loved', None)),  # True/False/None -> True/False/False
-                'date_added': int(getattr(track, 'date_added', 0) or 0),
+                'last_played': _int_or_none(getattr(track, 'last_played', None)),
+                'loved': getattr(track, 'loved', None),          # True | False | None
+                'loved_source': getattr(track, 'loved_source', None),
+                'date_added': _int_or_none(getattr(track, 'date_added', None)),
             }
 
-        # Queue async save (debounced to avoid blocking UI)
         self._queue_metadata_save()
     
     def _queue_metadata_save(self):
@@ -2979,6 +3033,7 @@ class MusicPlayerGUI:
                 track.rating = 0
                 track.last_played = None
                 track.loved = None
+                track.loved_source = None
                 track.date_added = None
             
             # Update love button for current track if playing
@@ -3980,9 +4035,9 @@ class MusicPlayerGUI:
             track.play_count = (track.play_count or 0) + 1
             track.last_played = int(time.time())
 
-            # Set date_added if not already set (None check preserves 0 and imported values)
-            if track.date_added is None:
-                track.date_added = int(time.time())
+            # NOTE (Task 7a): do NOT stamp date_added on first playback - that
+            # made every old track look brand new to the shuffle's newness
+            # boost.  Unknown date stays None (scored neutral).
 
             self._update_track_metadata(track)
 
