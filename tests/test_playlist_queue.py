@@ -108,6 +108,10 @@ class AdvanceTests(unittest.TestCase):
         self.assertFalse(temp)
 
     def test_wrap_on_normal_list_end(self):
+        # MODE-DEPENDENT (Task 5): this is the Truly-Random / default behaviour -
+        # replay the same order from index 0.  Once Task 5 lands, Smart Shuffle
+        # passes reshuffle_on_wrap=True and expects action == 'reshuffle' instead;
+        # that case gets its own test then.
         action, new_index, count, temp = advance(
             current_index=9, length=10, queued_count=0, is_temp_view=False
         )

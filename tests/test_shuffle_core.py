@@ -5,6 +5,7 @@ Run with:
     python -m unittest tests/test_shuffle_core.py -v
 """
 
+import json
 import os
 import random
 import sys
@@ -135,67 +136,64 @@ class TestAdaptiveConstraints(unittest.TestCase):
                 repeats += 1
         return repeats
 
-    def test_adaptive_window_exceeds_configured_minimum(self):
-        """Adaptive mode must compute spacing from unique cardinality, not track count.
+    def _longest_artist_run(self, result):
+        longest = run = 0
+        for i, t in enumerate(result):
+            if i and t.artist and t.artist == result[i - 1].artist:
+                run += 1
+            else:
+                run = 1
+            longest = max(longest, run)
+        return longest
 
-        With 400 tracks across 100 unique artists (sqrt(100)/2 = 5.0 → rounds to 5)
-        and a configured minimum of 2, the effective RECENT_ARTISTS must be >= 5.
-        We verify this by checking that same-artist adjacency is lower than it would
-        be if the minimum (2) were used literally.
+    def test_adaptive_window_raises_low_configured_minimum(self):
+        """Adaptive mode enlarges a too-small configured window from cardinality.
+
+        6 unique artists → adaptive artist window = max(3, round(sqrt(6)/2)) = 3.
+        With a small lookahead the choice of window measurably changes spacing,
+        so this input can actually observe the effect (a large-pool input cannot
+        - the repair phase drives adjacency to 0 for every window there).
+
+        Assert on metrics, not byte-identical output: adaptive with a configured
+        minimum of 1 must match the explicit window=3 baseline and must differ
+        from the explicit window=1 baseline.
         """
-        random.seed(42)
-        # 400 tracks, 100 unique artists → adaptive_artists = min(8, max(3, round(sqrt(100)/2))) = max(3,5) = 5
-        artists = [f"Artist_{i}" for i in range(100)]
-        tracks  = _make_tracks(400, artist_pool=artists)
+        artists = [f"Artist_{i}" for i in range(6)]
+        tracks  = _make_tracks(180, artist_pool=artists)
+        base = {'adaptive_constraints': False, 'recent_albums': 1,
+                'recent_genres': 1, 'lookahead': 6}
 
-        # Adaptive should compute window = 5 (from cardinality), overriding configured min of 2
-        config_adaptive = {'adaptive_constraints': True,  'recent_artists': 2, 'recent_albums': 1, 'recent_genres': 1}
-        # Manually set window to 2 to simulate the broken "count not unique" behaviour
-        config_min2     = {'adaptive_constraints': False, 'recent_artists': 2, 'recent_albums': 1, 'recent_genres': 1}
-        # Ground-truth with window = 5 (what adaptive should produce)
-        config_win5     = {'adaptive_constraints': False, 'recent_artists': 5, 'recent_albums': 1, 'recent_genres': 1}
+        adaptive = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {**base, 'adaptive_constraints': True, 'recent_artists': 1},
+            rng=random.Random(42))
+        win1 = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {**base, 'recent_artists': 1}, rng=random.Random(42))
+        win3 = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {**base, 'recent_artists': 3}, rng=random.Random(42))
 
-        random.seed(42)
-        result_adaptive = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config_adaptive)
-        repeats_adaptive = self._count_adjacent_artist_repeats(result_adaptive)
+        metrics = lambda r: (self._count_adjacent_artist_repeats(r),
+                             self._longest_artist_run(r))
 
-        random.seed(42)
-        result_min2 = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config_min2)
-        repeats_min2 = self._count_adjacent_artist_repeats(result_min2)
-
-        random.seed(42)
-        result_win5 = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config_win5)
-        repeats_win5 = self._count_adjacent_artist_repeats(result_win5)
-
-        # Adaptive must produce same or fewer repeats than window=2 baseline
-        self.assertLessEqual(repeats_adaptive, repeats_min2,
-                             "Adaptive constraints should not produce more repeats than window-2 baseline")
-
-        # Adaptive result must match window=5 result (verifies unique-cardinality path)
-        # (same seed → same random weights → same draft → identical repair outcome)
-        adaptive_fps = [t.filepath for t in result_adaptive]
-        win5_fps     = [t.filepath for t in result_win5]
-        self.assertEqual(adaptive_fps, win5_fps,
-                         "Adaptive with 100 unique artists should produce identical output to explicit window=5")
+        self.assertEqual(metrics(adaptive), metrics(win3),
+                         "adaptive(min=1) with 6 artists must behave as window=3")
+        self.assertNotEqual(metrics(adaptive), metrics(win1),
+                            "adaptive must not fall through to the configured minimum of 1")
 
     def test_adaptive_reduces_clumping_vs_minimal_constraints(self):
         """With many artists, adaptive mode should reduce same-artist adjacency."""
-        random.seed(42)
         artists = [f"Artist_{i}" for i in range(50)]
         tracks  = _make_tracks(200, artist_pool=artists)
 
         config_adaptive = {'adaptive_constraints': True,  'recent_artists': 2}
         config_off      = {'adaptive_constraints': False, 'recent_artists': 1, 'recent_albums': 1, 'recent_genres': 1}
 
-        random.seed(42)
-        result_adaptive = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config_adaptive)
-        repeats_adaptive = self._count_adjacent_artist_repeats(result_adaptive)
+        result_adaptive = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), config_adaptive, rng=random.Random(42))
+        result_off = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), config_off, rng=random.Random(42))
 
-        random.seed(42)
-        result_off = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config_off)
-        repeats_off = self._count_adjacent_artist_repeats(result_off)
-
-        self.assertLessEqual(repeats_adaptive, repeats_off,
+        self.assertLessEqual(self._count_adjacent_artist_repeats(result_adaptive),
+                             self._count_adjacent_artist_repeats(result_off),
                              "Adaptive constraints should not produce more repeats than minimal constraints")
 
     def test_adaptive_enabled_by_default(self):
@@ -219,9 +217,9 @@ class TestHistoryGuard(unittest.TestCase):
     def test_history_guard_depresses_recent_tracks(self):
         """Tracks in recent history should appear later on average.
 
-        Design: each track has a unique artist so the repair phase performs no
-        swaps.  With random_range=0 the output is a pure weight-ordered list,
-        making the penalty's effect fully deterministic.
+        Determinism lever: injected ``rng`` + zeroed additive randomness +
+        fixed ``now`` (legacy scoring).  When ``weighted`` mode lands it gets a
+        parallel test using positive ``beta`` instead.
         """
         n = 100
         # One unique artist per track → repair phase does no swaps at all
@@ -237,7 +235,6 @@ class TestHistoryGuard(unittest.TestCase):
         recent_fps     = {t.filepath for t in tracks[:10]}
         recent_history = [(t.filepath, t.artist.lower()) for t in tracks[:10]]
 
-        # Zero randomness so weights are fully deterministic
         config = {
             'history_guard_size':     10,
             'history_track_penalty':  0.9,  # strong penalty
@@ -249,9 +246,14 @@ class TestHistoryGuard(unittest.TestCase):
             'recent_albums':  1,
             'recent_genres':  1,
         }
+        fixed_now = 1_700_000_000.0
 
-        result_with    = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config, recent_history=recent_history)
-        result_without = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config, recent_history=None)
+        result_with    = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), config, recent_history=recent_history,
+            rng=random.Random(3), now=fixed_now)
+        result_without = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), config, recent_history=None,
+            rng=random.Random(3), now=fixed_now)
 
         mean_rank_with    = self._rank_of_recent(result_with,    recent_fps)
         mean_rank_without = self._rank_of_recent(result_without, recent_fps)
@@ -271,17 +273,104 @@ class TestDeterminism(unittest.TestCase):
     def test_same_seed_same_result(self):
         tracks = _make_tracks(100)
         config = {}
+        fixed_now = 1_700_000_000.0
 
-        random.seed(7)
-        result_a = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config)
-
-        random.seed(7)
-        result_b = CustomShuffleAlgorithm.smart_shuffle(list(tracks), config)
+        result_a = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), config, rng=random.Random(7), now=fixed_now)
+        result_b = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), config, rng=random.Random(7), now=fixed_now)
 
         fps_a = [t.filepath for t in result_a]
         fps_b = [t.filepath for t in result_b]
         self.assertEqual(fps_a, fps_b,
-                         "Same seed must produce identical shuffle order")
+                         "Same injected rng seed must produce identical shuffle order")
+
+
+class TestRngClockSeam(unittest.TestCase):
+    """Task 0a: injectable rng/now, behaviour-preserving when rng is None."""
+
+    def test_injected_rng_is_isolated_from_global_random(self):
+        tracks = _make_tracks(60)
+
+        random.seed(999)
+        out_a = [t.filepath for t in CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {}, rng=random.Random(42))]
+
+        random.seed(111)
+        out_b = [t.filepath for t in CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {}, rng=random.Random(42))]
+
+        self.assertEqual(out_a, out_b,
+                         "Same injected rng seed must yield same order "
+                         "regardless of global random state")
+
+    # Bit-identical backward compatibility of the rng=None path is locked by
+    # TestLegacyGolden (a frozen pre-seam snapshot), not here.
+
+    def test_now_is_injectable_without_error(self):
+        tracks = _make_tracks(10)
+        CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {}, rng=random.Random(1), now=1_000_000.0)
+
+    def test_truly_random_accepts_injected_rng(self):
+        tracks = _make_tracks(30)
+        a = [t.filepath for t in
+             CustomShuffleAlgorithm.truly_random(list(tracks), rng=random.Random(5))]
+        b = [t.filepath for t in
+             CustomShuffleAlgorithm.truly_random(list(tracks), rng=random.Random(5))]
+        self.assertEqual(a, b)
+
+
+def _golden_tracks(n, now):
+    """Deterministic library that exercises every legacy scoring branch.
+
+    Unlike the bare `_make_tracks`, this populates `last_played`, `date_added`,
+    `loved` and `bpm` so `_recency_boost`, `_newness_boost`, `_love_score` and
+    the bpm bonus all contribute - and so the injected `now` is load-bearing.
+    """
+    tracks = _make_tracks(n)
+    for i, t in enumerate(tracks):
+        t.last_played = None if i % 7 == 0 else now - (i * 3600) - 60
+        t.date_added  = now - ((i % 90) + 1) * 86400
+        t.loved       = (None, True, False)[i % 3]
+        t.bpm         = (0, 0, 120, 140)[i % 4]
+    return tracks
+
+
+class TestLegacyGolden(unittest.TestCase):
+    """Frozen snapshot of pre-Task-2 draft+repair output.
+
+    Guards that the legacy scoring path stays bit-identical once the core is
+    replaced (Task 2a keeps `scoring_mode='legacy'` as the default).  NOTE:
+    depends on `_make_tracks` staying RNG-free and stable - if that helper
+    changes, a failure here is a fixture-staleness signal, not necessarily a
+    scoring regression.
+    """
+
+    def test_matches_frozen_snapshot(self):
+        fixture_path = os.path.join(os.path.dirname(__file__),
+                                    'fixtures_shuffle_legacy_golden.json')
+        with open(fixture_path) as f:
+            g = json.load(f)
+
+        random.seed(g['seed'])
+        tracks = _golden_tracks(g['n'], g['now'])
+        result = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), g['config'], now=g['now'])
+
+        self.assertEqual([t.filepath for t in result], g['expected'])
+
+    def test_now_actually_affects_output(self):
+        """Sanity: the fixture library is recency-sensitive, so the golden is
+        genuinely locking the recency/newness math (not just draft order)."""
+        g_now = 1_700_000_000.0
+        a = CustomShuffleAlgorithm.smart_shuffle(
+            _golden_tracks(80, g_now), {'adaptive_constraints': True},
+            rng=random.Random(1), now=g_now)
+        b = CustomShuffleAlgorithm.smart_shuffle(
+            _golden_tracks(80, g_now), {'adaptive_constraints': True},
+            rng=random.Random(1), now=g_now + 400 * 86400)
+        self.assertNotEqual([t.filepath for t in a], [t.filepath for t in b])
 
 
 class TestTrulyRandom(unittest.TestCase):

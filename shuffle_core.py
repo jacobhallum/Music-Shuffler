@@ -22,7 +22,7 @@ class CustomShuffleAlgorithm:
     """Custom shuffle algorithms for music playback"""
 
     @staticmethod
-    def smart_shuffle(tracks, config=None, recent_history=None):
+    def smart_shuffle(tracks, config=None, recent_history=None, *, rng=None, now=None):
         """
         Smart Shuffle v2 - Optimised for large libraries (15K+ tracks)
 
@@ -39,12 +39,23 @@ class CustomShuffleAlgorithm:
         recent_history : list of (norm_path, artist_key_or_None), optional
             Recently-played entries used by the history guard.  Each element is a
             2-tuple ``(normalized_filepath, artist_key_string_or_None)``.
+        rng : random.Random, optional
+            Random source.  When ``None`` the global :mod:`random` module is used,
+            so callers that seed via :func:`random.seed` keep bit-identical
+            output.  Pass an explicit ``random.Random(seed)`` for isolation from
+            global state (e.g. tests, or the background shuffle thread).
+        now : float, optional
+            Wall-clock epoch seconds for recency/newness scoring.  Defaults to
+            :func:`time.time` at call time; injectable for deterministic tests.
         """
         if not tracks:
             return []
 
         if config is None:
             config = {}
+
+        if rng is None:
+            rng = random
 
         # ---- Constraint windows ------------------------------------------------
         RECENT_ARTISTS = config.get('recent_artists', 3)
@@ -57,7 +68,8 @@ class CustomShuffleAlgorithm:
         UNKNOWN_ALBUM  = {"", "unknown album"}
         UNKNOWN_GENRE  = {"", "unknown"}
 
-        now = time.time()
+        if now is None:
+            now = time.time()
 
         # ---- Helper / scoring functions ----------------------------------------
         def _norm_rating(r):
@@ -188,7 +200,7 @@ class CustomShuffleAlgorithm:
         def _compute_weight(t):
             random_min   = config.get('random_min',   0.20)
             random_range = config.get('random_range', 0.50)
-            w = random_min + random.random() * random_range
+            w = random_min + rng.random() * random_range
 
             w += config.get('rating_weight',       0.55) * _norm_rating(getattr(t, 'rating', None))
             w += config.get('novelty_weight',      0.55) * _novelty_score(getattr(t, 'play_count', None))
@@ -293,8 +305,14 @@ class CustomShuffleAlgorithm:
         return result
 
     @staticmethod
-    def truly_random(tracks):
-        """Standard random shuffle"""
+    def truly_random(tracks, *, rng=None):
+        """Standard random shuffle.
+
+        ``rng`` behaves as in :meth:`smart_shuffle` - ``None`` uses the global
+        :mod:`random` module for backward-compatible output.
+        """
+        if rng is None:
+            rng = random
         shuffled = list(tracks)
-        random.shuffle(shuffled)
+        rng.shuffle(shuffled)
         return shuffled
