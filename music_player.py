@@ -1344,11 +1344,13 @@ class MusicPlayerGUI:
         self._setup_global_media_keys()
         # Transport keys (F5-F8) and the hardware media dial both arrive as a real
         # WM_APPCOMMAND — fnlock owns the physical-key-to-action mapping, this app
-        # just reacts to whatever command it actually sends. Foreground-only.
+        # just reacts to whatever command it actually sends. Delivery (global vs.
+        # foreground-only) depends entirely on which window fnlock targets, not on
+        # anything here — see _setup_wm_appcommand_hook's docstring.
         self._setup_wm_appcommand_hook()
 
         print("Keyboard shortcuts enabled:")
-        print("  Volume keys work globally (out of focus); transport keys/dial need focus")
+        print("  Volume keys work globally (out of focus); transport keys/dial: reacts to whatever fnlock sends")
 
     def _setup_global_media_keys(self):
         """Enable the volume keys even when the window is not focused.
@@ -1414,11 +1416,18 @@ class MusicPlayerGUI:
         media dial — fnlock forwards both the same way, as a real WM_APPCOMMAND,
         so this app doesn't need to know or duplicate fnlock's physical-key mapping.
 
-        Unlike the global keyboard hook above (volume keys only), WM_APPCOMMAND is
-        only delivered to the foreground window — this only fires while the app is
-        focused. Focus-independent control would require registering with Windows'
-        System Media Transport Controls (SMTC) instead; not done here, deliberately,
-        to keep this change small.
+        WM_APPCOMMAND has no inherent foreground requirement — it's just a message
+        sent to whatever window handle the sender chooses, via SendMessage. It's not
+        this app that decides whether that's global or foreground-only; fnlock is
+        the sender, and its SendAppCommand() (fn-lock.ahk, a separate companion repo)
+        is what decides the target. fnlock currently targets this app's window
+        directly whenever it's running (falling back to the foreground window only
+        when this app isn't open), so in practice this fires regardless of focus —
+        but that's a property of fnlock's current code, not a guarantee this app can
+        make on its own. (An earlier version of this comment claimed WM_APPCOMMAND
+        was inherently foreground-only and that fixing it would need Windows' System
+        Media Transport Controls — that was wrong; SMTC is a real alternative but was
+        never actually necessary here.)
         """
         try:
             import ctypes
@@ -1509,7 +1518,7 @@ class MusicPlayerGUI:
             self._appcmd_hwnd = hwnd
             self._appcmd_old_proc = old_proc
             self._appcmd_set_window_long = set_window_long
-            print("✓ Media transport hook enabled — F5-F8 + dial (works only while window is focused)")
+            print("✓ Media transport hook enabled — F5-F8 + dial (reacts to whatever fnlock sends)")
             self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
         except Exception as e:
             print(f"⚠ Media transport hook disabled: {e}")
@@ -2950,7 +2959,6 @@ class MusicPlayerGUI:
             ("", ""),
             ("F5-F8", "Prev/Next/Play-Pause/Stop"),
             ("+ dial", "Whatever fnlock currently maps them to"),
-            ("", "Only works while this window is focused"),
         ]
         
         for key, action in shortcuts:
@@ -2983,7 +2991,9 @@ class MusicPlayerGUI:
         text.insert(tk.END, "mapping for these — it reacts to whatever real media command\n")
         text.insert(tk.END, "fnlock actually sends (its own GUI/config.ini controls which\n")
         text.insert(tk.END, "F-key does what). Check fnlock's config to see the current\n")
-        text.insert(tk.END, "mapping. These only work while this window is focused.\n\n")
+        text.insert(tk.END, "mapping. fnlock's current setup targets this app directly when\n")
+        text.insert(tk.END, "it's running, so these work regardless of focus (as fnlock is\n")
+        text.insert(tk.END, "currently configured).\n\n")
         text.insert(tk.END, "Press any F5-F11 key and check the console for output.\n\n")
         
         try:
