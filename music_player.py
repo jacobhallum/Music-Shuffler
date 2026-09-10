@@ -21,7 +21,6 @@ FEATURES:
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
-import random
 import re
 import queue
 from collections import deque
@@ -62,6 +61,7 @@ MIN_VALID_CACHE_SIZE = 1024  # Minimum bytes for valid converted file
 END_DETECTION_BUFFER_SEC = 2.0  # Buffer seconds for track end detection
 VOLUME_SYNC_INTERVAL_SEC = 2.0  # How often to sync volume slider with system
 METADATA_SAVE_DEBOUNCE_SEC = 0.1  # Debounce delay for metadata saves
+HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
 
@@ -495,9 +495,11 @@ class MusicPlayerGUI:
         self.queued_count = 0          # Manually-queued tracks right after current_index
         self.is_temp_view = False      # True when current_playlist is a taken-over search view
 
-        # Recent play history for shuffle history guard (Task 5)
-        # Stores (normalized_filepath, artist_key_or_None) tuples
-        self._recent_play_history = deque(maxlen=200)
+        # Recent play history for the shuffle history guard.  The persisted
+        # source of truth is self._history_entries (list of shuffle_history
+        # entry dicts), loaded during cache setup below; this deque is kept only
+        # as a defensive default in case that load has not run yet.
+        self._recent_play_history = deque(maxlen=200)  # legacy; unused once history loads
 
         # Debug flag: set MUSIC_SHUFFLER_DEBUG_SCAN=1 to enable scan spam (Task 8)
         self.debug_scan_logging = os.getenv('MUSIC_SHUFFLER_DEBUG_SCAN', '0') == '1'
@@ -589,7 +591,21 @@ class MusicPlayerGUI:
         self.volume_pref_file = cache_dir / "volume_pref.txt"
         self.player_metadata_file = cache_dir / "music_player_metadata.xml"
         self.shuffle_config_file = cache_dir / "shuffle_config.json"
+        self.shuffle_history_file = cache_dir / "shuffle_history.json"
         print(f"Cache directory: {cache_dir}")
+
+        # Persisted ordered listening history (Task 3) - survives restarts so
+        # Smart Shuffle keeps session continuity.
+        try:
+            import shuffle_history as _sh
+            self._history_entries = _sh.load(str(self.shuffle_history_file))
+            if self._history_entries:
+                print(f"✓ Loaded {len(self._history_entries)} listening-history entries")
+        except Exception as e:
+            print(f"⚠ Could not load shuffle history: {e}")
+            self._history_entries = []
+        self._history_dirty = False
+        self._history_save_job = None
         
         # Initialize shuffle configuration
         self._init_shuffle_config()
@@ -1013,6 +1029,54 @@ class MusicPlayerGUI:
         except Exception as e:
             print(f"Error saving shuffle config: {e}")
             return False
+
+    # ---- Persisted listening history (Task 3) -----------------------------
+
+    def _record_history_start(self, track):
+        """Append a playback start to the history and schedule a debounced save."""
+        try:
+            import shuffle_history as _sh
+            entry = _sh.make_entry(
+                track.filepath,   # matches what smart_shuffle compares against
+                artist=getattr(track, 'artist', None),
+                album=getattr(track, 'album', None),
+                genre=getattr(track, 'genre', None),
+            )
+            self._history_entries = _sh.append(self._history_entries, entry)
+            self._history_dirty = True
+            if self._history_save_job is not None:
+                try:
+                    self.root.after_cancel(self._history_save_job)
+                except Exception:
+                    pass
+            self._history_save_job = self.root.after(
+                HISTORY_SAVE_DEBOUNCE_MS, self._flush_history)
+        except Exception as e:
+            print(f"⚠ Could not record listening history: {e}")
+
+    def _flush_history(self):
+        """Write the listening history to disk if it changed (atomic)."""
+        self._history_save_job = None
+        if not self._history_dirty:
+            return
+        try:
+            import shuffle_history as _sh
+            _sh.save(str(self.shuffle_history_file), list(self._history_entries))
+            self._history_dirty = False
+        except Exception as e:
+            print(f"⚠ Could not save listening history: {e}")
+
+    def _shuffle_context(self):
+        """Build (recent_history, context) for a smart_shuffle call."""
+        try:
+            import shuffle_history as _sh
+            entries = list(self._history_entries)
+            recent = _sh.to_recent_history(entries)
+            context = {'protected_paths': _sh.protected_paths(entries),
+                       'protect_positions': 3}
+            return recent, context
+        except Exception:
+            return [], None
     
     def edit_shuffle_settings(self):
         """Edit shuffle algorithm parameters"""
@@ -2410,6 +2474,15 @@ class MusicPlayerGUI:
         except (OSError, IOError, Exception) as e:
             print(f"⚠ Error saving metadata on close: {e}")
 
+        # Final listening-history flush
+        try:
+            if self._history_save_job is not None:
+                self.root.after_cancel(self._history_save_job)
+                self._history_save_job = None
+            self._flush_history()
+        except Exception as e:
+            print(f"⚠ Error saving listening history on close: {e}")
+
         try:
             self.stop_background_preconversion()
         except (RuntimeError, Exception) as e:
@@ -2677,14 +2750,10 @@ class MusicPlayerGUI:
             
             self.update_library_stats()
             
-            if self.all_tracks and self.audio_available:
-                random_track = random.choice(self.all_tracks)
-                self.current_playlist = [random_track]
-                self.current_index = 0
-                self.play_track_at_index(0)
-            
+            # History-aware Smart Shuffle picks the first track too - no random
+            # pick then reshuffle around it (Task 3).
             if self.all_tracks:
-                self.apply_shuffle()
+                self.apply_shuffle(auto_play=bool(self.audio_available))
             
             # Start background pre-conversion after small delay (avoid status overlap)
             self.root.after(500, self.start_background_preconversion)
@@ -2794,7 +2863,8 @@ class MusicPlayerGUI:
             "This will delete:\n"
             "• Library cache\n"
             "• M4P Downloads metadata\n"
-            "• All converted .mp3 files\n\n"
+            "• All converted .mp3 files\n"
+            "• Recent listening history (shuffle continuity)\n\n"
             "Songs will need to be converted again when played.\n"
             "M4P metadata will start fresh.\n\n"
             "Continue?"
@@ -2817,7 +2887,15 @@ class MusicPlayerGUI:
                 deleted_size += self.player_metadata_file.stat().st_size
                 self.player_metadata_file.unlink()
                 deleted_count += 1
-            
+
+            # Listening history is session-continuity cache; clear it too
+            if self.shuffle_history_file.exists():
+                deleted_size += self.shuffle_history_file.stat().st_size
+                self.shuffle_history_file.unlink()
+                deleted_count += 1
+            self._history_entries = []
+            self._history_dirty = False
+
             if self.convert_cache_dir.exists():
                 for file in self.convert_cache_dir.iterdir():
                     if file.is_file():
@@ -2877,7 +2955,16 @@ class MusicPlayerGUI:
             # Delete metadata file
             if self.player_metadata_file.exists():
                 self.player_metadata_file.unlink()
-            
+
+            # Metadata reset also clears persisted listening history (Task 3)
+            try:
+                if self.shuffle_history_file.exists():
+                    self.shuffle_history_file.unlink()
+            except OSError:
+                pass
+            self._history_entries = []
+            self._history_dirty = False
+
             # Reset all loaded tracks
             for track in self.all_tracks:
                 track.play_count = 0
@@ -3431,12 +3518,14 @@ class MusicPlayerGUI:
             
             self.status_label.config(text="Shuffling...")
             
+            recent_snapshot, context_snapshot = self._shuffle_context()
+
             def compute_shuffle():
                 try:
-                    history_snapshot = list(self._recent_play_history)
                     result = CustomShuffleAlgorithm.smart_shuffle(
                         tracks_snapshot, self.shuffle_config,
-                        recent_history=history_snapshot,
+                        recent_history=recent_snapshot,
+                        context=context_snapshot,
                     )
                     
                     def apply_if_latest():
@@ -3873,10 +3962,8 @@ class MusicPlayerGUI:
 
             self._update_track_metadata(track)
 
-            # Task 5: record in recent play history for shuffle history guard
-            norm_fp   = self._norm_path(track.filepath)
-            artist_k  = (track.artist or "").strip().lower() or None
-            self._recent_play_history.append((norm_fp, artist_k))
+            # Record this start in the persisted listening history (Task 3).
+            self._record_history_start(track)
             print(f"▶ Playing: {track.title}{ext} (plays: {track.play_count})")
             
             self._seek_base_sec = 0.0

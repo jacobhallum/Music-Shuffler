@@ -133,6 +133,53 @@ class TestHistoryGuardSizeZero(unittest.TestCase):
                          "guard size 0 must be a no-op")
 
 
+class TestStartProtection(unittest.TestCase):
+    """context={'protected_paths': [...]} keeps just-played tracks out of the
+    first few positions of a fresh shuffle."""
+
+    def _lib(self, n=40):
+        return [QTrack(f'/t{i:02d}.mp3', f'Art{i}') for i in range(n)]
+
+    def test_protected_tracks_not_in_first_three(self):
+        lib = self._lib()
+        protected = {t.filepath for t in lib[:3]}
+        for seed in range(30):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                list(lib), {}, rng=random.Random(seed), now=NOW,
+                context={'protected_paths': protected, 'protect_positions': 3})
+            first3 = {t.filepath for t in out[:3]}
+            self.assertEqual(first3 & protected, set(),
+                             f"seed {seed}: protected track in first 3")
+
+    def test_still_complete(self):
+        lib = self._lib()
+        protected = {t.filepath for t in lib[:3]}
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {}, rng=random.Random(1), now=NOW,
+            context={'protected_paths': protected})
+        self.assertEqual(sorted(t.filepath for t in out),
+                         sorted(t.filepath for t in lib))
+
+    def test_degrades_when_pool_too_small(self):
+        # 2 tracks, both protected -> cannot honour protection, must not hang
+        a, b = QTrack('/a.mp3', 'A'), QTrack('/b.mp3', 'B')
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            [a, b], {}, rng=random.Random(1), now=NOW,
+            context={'protected_paths': {'/a.mp3', '/b.mp3'}, 'protect_positions': 3})
+        self.assertEqual(len(out), 2)
+
+    def test_context_recent_history_still_penalises(self):
+        lib = self._lib(60)
+        recent = [(t.filepath, t.artist.lower()) for t in lib[:10]]
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {'random_min': 0.0, 'random_range': 0.0},
+            recent_history=recent, rng=random.Random(1), now=NOW)
+        positions = {t.filepath: i for i, t in enumerate(out)}
+        recent_mean = sum(positions[t.filepath] for t in lib[:10]) / 10
+        other_mean = sum(positions[t.filepath] for t in lib[10:]) / 50
+        self.assertGreater(recent_mean, other_mean)
+
+
 class TestWeightedMode(unittest.TestCase):
     """scoring_mode='weighted': favourites lead more often, but not always."""
 

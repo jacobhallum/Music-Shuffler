@@ -259,7 +259,8 @@ class CustomShuffleAlgorithm:
     """Custom shuffle algorithms for music playback"""
 
     @staticmethod
-    def smart_shuffle(tracks, config=None, recent_history=None, *, rng=None, now=None):
+    def smart_shuffle(tracks, config=None, recent_history=None, *,
+                      rng=None, now=None, context=None):
         """
         Bucketed stride-interleave shuffle - O(n log k) in unique artists,
         well under a second on 15K+ track libraries at any artist skew.
@@ -281,6 +282,13 @@ class CustomShuffleAlgorithm:
         now : float, optional
             Wall-clock epoch seconds for recency/newness scoring.  Defaults to
             :func:`time.time` at call time; injectable for deterministic tests.
+        context : dict, optional
+            Extra playback context.  Recognised keys:
+              ``protected_paths``    - iterable of normalised filepaths to keep
+                                       out of the first ``protect_positions``
+                                       result slots (degrades gracefully when
+                                       the pool is too small).
+              ``protect_positions``  - int, default 3.
         """
         if not tracks:
             return []
@@ -466,6 +474,30 @@ class CustomShuffleAlgorithm:
                     heapq.heappush(cooling, (m['cool_until'], key))
                 else:
                     heapq.heappush(avail, _avail_entry(key))
+
+        # ---- Start protection (Task 3) --------------------------------------
+        if context:
+            protected = {os.path.normcase(os.path.normpath(p))
+                         for p in context.get('protected_paths') or ()}
+            k = min(int(context.get('protect_positions', 3)), n)
+            if protected:
+                swap_from = k
+                for i in range(k):
+                    fp = os.path.normcase(os.path.normpath(
+                        getattr(result[i], 'filepath', '') or ''))
+                    if fp not in protected:
+                        continue
+                    # find the earliest later slot holding a non-protected track
+                    while swap_from < n:
+                        cand = os.path.normcase(os.path.normpath(
+                            getattr(result[swap_from], 'filepath', '') or ''))
+                        if cand not in protected:
+                            break
+                        swap_from += 1
+                    if swap_from >= n:
+                        break   # whole pool is protected - degrade gracefully
+                    result[i], result[swap_from] = result[swap_from], result[i]
+                    swap_from += 1
 
         return result
 
