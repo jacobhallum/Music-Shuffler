@@ -278,6 +278,52 @@ def legacy_preference_score(track, cfg, *, now, base=0.0,
     return w
 
 
+def explain_preference_score(track, config=None, *, now=None, scoring_mode=None):
+    """Human-readable breakdown of a track's deterministic preference score.
+
+    Returns a dict: {'mode', 'score', 'components': [(label, value), ...],
+    'feedback', 'notes': [...]}.  Used by the diagnostic tool so it can never
+    drift from the real scorer (Task 9).
+    """
+    import time as _t
+    cfg = normalize_shuffle_config(config)
+    if now is None:
+        now = _t.time()
+    mode = scoring_mode or cfg['scoring_mode']
+    wcfg = cfg
+    if mode == 'weighted':
+        wcfg = {**cfg, 'rating_weight': 0.0, 'loved_weight': 0.85}
+
+    comps = [
+        ('rating',   wcfg['rating_weight']  * _norm_rating(getattr(track, 'rating', None))),
+        ('novelty',  wcfg['novelty_weight'] * _novelty_score(getattr(track, 'play_count', None))),
+        ('recency',  wcfg['recency_weight'] * _recency_boost(getattr(track, 'last_played', None), now)),
+        ('newness',  wcfg['newness_weight'] * _newness_boost(getattr(track, 'date_added', None), now)),
+        ('favorite', wcfg['loved_weight']   * _love_score(getattr(track, 'loved', None))),
+        ('skip_penalty(legacy)', -wcfg['skip_penalty_weight'] * _skip_penalty(track)),
+        ('feedback_penalty',     -_feedback_penalty(track, wcfg, now)),
+    ]
+    score = legacy_preference_score(track, wcfg, now=now)
+    notes = []
+    if mode == 'weighted':
+        notes.append("weighted mode: numeric rating is ignored; favorite weight = 0.85")
+    else:
+        notes.append("legacy mode: numeric rating still contributes")
+    notes.append("final playlist position also depends on artist stride + a "
+                 "per-seed random race, so rank varies run to run")
+    return {
+        'mode': mode,
+        'score': score,
+        'components': comps,
+        'feedback': {
+            'qualified_play_count': getattr(track, 'qualified_play_count', None),
+            'manual_skip_count': getattr(track, 'manual_skip_count', None),
+            'last_skipped_at': getattr(track, 'last_skipped_at', None),
+        },
+        'notes': notes,
+    }
+
+
 def _boltzmann_weights(scores, beta):
     """Scale-free race weights for ``weighted`` mode: w = exp(beta * clamp(z)).
 
