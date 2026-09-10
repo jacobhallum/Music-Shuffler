@@ -12,6 +12,7 @@ import unittest
 # Allow running from project root or tests/ directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
+import playlist_queue
 from playlist_queue import queue_target, advance, previous_position
 
 
@@ -83,6 +84,44 @@ class QueueTargetTests(unittest.TestCase):
         self.assertEqual(insert_idx, 2)
         self.assertEqual(cur, 0)
         self.assertEqual(count, 2)
+
+
+class ReshuffleCompositionTests(unittest.TestCase):
+    """Fixed-prefix preservation across a reshuffle (Task 4)."""
+
+    def _mk(self, path):
+        return type('T', (), {'filepath': path})()
+
+    def test_prefix_excluded_from_shuffle_input(self):
+        lib = [self._mk(f'/m/{i}.mp3') for i in range(6)]
+        active = lib[2]
+        queued = [lib[4], lib[0]]
+        tail = playlist_queue.reshuffle_tail_input(
+            lib, active, queued, norm_fn=lambda p: p.lower())
+        paths = {t.filepath for t in tail}
+        self.assertEqual(paths, {'/m/1.mp3', '/m/3.mp3', '/m/5.mp3'})
+
+    def test_none_active_keeps_whole_library_minus_queue(self):
+        lib = [self._mk(f'/m/{i}.mp3') for i in range(4)]
+        tail = playlist_queue.reshuffle_tail_input(
+            lib, None, [lib[1]], norm_fn=lambda p: p)
+        self.assertEqual({t.filepath for t in tail}, {'/m/0.mp3', '/m/2.mp3', '/m/3.mp3'})
+
+    def test_compose_puts_active_then_queue_then_tail(self):
+        active = self._mk('/a.mp3')
+        queued = [self._mk('/q1.mp3'), self._mk('/q2.mp3')]
+        tail = [self._mk('/t1.mp3'), self._mk('/t2.mp3')]
+        playlist, idx, qc = playlist_queue.reshuffle_compose(active, queued, tail)
+        self.assertEqual([t.filepath for t in playlist],
+                         ['/a.mp3', '/q1.mp3', '/q2.mp3', '/t1.mp3', '/t2.mp3'])
+        self.assertEqual(idx, 0)
+        self.assertEqual(qc, 2)
+
+    def test_compose_no_active(self):
+        tail = [self._mk('/t1.mp3'), self._mk('/t2.mp3')]
+        playlist, idx, qc = playlist_queue.reshuffle_compose(None, [], tail)
+        self.assertEqual([t.filepath for t in playlist], ['/t1.mp3', '/t2.mp3'])
+        self.assertEqual((idx, qc), (0, 0))
 
 
 class AdvanceTests(unittest.TestCase):

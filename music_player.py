@@ -608,6 +608,9 @@ class MusicPlayerGUI:
         self._history_save_job = None
         self._active_algo = "Smart Shuffle"
         self._last_wrap_mono = 0.0   # cycle-wrap loop guard (Task 5)
+        # Playback lifecycle, tracked independently of is_playing so a *paused*
+        # track still counts as "active" for reshuffle prefix preservation.
+        self._playback_state = 'stopped'   # 'playing' | 'paused' | 'stopped'
         
         # Initialize shuffle configuration
         self._init_shuffle_config()
@@ -1720,14 +1723,16 @@ class MusicPlayerGUI:
             
             pygame.mixer.music.pause()
             self.is_playing = False
+            self._playback_state = 'paused'
             print("Paused")
         else:
             # Reset segment start time when unpausing
             self._segment_start_mono = time.monotonic()
-            
+
             pygame.mixer.music.unpause()
             if pygame.mixer.music.get_busy():
                 self.is_playing = True
+                self._playback_state = 'playing'
                 print("Unpaused")
             else:
                 self.play_track_at_index(self.current_index)
@@ -3516,11 +3521,22 @@ class MusicPlayerGUI:
         
         if algo == "Smart Shuffle":
             self._set_navigation_enabled(False)
-            
-            tracks_snapshot = list(self.all_tracks)
-            
+
+            # Snapshot the fixed prefix on the main thread BEFORE the worker
+            # starts (Task 4): the active track (playing or paused) plus the
+            # untouched queued block.  Skipped for auto_play (startup / wrap),
+            # which deliberately starts fresh from index 0.
+            if auto_play:
+                active_track, queued_block = None, []
+            else:
+                active_track = self._active_track()
+                queued_block = list(self._get_queued_tracks())
+
+            tracks_snapshot = playlist_queue.reshuffle_tail_input(
+                self.all_tracks, active_track, queued_block, norm_fn=self._norm_path)
+
             self.status_label.config(text="Shuffling...")
-            
+
             recent_snapshot, context_snapshot = self._shuffle_context()
 
             def compute_shuffle():
@@ -3530,13 +3546,22 @@ class MusicPlayerGUI:
                         recent_history=recent_snapshot,
                         context=context_snapshot,
                     )
-                    
+
                     def apply_if_latest():
-                        if getattr(self, "_shuffle_token", 0) != token:
-                            # If this shuffle is stale, ensure nav isn't left disabled
+                        stale = (getattr(self, "_shuffle_token", 0) != token)
+                        # Also stale if playback auto-advanced past the track we
+                        # snapshotted while the worker ran (Task 4).
+                        if not stale and not auto_play and active_track is not None \
+                                and self._active_track() is not active_track:
+                            stale = True
+                        if stale:
                             self._set_navigation_enabled(True)
+                            self.status_label.config(
+                                text=f"✓ {len(self.current_playlist)} tracks")
                             return
-                        self._apply_shuffle_results(result, algo, auto_play=auto_play)
+                        self._apply_shuffle_results(
+                            result, algo, auto_play=auto_play,
+                            active_track=active_track, queued_block=queued_block)
                     
                     try:
                         self.root.after(0, apply_if_latest)
@@ -3559,30 +3584,20 @@ class MusicPlayerGUI:
         # Non-smart shuffles should never leave nav disabled
         self._set_navigation_enabled(True)
 
-        currently_playing_track = None
-        if self.is_playing and self.current_playlist and 0 <= self.current_index < len(self.current_playlist):
-            currently_playing_track = self.current_playlist[self.current_index]
-
-        # Only Truly Random remains (everything else is Smart Shuffle)
-        self.current_playlist = CustomShuffleAlgorithm.truly_random(self.all_tracks)
-        self.queued_count = 0
-        self.is_temp_view = False
-
-        # Move currently playing track to position 0
-        if currently_playing_track and not auto_play:
-            try:
-                # Find and remove the currently playing track from the shuffled playlist
-                playing_index = next(i for i, t in enumerate(self.current_playlist)
-                                   if self._norm_path(t.filepath) == self._norm_path(currently_playing_track.filepath))
-                self.current_playlist.pop(playing_index)
-
-                # Insert it at the beginning
-                self.current_playlist.insert(0, currently_playing_track)
-                self.current_index = 0
-            except (StopIteration, ValueError):
-                self.current_index = 0
+        # Only Truly Random remains (everything else is Smart Shuffle).  Same
+        # fixed-prefix preservation as Smart Shuffle (Task 4).
+        if auto_play:
+            active_track, queued_block = None, []
         else:
-            self.current_index = 0
+            active_track = self._active_track()
+            queued_block = list(self._get_queued_tracks())
+
+        tail = CustomShuffleAlgorithm.truly_random(
+            playlist_queue.reshuffle_tail_input(
+                self.all_tracks, active_track, queued_block, norm_fn=self._norm_path))
+        self.current_playlist, self.current_index, self.queued_count = \
+            playlist_queue.reshuffle_compose(active_track, queued_block, tail)
+        self.is_temp_view = False
 
         # Clear search filter to show full shuffled playlist
         self.filtered_playlist = []
@@ -3594,31 +3609,20 @@ class MusicPlayerGUI:
         if auto_play:
             self.play_track_at_index(0)
     
-    def _apply_shuffle_results(self, playlist, algo, auto_play=False):
-        """Apply shuffle results on main thread"""
-        currently_playing_track = None
-        if self.is_playing and self.current_playlist and 0 <= self.current_index < len(self.current_playlist):
-            currently_playing_track = self.current_playlist[self.current_index]
+    def _apply_shuffle_results(self, playlist, algo, auto_play=False,
+                               active_track=None, queued_block=None):
+        """Apply shuffle results on main thread.
 
-        # Move currently playing track to position 0
-        if currently_playing_track and not auto_play:
-            try:
-                # Find and remove the currently playing track from the shuffled playlist
-                playing_index = next(i for i, t in enumerate(playlist)
-                                   if self._norm_path(t.filepath) == self._norm_path(currently_playing_track.filepath))
-                playlist.pop(playing_index)
+        ``playlist`` is the freshly shuffled tail (already excludes the fixed
+        prefix).  The prefix - ``active_track`` then ``queued_block`` - is
+        re-attached at the front so the play position and Up Next survive the
+        reshuffle (Task 4).  For auto_play both are None/empty and playback
+        starts at index 0.
+        """
+        queued_block = queued_block or []
+        self.current_playlist, self.current_index, self.queued_count = \
+            playlist_queue.reshuffle_compose(active_track, queued_block, playlist)
 
-                # Insert it at the beginning
-                playlist.insert(0, currently_playing_track)
-                self.current_index = 0
-            except (StopIteration, ValueError):
-                # Track not found in new playlist (shouldn't happen), just use playlist as-is
-                self.current_index = 0
-        else:
-            self.current_index = 0
-
-        self.current_playlist = playlist
-        self.queued_count = 0
         self.is_temp_view = False
         self.filtered_playlist = []  # Clear search filter
         self.search_var.set('')  # Clear search box
@@ -3824,6 +3828,10 @@ class MusicPlayerGUI:
         self.current_index = new_current_index
         self.queued_count = new_queued_count
 
+        # Invalidate any in-flight shuffle: it snapshotted the old queue, so
+        # its result would drop this newly-queued track (Task 4).
+        self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
+
         if play_next:
             self.status_label.config(text=f"▶ Will play next: {track.title}")
         else:
@@ -3836,6 +3844,14 @@ class MusicPlayerGUI:
         start = self.current_index + 1
         end = start + self.queued_count
         return self.current_playlist[start:end]
+
+    def _active_track(self):
+        """The track the player is currently on - playing OR paused (not
+        stopped).  Used to keep the play position aligned across a reshuffle."""
+        if self._playback_state in ('playing', 'paused') and \
+                0 <= self.current_index < len(self.current_playlist):
+            return self.current_playlist[self.current_index]
+        return None
 
     def view_up_next(self):
         """Show Up Next queue in a dialog"""
@@ -3883,6 +3899,7 @@ class MusicPlayerGUI:
             end = start + count
             del self.current_playlist[start:end]
             self.queued_count = 0
+            self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
             self.display_playlist()
             self.status_label.config(text=f"Cleared {count} tracks from Up Next")
         else:
@@ -3951,6 +3968,7 @@ class MusicPlayerGUI:
             pygame.mixer.music.load(playback_path)
             pygame.mixer.music.play()
             self.is_playing = True
+            self._playback_state = 'playing'
             # A track actually started - clear the cycle-wrap loop guard so it
             # only trips when nothing plays between two wraps (Task 5).
             self._last_wrap_mono = 0.0
@@ -4013,11 +4031,13 @@ class MusicPlayerGUI:
                     print(f"  Could not delete corrupt cache: {err}")
             
             # Skip immediately to next track
+            self._playback_state = 'stopped'
             self.next_track(_internal=True)
         except Exception as e:
             print(f"⚠ Unexpected playback error: {os.path.basename(playback_path)} - {e}")
             import traceback
             traceback.print_exc()  # Print full traceback for debugging
+            self._playback_state = 'stopped'
             self.next_track(_internal=True)
     
     def play(self):
@@ -4036,6 +4056,7 @@ class MusicPlayerGUI:
             self._segment_start_mono = time.monotonic()
             pygame.mixer.music.unpause()
             self.is_playing = True
+            self._playback_state = 'playing'
     
     def pause(self):
         """Pause playback"""
@@ -4049,14 +4070,16 @@ class MusicPlayerGUI:
         
         pygame.mixer.music.pause()
         self.is_playing = False
-    
+        self._playback_state = 'paused'
+
     def stop(self):
         """Stop playback"""
         if not self.audio_available:
             return
-        
+
         pygame.mixer.music.stop()
         self.is_playing = False
+        self._playback_state = 'stopped'
         self.now_playing_label.config(text="Not Playing")
         self.now_playing_artist.config(text="")
         self._show_placeholder_artwork()
@@ -4142,6 +4165,9 @@ class MusicPlayerGUI:
         self.current_index = playlist_queue.previous_position(
             self.current_index, len(self.current_playlist)
         )
+        # Going backward abandons the forward-looking Up Next queue: keeping the
+        # block "adjacent to current" is impossible once you navigate past it,
+        # and re-consuming it on the way forward again would be surprising.
         self.queued_count = 0
         self.play_track_at_index(self.current_index)
     
@@ -4273,6 +4299,7 @@ class MusicPlayerGUI:
                 print(f"✓ Completed: {track.title}")
             
             self.is_playing = False
+            self._playback_state = 'stopped'  # until the next track starts
             self.next_track(_internal=True)  # Allow auto-advance even during shuffle
 
 

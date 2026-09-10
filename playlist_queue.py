@@ -88,6 +88,34 @@ def advance(current_index, length, queued_count, is_temp_view, *,
     return 'play', next_index, new_queued_count, is_temp_view
 
 
+def reshuffle_tail_input(all_tracks, active_track, queued_tracks, *, norm_fn=None):
+    """Library tracks eligible for a fresh shuffle, i.e. everything except the
+    fixed prefix (the active track plus the queued block).
+
+    Excludes by object identity - `all_tracks`, the active track and the queued
+    block all hold the same MusicTrack objects - so duplicate/case-variant
+    filepaths and empty paths are handled correctly.  `norm_fn` is accepted for
+    call-site symmetry but unused.
+    """
+    exclude = {id(t) for t in queued_tracks}
+    if active_track is not None:
+        exclude.add(id(active_track))
+    return [t for t in all_tracks if id(t) not in exclude]
+
+
+def reshuffle_compose(active_track, queued_tracks, shuffled_tail):
+    """Assemble the new playlist: active track, then the untouched queued block,
+    then the freshly shuffled tail.
+
+    Returns (playlist, current_index, queued_count).
+    """
+    prefix = ([active_track] if active_track is not None else []) + list(queued_tracks)
+    playlist = prefix + list(shuffled_tail)
+    current_index = 0
+    queued_count = len(queued_tracks)
+    return playlist, current_index, queued_count
+
+
 def previous_position(current_index, length):
     """Modulo-wrap previous index (today's behavior)."""
     if length == 0:
