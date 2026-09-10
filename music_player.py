@@ -606,6 +606,8 @@ class MusicPlayerGUI:
             self._history_entries = []
         self._history_dirty = False
         self._history_save_job = None
+        self._active_algo = "Smart Shuffle"
+        self._last_wrap_mono = 0.0   # cycle-wrap loop guard (Task 5)
         
         # Initialize shuffle configuration
         self._init_shuffle_config()
@@ -3503,7 +3505,8 @@ class MusicPlayerGUI:
         
         if algo is None:
             algo = "Smart Shuffle"
-        
+        self._active_algo = algo
+
         # Always increment token to cancel any in-flight shuffle work
         self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
         token = self._shuffle_token
@@ -3948,7 +3951,10 @@ class MusicPlayerGUI:
             pygame.mixer.music.load(playback_path)
             pygame.mixer.music.play()
             self.is_playing = True
-            
+            # A track actually started - clear the cycle-wrap loop guard so it
+            # only trips when nothing plays between two wraps (Task 5).
+            self._last_wrap_mono = 0.0
+
             # Log what's playing with file extension
             ext = os.path.splitext(track.filepath)[1]
             
@@ -4094,17 +4100,29 @@ class MusicPlayerGUI:
                 self._update_track_metadata(track)
                 print(f"⏭ Skipped: {track.title} (skips: {track.skips})")
         
+        # Smart Shuffle regenerates a fresh order at the cycle boundary instead
+        # of replaying the same sequence forever (Task 5).
+        smart = getattr(self, '_active_algo', 'Smart Shuffle') == 'Smart Shuffle'
         action, new_index, new_queued_count, new_is_temp_view = playlist_queue.advance(
-            self.current_index, len(self.current_playlist), self.queued_count, self.is_temp_view
+            self.current_index, len(self.current_playlist), self.queued_count,
+            self.is_temp_view, reshuffle_on_wrap=smart,
         )
 
         if action == 'stop':
             return
 
         if action == 'reshuffle':
+            # Guard against an all-unplayable library spinning forever: if we
+            # wrapped again within a couple of seconds, the tracks are failing
+            # instantly - stop instead of reshuffling in a tight loop.
+            now_mono = time.monotonic()
+            if now_mono - getattr(self, '_last_wrap_mono', 0.0) < 2.0:
+                self.status_label.config(text="⚠ No playable tracks")
+                return
+            self._last_wrap_mono = now_mono
             self.queued_count = 0
             self.is_temp_view = False
-            self.apply_shuffle(auto_play=True)
+            self.apply_shuffle(auto_play=True)  # no-arg -> Smart Shuffle; branch is Smart-only
             return
 
         self.current_index = new_index

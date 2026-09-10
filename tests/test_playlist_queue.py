@@ -107,18 +107,35 @@ class AdvanceTests(unittest.TestCase):
         self.assertEqual(count, 1)  # decremented
         self.assertFalse(temp)
 
-    def test_wrap_on_normal_list_end(self):
-        # MODE-DEPENDENT (Task 5): this is the Truly-Random / default behaviour -
-        # replay the same order from index 0.  Once Task 5 lands, Smart Shuffle
-        # passes reshuffle_on_wrap=True and expects action == 'reshuffle' instead;
-        # that case gets its own test then.
+    def test_wrap_replays_when_reshuffle_disabled(self):
+        # Truly Random / default: replay the same order from index 0.
         action, new_index, count, temp = advance(
             current_index=9, length=10, queued_count=0, is_temp_view=False
         )
-        self.assertEqual(action, 'play')
+        self.assertEqual((action, new_index, count, temp), ('play', 0, 0, False))
+
+    def test_wrap_regenerates_when_reshuffle_enabled(self):
+        # Smart Shuffle: regenerate a fresh shuffle at the cycle boundary.
+        action, new_index, count, temp = advance(
+            current_index=9, length=10, queued_count=0, is_temp_view=False,
+            reshuffle_on_wrap=True,
+        )
+        self.assertEqual(action, 'reshuffle')
         self.assertEqual(new_index, 0)
         self.assertEqual(count, 0)
-        self.assertFalse(temp)
+
+    def test_reshuffle_flag_does_not_affect_mid_playlist_advance(self):
+        action, new_index, count, temp = advance(
+            current_index=3, length=10, queued_count=0, is_temp_view=False,
+            reshuffle_on_wrap=True,
+        )
+        self.assertEqual((action, new_index), ('play', 4))
+
+    def test_temp_view_still_reshuffles_without_flag(self):
+        action, *_ = advance(
+            current_index=4, length=5, queued_count=0, is_temp_view=True
+        )
+        self.assertEqual(action, 'reshuffle')
 
     def test_reshuffle_on_temp_view_end(self):
         action, new_index, count, temp = advance(

@@ -59,14 +59,17 @@ def queue_target(current_index, queued_count, play_next, existing_index):
     return existing_index, insert_index, new_current_index, new_queued_count
 
 
-def advance(current_index, length, queued_count, is_temp_view):
+def advance(current_index, length, queued_count, is_temp_view, *,
+            reshuffle_on_wrap=False):
     """Decide the next track.
 
     Returns (action, new_index, new_queued_count, new_is_temp_view).
     action is one of:
         'play'      - play new_index in the current playlist
-        'reshuffle' - the temp (taken-over) view ended; caller should
-                      regenerate a full shuffle and start at index 0
+        'reshuffle' - regenerate a full shuffle and start at index 0.  Happens
+                      when a taken-over search view ends, or (with
+                      reshuffle_on_wrap=True, i.e. Smart Shuffle) at a normal
+                      end-of-playlist wrap instead of replaying the same order.
         'stop'      - nothing to play (empty playlist)
     """
     if length == 0:
@@ -76,6 +79,8 @@ def advance(current_index, length, queued_count, is_temp_view):
 
     if next_index >= length:
         if is_temp_view:
+            return 'reshuffle', 0, 0, False
+        if reshuffle_on_wrap:
             return 'reshuffle', 0, 0, False
         return 'play', 0, 0, False
 
