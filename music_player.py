@@ -21,7 +21,6 @@ FEATURES:
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import os
-import random
 import re
 import queue
 from collections import deque
@@ -55,13 +54,13 @@ from urllib.parse import unquote, urlparse  # For decoding iTunes file URLs
 # =============================================================================
 # Constants
 # =============================================================================
-SKIP_COMPLETION_THRESHOLD = 0.80  # Track must be <80% complete to count as skip
 MIN_DISK_SPACE_MB = 50  # Minimum disk space for cache operations
 MIN_DISK_SPACE_PRECONV_MB = 500  # Minimum disk space for pre-conversion
 MIN_VALID_CACHE_SIZE = 1024  # Minimum bytes for valid converted file
 END_DETECTION_BUFFER_SEC = 2.0  # Buffer seconds for track end detection
 VOLUME_SYNC_INTERVAL_SEC = 2.0  # How often to sync volume slider with system
 METADATA_SAVE_DEBOUNCE_SEC = 0.1  # Debounce delay for metadata saves
+HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
 
@@ -89,9 +88,15 @@ class MusicTrack:
         
         # Optional metadata (only if stored in-file). None = unknown.
         self.loved = None        # bool|None
+        self.loved_source = None  # 'user' | 'migrated' | None (Task 7a)
         self.last_played = None  # epoch seconds|None
-        self.skips = None        # int|None
+        self.skips = None        # int|None (legacy heuristic counter)
         self.date_added = None   # epoch seconds|None
+        # Task 8: honest listening-outcome counters (versioned, additive - do
+        # NOT reinterpret the legacy `skips`/`play_count`).
+        self.qualified_play_count = None  # int|None
+        self.manual_skip_count = None     # int|None
+        self.last_skipped_at = None       # epoch seconds|None
         
         self._load_metadata()
         
@@ -126,9 +131,22 @@ class MusicTrack:
             elif isinstance(date_added, (int, float)):
                 self.date_added = int(date_added)
         
-        # Loved status
-        self.loved = metadata.get('loved', self.loved)
-    
+        # Loved status (tri-state) + provenance.  A None in the player metadata
+        # means "no opinion recorded" - don't let it clobber a real loved tag
+        # already read from the file itself.
+        loved = metadata.get('loved')
+        if loved is not None:
+            self.loved = loved
+            self.loved_source = metadata.get('loved_source') or 'user'
+
+        # Task 8 listening-outcome counters
+        for attr, key in (('qualified_play_count', 'qualified_play_count'),
+                          ('manual_skip_count', 'manual_skip_count'),
+                          ('last_skipped_at', 'last_skipped_at')):
+            v = metadata.get(key)
+            if v is not None:
+                setattr(self, attr, v)
+
     def _load_metadata(self):
         """Load metadata from the meta_path"""
         try:
@@ -427,9 +445,13 @@ class MusicTrack:
             'bpm': self.bpm,
             'track_number': self.track_number,
             'loved': self.loved,
+            'loved_source': self.loved_source,
             'last_played': self.last_played,
             'skips': self.skips,
             'date_added': self.date_added,
+            'qualified_play_count': self.qualified_play_count,
+            'manual_skip_count': self.manual_skip_count,
+            'last_skipped_at': self.last_skipped_at,
         }
 
     @classmethod
@@ -452,9 +474,13 @@ class MusicTrack:
         track.bpm = data.get('bpm', 0)
         track.track_number = data.get('track_number')
         track.loved = data.get('loved')
+        track.loved_source = data.get('loved_source')
         track.last_played = data.get('last_played')
         track.skips = data.get('skips')
         track.date_added = data.get('date_added')
+        track.qualified_play_count = data.get('qualified_play_count')
+        track.manual_skip_count = data.get('manual_skip_count')
+        track.last_skipped_at = data.get('last_skipped_at')
 
         # Apply player metadata if provided (takes precedence)
         if player_metadata:
@@ -495,9 +521,11 @@ class MusicPlayerGUI:
         self.queued_count = 0          # Manually-queued tracks right after current_index
         self.is_temp_view = False      # True when current_playlist is a taken-over search view
 
-        # Recent play history for shuffle history guard (Task 5)
-        # Stores (normalized_filepath, artist_key_or_None) tuples
-        self._recent_play_history = deque(maxlen=200)
+        # Recent play history for the shuffle history guard.  The persisted
+        # source of truth is self._history_entries (list of shuffle_history
+        # entry dicts), loaded during cache setup below; this deque is kept only
+        # as a defensive default in case that load has not run yet.
+        self._recent_play_history = deque(maxlen=200)  # legacy; unused once history loads
 
         # Debug flag: set MUSIC_SHUFFLER_DEBUG_SCAN=1 to enable scan spam (Task 8)
         self.debug_scan_logging = os.getenv('MUSIC_SHUFFLER_DEBUG_SCAN', '0') == '1'
@@ -589,7 +617,29 @@ class MusicPlayerGUI:
         self.volume_pref_file = cache_dir / "volume_pref.txt"
         self.player_metadata_file = cache_dir / "music_player_metadata.xml"
         self.shuffle_config_file = cache_dir / "shuffle_config.json"
+        self.shuffle_history_file = cache_dir / "shuffle_history.json"
+        # Favorites store: sibling of the cache dir, NOT inside it, so
+        # "Clear Cache" cannot destroy the shuffle taste signal (Task 7c).
+        self.preferences_file = cache_dir.parent / "shuffler_preferences.json"
         print(f"Cache directory: {cache_dir}")
+
+        # Persisted ordered listening history (Task 3) - survives restarts so
+        # Smart Shuffle keeps session continuity.
+        try:
+            import shuffle_history as _sh
+            self._history_entries = _sh.load(str(self.shuffle_history_file))
+            if self._history_entries:
+                print(f"✓ Loaded {len(self._history_entries)} listening-history entries")
+        except Exception as e:
+            print(f"⚠ Could not load shuffle history: {e}")
+            self._history_entries = []
+        self._history_dirty = False
+        self._history_save_job = None
+        self._active_algo = "Smart Shuffle"
+        self._last_wrap_mono = 0.0   # cycle-wrap loop guard (Task 5)
+        # Playback lifecycle, tracked independently of is_playing so a *paused*
+        # track still counts as "active" for reshuffle prefix preservation.
+        self._playback_state = 'stopped'   # 'playing' | 'paused' | 'stopped'
         
         # Initialize shuffle configuration
         self._init_shuffle_config()
@@ -639,6 +689,10 @@ class MusicPlayerGUI:
         # Playback state
         self.is_playing = False
         self.current_position = 0
+        # Task 8: audible-time tracker for the current playback instance
+        self._pb_tracker = None
+        self._pb_track = None
+        self._pb_seq = 0
         self.audio_available = False
         
         # Playback position tracking
@@ -668,7 +722,20 @@ class MusicPlayerGUI:
         
         # V2: Load unified player metadata
         self._load_player_metadata()
-        
+
+        # Task 7c: favorites live in a durable store outside the cache; they are
+        # authoritative for loved/loved_source and survive a cache wipe.
+        try:
+            import preferences as _pf
+            self._favorites = _pf.load(str(self.preferences_file))
+            with self._metadata_lock:
+                _pf.merge_into_metadata(self._favorites, self.player_metadata)
+            if self._favorites:
+                print(f"✓ Loaded {len(self._favorites)} favorites")
+        except Exception as e:
+            print(f"⚠ Could not load favorites: {e}")
+            self._favorites = {}
+
         # Auto-load library on startup
         self.root.after(100, self.scan_library)
     
@@ -720,6 +787,7 @@ class MusicPlayerGUI:
         settings_menu.add_command(label="Library Info", command=self.show_library_info)
         settings_menu.add_separator()
         settings_menu.add_command(label="Shuffle Settings", command=self.edit_shuffle_settings)
+        settings_menu.add_command(label="Import iTunes Ratings as Favorites…", command=self.migrate_ratings_to_favorites)
         settings_menu.add_separator()
         settings_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
         settings_menu.add_separator()
@@ -981,43 +1049,23 @@ class MusicPlayerGUI:
     
     
     def _init_shuffle_config(self):
-        """Initialize shuffle configuration with defaults"""
-        # Default shuffle parameters
-        self.shuffle_config = {
-            # Weight parameters
-            'random_min': 0.20,
-            'random_range': 0.50,
-            'rating_weight': 0.55,
-            'novelty_weight': 0.55,
-            'recency_weight': 0.45,
-            'newness_weight': 0.20,
-            'loved_weight': 0.30,
-            'skip_penalty_weight': 0.40,
-            'artist_skip_weight': 0.10,
-            'bpm_bonus': 0.05,
+        """Initialize shuffle configuration from the shuffle_core defaults."""
+        from shuffle_core import normalize_shuffle_config
 
-            # Constraint parameters
-            'recent_artists': 3,
-            'recent_albums': 2,
-            'recent_genres': 2,
-            'lookahead': 400,
+        # Single source of truth lives in shuffle_core.
+        self.shuffle_config = normalize_shuffle_config(None)
 
-            # Adaptive spacing (Task 4)
-            'adaptive_constraints': True,
-
-            # History guard (Task 5)
-            'history_guard_size': 30,
-            'history_track_penalty': 0.35,
-            'history_artist_penalty': 0.15,
-        }
-        
-        # Load saved configuration if it exists
+        # Load and validate saved configuration if it exists
         if self.shuffle_config_file.exists():
             try:
                 import json
                 with open(self.shuffle_config_file, 'r') as f:
                     saved_config = json.load(f)
-                    self.shuffle_config.update(saved_config)
+                if not isinstance(saved_config, dict):
+                    raise ValueError("shuffle config is not a JSON object")
+                # normalize_shuffle_config clamps/validates every field and
+                # falls back per-key for malformed persisted values.
+                self.shuffle_config = normalize_shuffle_config(saved_config)
                 print("✓ Loaded shuffle configuration")
             except Exception as e:
                 print(f"⚠ Could not load shuffle config: {e}")
@@ -1033,6 +1081,54 @@ class MusicPlayerGUI:
         except Exception as e:
             print(f"Error saving shuffle config: {e}")
             return False
+
+    # ---- Persisted listening history (Task 3) -----------------------------
+
+    def _record_history_start(self, track):
+        """Append a playback start to the history and schedule a debounced save."""
+        try:
+            import shuffle_history as _sh
+            entry = _sh.make_entry(
+                track.filepath,   # matches what smart_shuffle compares against
+                artist=getattr(track, 'artist', None),
+                album=getattr(track, 'album', None),
+                genre=getattr(track, 'genre', None),
+            )
+            self._history_entries = _sh.append(self._history_entries, entry)
+            self._history_dirty = True
+            if self._history_save_job is not None:
+                try:
+                    self.root.after_cancel(self._history_save_job)
+                except Exception:
+                    pass
+            self._history_save_job = self.root.after(
+                HISTORY_SAVE_DEBOUNCE_MS, self._flush_history)
+        except Exception as e:
+            print(f"⚠ Could not record listening history: {e}")
+
+    def _flush_history(self):
+        """Write the listening history to disk if it changed (atomic)."""
+        self._history_save_job = None
+        if not self._history_dirty:
+            return
+        try:
+            import shuffle_history as _sh
+            _sh.save(str(self.shuffle_history_file), list(self._history_entries))
+            self._history_dirty = False
+        except Exception as e:
+            print(f"⚠ Could not save listening history: {e}")
+
+    def _shuffle_context(self):
+        """Build (recent_history, context) for a smart_shuffle call."""
+        try:
+            import shuffle_history as _sh
+            entries = list(self._history_entries)
+            recent = _sh.to_recent_history(entries)
+            context = {'protected_paths': _sh.protected_paths(entries),
+                       'protect_positions': 3}
+            return recent, context
+        except Exception:
+            return [], None
     
     def edit_shuffle_settings(self):
         """Edit shuffle algorithm parameters"""
@@ -1169,43 +1265,32 @@ class MusicPlayerGUI:
         button_frame.pack(pady=15)
         
         def save_settings():
-            # Update config
+            from shuffle_core import normalize_shuffle_config
+            # Update + validate config (clamps out-of-range typed values)
+            candidate = dict(self.shuffle_config)
             for param, var in vars_dict.items():
-                self.shuffle_config[param] = var.get()
-            
-            # Save to file
+                candidate[param] = var.get()
+            self.shuffle_config = normalize_shuffle_config(candidate)
+
             if self._save_shuffle_config():
                 messagebox.showinfo("Saved", "Shuffle settings saved successfully!")
                 dialog.destroy()
+                # Apply immediately so the change is audible next shuffle.
+                try:
+                    if getattr(self, 'all_tracks', None):
+                        self.apply_shuffle()
+                except Exception as e:
+                    print(f"⚠ Could not re-apply shuffle after settings change: {e}")
             else:
                 messagebox.showerror("Error", "Failed to save shuffle settings")
-        
+
         def reset_defaults():
-            result = messagebox.askyesno("Reset to Defaults", 
+            result = messagebox.askyesno("Reset to Defaults",
                                         "Reset all shuffle parameters to default values?")
             if result:
-                defaults = {
-                    'random_min': 0.20,
-                    'random_range': 0.50,
-                    'rating_weight': 0.55,
-                    'novelty_weight': 0.55,
-                    'recency_weight': 0.45,
-                    'newness_weight': 0.20,
-                    'loved_weight': 0.30,
-                    'skip_penalty_weight': 0.40,
-                    'artist_skip_weight': 0.10,
-                    'bpm_bonus': 0.05,
-                    'recent_artists': 3,
-                    'recent_albums': 2,
-                    'recent_genres': 2,
-                    'lookahead': 400,
-                    'adaptive_constraints': True,
-                    'history_guard_size': 30,
-                    'history_track_penalty': 0.35,
-                    'history_artist_penalty': 0.15,
-                }
+                from shuffle_core import DEFAULT_SHUFFLE_CONFIG
                 for param, var in vars_dict.items():
-                    var.set(defaults.get(param, 0))
+                    var.set(DEFAULT_SHUFFLE_CONFIG.get(param, 0))
     
         ttk.Button(button_frame, text="Save", command=save_settings, width=12).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Reset Defaults", command=reset_defaults, width=15).pack(side=tk.LEFT, padx=5)
@@ -1646,10 +1731,24 @@ class MusicPlayerGUI:
             return
         
         track = self.current_playlist[self.current_index]
-        
-        # Toggle loved status
+
+        # Toggle loved status. A button press is always an explicit user
+        # opinion, so record provenance (Task 7a) - distinguishes a real
+        # "not a favourite" from "never touched".
         track.loved = not track.loved if track.loved is not None else True
-        
+        track.loved_source = 'user'
+
+        # Persist to the durable favorites store (Task 7c)
+        try:
+            import preferences as _pf
+            self._favorites = _pf.set_favorite(
+                getattr(self, '_favorites', {}),
+                getattr(track, 'original_filepath', track.filepath),
+                track.loved, source='user')
+            _pf.save(str(self.preferences_file), self._favorites)
+        except Exception as e:
+            print(f"⚠ Could not save favorite: {e}")
+
         # Update button - use unicode hearts that respond to foreground color
         if track.loved:
             self.love_button.config(text="♥", foreground="red", font=('Arial', 14, 'bold'))
@@ -1661,6 +1760,54 @@ class MusicPlayerGUI:
         
         print(f"{'♥' if track.loved else '♡'} {track.title}")
     
+    def migrate_ratings_to_favorites(self):
+        """One-time, opt-in: seed favorites from existing high iTunes ratings
+        for tracks that have no favorite opinion yet (Task 7b)."""
+        candidates = []
+        for t in getattr(self, 'library_tracks', []) or self.all_tracks:
+            if getattr(t, 'loved', None) is not None:
+                continue
+            if getattr(t, 'loved_source', None) not in (None, 'unknown'):
+                continue
+            r = getattr(t, 'rating', 0) or 0
+            # 4+ stars on either common iTunes scale (0-100 or POPM 0-255).
+            if (0 < r <= 100 and r >= 80) or (100 < r <= 255 and r >= 204):
+                candidates.append(t)
+
+        if not candidates:
+            messagebox.showinfo("Import Ratings",
+                                "No un-favorited tracks rated 4+ stars were found.")
+            return
+        if not messagebox.askyesno(
+                "Import Ratings as Favorites",
+                f"Mark {len(candidates)} track(s) rated 4+ stars as favorites?\n\n"
+                "This only affects tracks you haven't favorited or un-favorited "
+                "yourself, and is recorded as 'migrated' so you can tell them "
+                "apart later."):
+            return
+
+        try:
+            import preferences as _pf
+        except Exception as e:
+            messagebox.showerror("Import Ratings", f"Could not load favorites store:\n{e}")
+            return
+        favs = getattr(self, '_favorites', {})
+        for t in candidates:
+            t.loved = True
+            t.loved_source = 'migrated'
+            self._update_track_metadata(t)
+            favs = _pf.set_favorite(favs, getattr(t, 'original_filepath', t.filepath),
+                                    True, source='migrated')
+        self._favorites = favs
+        try:
+            _pf.save(str(self.preferences_file), favs)
+        except Exception as e:
+            print(f"⚠ Could not save migrated favorites: {e}")
+        if self._validate_playlist_index():
+            self._update_love_button(self.current_playlist[self.current_index])
+        messagebox.showinfo("Import Ratings",
+                            f"Marked {len(candidates)} track(s) as favorites.")
+
     def _update_love_button(self, track):
         """V2: Update love button state (always visible)"""
         self.love_button.grid()  # Make button visible for all tracks
@@ -1685,14 +1832,20 @@ class MusicPlayerGUI:
             
             pygame.mixer.music.pause()
             self.is_playing = False
+            self._playback_state = 'paused'
+            if self._pb_tracker:
+                self._pb_tracker.pause(time.monotonic())
             print("Paused")
         else:
             # Reset segment start time when unpausing
             self._segment_start_mono = time.monotonic()
-            
+
             pygame.mixer.music.unpause()
             if pygame.mixer.music.get_busy():
                 self.is_playing = True
+                self._playback_state = 'playing'
+                if self._pb_tracker:
+                    self._pb_tracker.resume(time.monotonic())
                 print("Unpaused")
             else:
                 self.play_track_at_index(self.current_index)
@@ -1748,7 +1901,13 @@ class MusicPlayerGUI:
                 # Update position tracking
                 self._seek_base_sec = float(target_pos)
                 self._segment_start_mono = time.monotonic()
-                
+                # Task 8: a seek settles audible time - the jumped interval is
+                # never credited as listening.
+                if self._pb_tracker:
+                    self._pb_tracker.seek(time.monotonic())
+                    if not was_playing:
+                        self._pb_tracker.pause(time.monotonic())
+
                 # Update UI
                 self.progress_var.set(percentage)
                 
@@ -1824,23 +1983,68 @@ class MusicPlayerGUI:
                     data = plistlib.load(f)
                 
                 tracks = data.get('tracks', {})
+                schema_version = int(data.get('schema_version', 1))
 
-                # Thread-safe write to metadata
+                if schema_version < 2 and filepath == self.player_metadata_file:
+                    # One-time keep of the pre-tri-state file so the loved
+                    # reclassification below is recoverable (Task 7a).
+                    try:
+                        import shutil
+                        v1 = self.player_metadata_file.with_suffix('.xml.v1backup')
+                        if not v1.exists():
+                            shutil.copy2(self.player_metadata_file, v1)
+                    except (OSError, IOError):
+                        pass
+
+                def _opt_int(v):
+                    if v in (None, ''):
+                        return None
+                    v = int(v)
+                    # v1 stored "unknown" as 0 for these fields; a real 0 and
+                    # "never set" score identically, so fold both to None.
+                    if schema_version < 2 and v == 0:
+                        return None
+                    return v
+
+                def _opt_int2(v):
+                    return None if v in (None, '') else int(v)
+
+                def _load_loved(td):
+                    raw = td.get('loved', None)
+                    src = td.get('loved_source', None)
+                    if schema_version >= 2:
+                        return raw, src
+                    # v1: a bare False has no provenance (mix of real "not a
+                    # favourite" and playback-coerced unknown) -> treat as
+                    # unknown; a True was almost certainly a deliberate heart.
+                    if raw is True:
+                        return True, 'user'
+                    return None, None
+
                 with self._metadata_lock:
                     for filepath_key, track_data in tracks.items():
-                        # Normalize key for storage
                         key = self._norm_path(filepath_key)
+                        loved, loved_source = _load_loved(track_data)
                         self.player_metadata[key] = {
                             'play_count': int(track_data.get('play_count', 0)),
-                            'skip_count': int(track_data.get('skip_count', 0)),
+                            'skip_count': _opt_int(track_data.get('skip_count')),
                             'rating': int(track_data.get('rating', 0)),
-                            'last_played': int(track_data.get('last_played', 0)),
-                            'loved': bool(track_data.get('loved', False)),
-                            'date_added': int(track_data.get('date_added', 0)),
+                            'last_played': _opt_int(track_data.get('last_played')),
+                            'loved': loved,
+                            'loved_source': loved_source,
+                            'date_added': _opt_int(track_data.get('date_added')),
+                            # Task 8 counters (never had a v1 sentinel)
+                            'qualified_play_count': _opt_int2(track_data.get('qualified_play_count')),
+                            'manual_skip_count': _opt_int2(track_data.get('manual_skip_count')),
+                            'last_skipped_at': _opt_int2(track_data.get('last_skipped_at')),
                         }
 
-                print(f"✓ Loaded metadata for {len(tracks)} tracks")
-                
+                try:
+                    print(f"Loaded metadata for {len(tracks)} tracks"
+                          + (" (migrated from v1)" if schema_version < 2 else ""))
+                except Exception:
+                    pass
+
                 # If we loaded from backup, restore it as main
                 if filepath == backup_file:
                     print("  Restored from backup file")
@@ -1853,9 +2057,14 @@ class MusicPlayerGUI:
                 return  # Success
                 
             except Exception as e:
-                print(f"⚠ Player metadata file corrupted (attempt {attempt}): {e}")
-                if filepath == self.player_metadata_file:
-                    print("  Trying backup file...")
+                # Status prints must never derail load (a cp1252 console makes
+                # the glyphs raise UnicodeEncodeError).
+                try:
+                    print(f"! Player metadata file corrupted (attempt {attempt}): {e}")
+                    if filepath == self.player_metadata_file:
+                        print("  Trying backup file...")
+                except Exception:
+                    pass
                 continue
         
         # Both files failed
@@ -1878,14 +2087,22 @@ class MusicPlayerGUI:
 
             tracks_out = {}
             for filepath_norm, track_data in metadata_copy.items():
-                tracks_out[filepath_norm] = {
+                entry = {
                     'play_count': int(track_data.get('play_count') or 0),
-                    'skip_count': int(track_data.get('skip_count') or 0),
                     'rating': int(track_data.get('rating') or 0),
-                    'last_played': int(track_data.get('last_played') or 0),
-                    'loved': bool(track_data.get('loved', False)),  # Ensure boolean
-                    'date_added': int(track_data.get('date_added') or 0),
                 }
+                # Tri-state fields: only written when known, so a missing key
+                # reads back as None ("never set") rather than 0/False (Task 7a/8).
+                for k in ('skip_count', 'last_played', 'date_added',
+                          'qualified_play_count', 'manual_skip_count', 'last_skipped_at'):
+                    v = track_data.get(k)
+                    if v is not None:
+                        entry[k] = int(v)
+                if track_data.get('loved') is not None:
+                    entry['loved'] = bool(track_data['loved'])
+                if track_data.get('loved_source') is not None:
+                    entry['loved_source'] = str(track_data['loved_source'])
+                tracks_out[filepath_norm] = entry
             
             # Create backup of existing file before overwriting
             if self.player_metadata_file.exists():
@@ -1899,7 +2116,7 @@ class MusicPlayerGUI:
             # Atomic write: write to temp file, then replace
             tmp_path = self.player_metadata_file.with_suffix(self.player_metadata_file.suffix + '.tmp')
             with open(tmp_path, 'wb') as f:
-                plistlib.dump({'tracks': tracks_out}, f)
+                plistlib.dump({'schema_version': 2, 'tracks': tracks_out}, f)
             
             # Verify the temp file before replacing
             if tmp_path.stat().st_size < 100:
@@ -1917,24 +2134,32 @@ class MusicPlayerGUI:
                 pass
 
     def _update_track_metadata(self, track):
-        """Update metadata for any track (unified system)"""
-        filepath_to_check = getattr(track, 'original_filepath', track.filepath)
+        """Update metadata for any track (unified system).
 
-        # Normalize key for storage
+        Tri-state fields (loved, skips, last_played, date_added) keep ``None``
+        for "unknown / never set" - collapsing them to 0/False was corrupting
+        the shuffle taste signal on every playback (Task 7a).
+        """
+        filepath_to_check = getattr(track, 'original_filepath', track.filepath)
         fp = self._norm_path(filepath_to_check)
 
-        # Store metadata in memory (thread-safe)
+        def _int_or_none(v):
+            return None if v is None else int(v)
+
         with self._metadata_lock:
             self.player_metadata[fp] = {
                 'play_count': int(getattr(track, 'play_count', 0) or 0),
-                'skip_count': int(getattr(track, 'skips', 0) or 0),
+                'skip_count': _int_or_none(getattr(track, 'skips', None)),
                 'rating': int(getattr(track, 'rating', 0) or 0),
-                'last_played': int(getattr(track, 'last_played', 0) or 0),
-                'loved': bool(getattr(track, 'loved', None)),  # True/False/None -> True/False/False
-                'date_added': int(getattr(track, 'date_added', 0) or 0),
+                'last_played': _int_or_none(getattr(track, 'last_played', None)),
+                'loved': getattr(track, 'loved', None),          # True | False | None
+                'loved_source': getattr(track, 'loved_source', None),
+                'date_added': _int_or_none(getattr(track, 'date_added', None)),
+                'qualified_play_count': _int_or_none(getattr(track, 'qualified_play_count', None)),
+                'manual_skip_count': _int_or_none(getattr(track, 'manual_skip_count', None)),
+                'last_skipped_at': _int_or_none(getattr(track, 'last_skipped_at', None)),
             }
 
-        # Queue async save (debounced to avoid blocking UI)
         self._queue_metadata_save()
     
     def _queue_metadata_save(self):
@@ -2441,6 +2666,21 @@ class MusicPlayerGUI:
         except (OSError, IOError, Exception) as e:
             print(f"⚠ Error saving metadata on close: {e}")
 
+        # Close the current playback instance (not a dislike) then flush.
+        try:
+            self._finalize_playback('stop')
+        except Exception:
+            pass
+
+        # Final listening-history flush
+        try:
+            if self._history_save_job is not None:
+                self.root.after_cancel(self._history_save_job)
+                self._history_save_job = None
+            self._flush_history()
+        except Exception as e:
+            print(f"⚠ Error saving listening history on close: {e}")
+
         try:
             self.stop_background_preconversion()
         except (RuntimeError, Exception) as e:
@@ -2708,14 +2948,10 @@ class MusicPlayerGUI:
             
             self.update_library_stats()
             
-            if self.all_tracks and self.audio_available:
-                random_track = random.choice(self.all_tracks)
-                self.current_playlist = [random_track]
-                self.current_index = 0
-                self.play_track_at_index(0)
-            
+            # History-aware Smart Shuffle picks the first track too - no random
+            # pick then reshuffle around it (Task 3).
             if self.all_tracks:
-                self.apply_shuffle()
+                self.apply_shuffle(auto_play=bool(self.audio_available))
             
             # Start background pre-conversion after small delay (avoid status overlap)
             self.root.after(500, self.start_background_preconversion)
@@ -2825,7 +3061,8 @@ class MusicPlayerGUI:
             "This will delete:\n"
             "• Library cache\n"
             "• M4P Downloads metadata\n"
-            "• All converted .mp3 files\n\n"
+            "• All converted .mp3 files\n"
+            "• Recent listening history (shuffle continuity)\n\n"
             "Songs will need to be converted again when played.\n"
             "M4P metadata will start fresh.\n\n"
             "Continue?"
@@ -2848,7 +3085,15 @@ class MusicPlayerGUI:
                 deleted_size += self.player_metadata_file.stat().st_size
                 self.player_metadata_file.unlink()
                 deleted_count += 1
-            
+
+            # Listening history is session-continuity cache; clear it too
+            if self.shuffle_history_file.exists():
+                deleted_size += self.shuffle_history_file.stat().st_size
+                self.shuffle_history_file.unlink()
+                deleted_count += 1
+            self._history_entries = []
+            self._history_dirty = False
+
             if self.convert_cache_dir.exists():
                 for file in self.convert_cache_dir.iterdir():
                     if file.is_file():
@@ -2908,7 +3153,19 @@ class MusicPlayerGUI:
             # Delete metadata file
             if self.player_metadata_file.exists():
                 self.player_metadata_file.unlink()
-            
+
+            # Metadata reset also clears persisted listening history (Task 3)
+            # and the durable favorites store (Task 7c).
+            for f in (self.shuffle_history_file, self.preferences_file):
+                try:
+                    if f.exists():
+                        f.unlink()
+                except OSError:
+                    pass
+            self._history_entries = []
+            self._history_dirty = False
+            self._favorites = {}
+
             # Reset all loaded tracks
             for track in self.all_tracks:
                 track.play_count = 0
@@ -2916,7 +3173,11 @@ class MusicPlayerGUI:
                 track.rating = 0
                 track.last_played = None
                 track.loved = None
+                track.loved_source = None
                 track.date_added = None
+                track.qualified_play_count = None
+                track.manual_skip_count = None
+                track.last_skipped_at = None
             
             # Update love button for current track if playing
             if self.is_playing and 0 <= self.current_index < len(self.current_playlist):
@@ -3447,7 +3708,8 @@ class MusicPlayerGUI:
         
         if algo is None:
             algo = "Smart Shuffle"
-        
+        self._active_algo = algo
+
         # Always increment token to cancel any in-flight shuffle work
         self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
         token = self._shuffle_token
@@ -3457,25 +3719,47 @@ class MusicPlayerGUI:
         
         if algo == "Smart Shuffle":
             self._set_navigation_enabled(False)
-            
-            tracks_snapshot = list(self.all_tracks)
-            
+
+            # Snapshot the fixed prefix on the main thread BEFORE the worker
+            # starts (Task 4): the active track (playing or paused) plus the
+            # untouched queued block.  Skipped for auto_play (startup / wrap),
+            # which deliberately starts fresh from index 0.
+            if auto_play:
+                active_track, queued_block = None, []
+            else:
+                active_track = self._active_track()
+                queued_block = list(self._get_queued_tracks())
+
+            tracks_snapshot = playlist_queue.reshuffle_tail_input(
+                self.all_tracks, active_track, queued_block, norm_fn=self._norm_path)
+
             self.status_label.config(text="Shuffling...")
-            
+
+            recent_snapshot, context_snapshot = self._shuffle_context()
+
             def compute_shuffle():
                 try:
-                    history_snapshot = list(self._recent_play_history)
                     result = CustomShuffleAlgorithm.smart_shuffle(
                         tracks_snapshot, self.shuffle_config,
-                        recent_history=history_snapshot,
+                        recent_history=recent_snapshot,
+                        context=context_snapshot,
                     )
-                    
+
                     def apply_if_latest():
-                        if getattr(self, "_shuffle_token", 0) != token:
-                            # If this shuffle is stale, ensure nav isn't left disabled
+                        stale = (getattr(self, "_shuffle_token", 0) != token)
+                        # Also stale if playback auto-advanced past the track we
+                        # snapshotted while the worker ran (Task 4).
+                        if not stale and not auto_play and active_track is not None \
+                                and self._active_track() is not active_track:
+                            stale = True
+                        if stale:
                             self._set_navigation_enabled(True)
+                            self.status_label.config(
+                                text=f"✓ {len(self.current_playlist)} tracks")
                             return
-                        self._apply_shuffle_results(result, algo, auto_play=auto_play)
+                        self._apply_shuffle_results(
+                            result, algo, auto_play=auto_play,
+                            active_track=active_track, queued_block=queued_block)
                     
                     try:
                         self.root.after(0, apply_if_latest)
@@ -3498,30 +3782,20 @@ class MusicPlayerGUI:
         # Non-smart shuffles should never leave nav disabled
         self._set_navigation_enabled(True)
 
-        currently_playing_track = None
-        if self.is_playing and self.current_playlist and 0 <= self.current_index < len(self.current_playlist):
-            currently_playing_track = self.current_playlist[self.current_index]
-
-        # Only Truly Random remains (everything else is Smart Shuffle)
-        self.current_playlist = CustomShuffleAlgorithm.truly_random(self.all_tracks)
-        self.queued_count = 0
-        self.is_temp_view = False
-
-        # Move currently playing track to position 0
-        if currently_playing_track and not auto_play:
-            try:
-                # Find and remove the currently playing track from the shuffled playlist
-                playing_index = next(i for i, t in enumerate(self.current_playlist)
-                                   if self._norm_path(t.filepath) == self._norm_path(currently_playing_track.filepath))
-                self.current_playlist.pop(playing_index)
-
-                # Insert it at the beginning
-                self.current_playlist.insert(0, currently_playing_track)
-                self.current_index = 0
-            except (StopIteration, ValueError):
-                self.current_index = 0
+        # Only Truly Random remains (everything else is Smart Shuffle).  Same
+        # fixed-prefix preservation as Smart Shuffle (Task 4).
+        if auto_play:
+            active_track, queued_block = None, []
         else:
-            self.current_index = 0
+            active_track = self._active_track()
+            queued_block = list(self._get_queued_tracks())
+
+        tail = CustomShuffleAlgorithm.truly_random(
+            playlist_queue.reshuffle_tail_input(
+                self.all_tracks, active_track, queued_block, norm_fn=self._norm_path))
+        self.current_playlist, self.current_index, self.queued_count = \
+            playlist_queue.reshuffle_compose(active_track, queued_block, tail)
+        self.is_temp_view = False
 
         # Clear search filter to show full shuffled playlist
         self.filtered_playlist = []
@@ -3533,31 +3807,20 @@ class MusicPlayerGUI:
         if auto_play:
             self.play_track_at_index(0)
     
-    def _apply_shuffle_results(self, playlist, algo, auto_play=False):
-        """Apply shuffle results on main thread"""
-        currently_playing_track = None
-        if self.is_playing and self.current_playlist and 0 <= self.current_index < len(self.current_playlist):
-            currently_playing_track = self.current_playlist[self.current_index]
+    def _apply_shuffle_results(self, playlist, algo, auto_play=False,
+                               active_track=None, queued_block=None):
+        """Apply shuffle results on main thread.
 
-        # Move currently playing track to position 0
-        if currently_playing_track and not auto_play:
-            try:
-                # Find and remove the currently playing track from the shuffled playlist
-                playing_index = next(i for i, t in enumerate(playlist)
-                                   if self._norm_path(t.filepath) == self._norm_path(currently_playing_track.filepath))
-                playlist.pop(playing_index)
+        ``playlist`` is the freshly shuffled tail (already excludes the fixed
+        prefix).  The prefix - ``active_track`` then ``queued_block`` - is
+        re-attached at the front so the play position and Up Next survive the
+        reshuffle (Task 4).  For auto_play both are None/empty and playback
+        starts at index 0.
+        """
+        queued_block = queued_block or []
+        self.current_playlist, self.current_index, self.queued_count = \
+            playlist_queue.reshuffle_compose(active_track, queued_block, playlist)
 
-                # Insert it at the beginning
-                playlist.insert(0, currently_playing_track)
-                self.current_index = 0
-            except (StopIteration, ValueError):
-                # Track not found in new playlist (shouldn't happen), just use playlist as-is
-                self.current_index = 0
-        else:
-            self.current_index = 0
-
-        self.current_playlist = playlist
-        self.queued_count = 0
         self.is_temp_view = False
         self.filtered_playlist = []  # Clear search filter
         self.search_var.set('')  # Clear search box
@@ -3763,6 +4026,10 @@ class MusicPlayerGUI:
         self.current_index = new_current_index
         self.queued_count = new_queued_count
 
+        # Invalidate any in-flight shuffle: it snapshotted the old queue, so
+        # its result would drop this newly-queued track (Task 4).
+        self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
+
         if play_next:
             self.status_label.config(text=f"▶ Will play next: {track.title}")
         else:
@@ -3775,6 +4042,55 @@ class MusicPlayerGUI:
         start = self.current_index + 1
         end = start + self.queued_count
         return self.current_playlist[start:end]
+
+    # ---- Task 8: listening-outcome tracking ------------------------------
+
+    def _start_playback_tracking(self, track):
+        """Begin a fresh audible-time instance for `track`."""
+        from playback_feedback import PlaybackTracker
+        self._pb_seq += 1
+        dur = getattr(track, 'duration', 0) or None
+        self._pb_tracker = PlaybackTracker(
+            self._pb_seq, duration=dur, now=time.monotonic())
+        self._pb_track = track
+
+    def _finalize_playback(self, reason):
+        """Close the current playback instance once and fold its outcome into
+        the versioned counters.  Idempotent (safe to call from every path)."""
+        tracker = self._pb_tracker
+        track = self._pb_track
+        if tracker is None or track is None:
+            return
+        try:
+            outcome = tracker.finalize(time.monotonic(), reason)
+        except Exception as e:
+            print(f"! playback finalize failed: {e}")
+            outcome = None
+        # Detach regardless: the instance is done, and a stale tracker must not
+        # keep receiving pause/resume/seek.
+        self._pb_tracker = None
+        self._pb_track = None
+        if outcome is None:
+            return
+
+        changed = False
+        if outcome.qualified_play:
+            track.qualified_play_count = int(track.qualified_play_count or 0) + 1
+            changed = True
+        if outcome.manual_skip:
+            track.manual_skip_count = int(track.manual_skip_count or 0) + 1
+            track.last_skipped_at = int(time.time())
+            changed = True
+        if changed:
+            self._update_track_metadata(track)
+
+    def _active_track(self):
+        """The track the player is currently on - playing OR paused (not
+        stopped).  Used to keep the play position aligned across a reshuffle."""
+        if self._playback_state in ('playing', 'paused') and \
+                0 <= self.current_index < len(self.current_playlist):
+            return self.current_playlist[self.current_index]
+        return None
 
     def view_up_next(self):
         """Show Up Next queue in a dialog"""
@@ -3822,6 +4138,7 @@ class MusicPlayerGUI:
             end = start + count
             del self.current_playlist[start:end]
             self.queued_count = 0
+            self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
             self.display_playlist()
             self.status_label.config(text=f"Cleared {count} tracks from Up Next")
         else:
@@ -3835,10 +4152,15 @@ class MusicPlayerGUI:
         
         if not self.current_playlist or index >= len(self.current_playlist):
             return
-        
+
+        # Close out the previous instance.  Callers that know a more specific
+        # reason (next_track, previous_track, _handle_track_end) finalize first;
+        # finalize is idempotent so this default only fires for direct picks.
+        self._finalize_playback('select')
+
         self.current_index = index
         track = self.current_playlist[index]
-        
+
         playback_path = track.filepath
         
         if track.filepath.lower().endswith('.m4a'):
@@ -3890,7 +4212,12 @@ class MusicPlayerGUI:
             pygame.mixer.music.load(playback_path)
             pygame.mixer.music.play()
             self.is_playing = True
-            
+            self._playback_state = 'playing'
+            self._start_playback_tracking(track)   # Task 8
+            # A track actually started - clear the cycle-wrap loop guard so it
+            # only trips when nothing plays between two wraps (Task 5).
+            self._last_wrap_mono = 0.0
+
             # Log what's playing with file extension
             ext = os.path.splitext(track.filepath)[1]
             
@@ -3898,16 +4225,14 @@ class MusicPlayerGUI:
             track.play_count = (track.play_count or 0) + 1
             track.last_played = int(time.time())
 
-            # Set date_added if not already set (None check preserves 0 and imported values)
-            if track.date_added is None:
-                track.date_added = int(time.time())
+            # NOTE (Task 7a): do NOT stamp date_added on first playback - that
+            # made every old track look brand new to the shuffle's newness
+            # boost.  Unknown date stays None (scored neutral).
 
             self._update_track_metadata(track)
 
-            # Task 5: record in recent play history for shuffle history guard
-            norm_fp   = self._norm_path(track.filepath)
-            artist_k  = (track.artist or "").strip().lower() or None
-            self._recent_play_history.append((norm_fp, artist_k))
+            # Record this start in the persisted listening history (Task 3).
+            self._record_history_start(track)
             print(f"▶ Playing: {track.title}{ext} (plays: {track.play_count})")
             
             self._seek_base_sec = 0.0
@@ -3951,11 +4276,13 @@ class MusicPlayerGUI:
                     print(f"  Could not delete corrupt cache: {err}")
             
             # Skip immediately to next track
+            self._playback_state = 'stopped'
             self.next_track(_internal=True)
         except Exception as e:
             print(f"⚠ Unexpected playback error: {os.path.basename(playback_path)} - {e}")
             import traceback
             traceback.print_exc()  # Print full traceback for debugging
+            self._playback_state = 'stopped'
             self.next_track(_internal=True)
     
     def play(self):
@@ -3974,6 +4301,9 @@ class MusicPlayerGUI:
             self._segment_start_mono = time.monotonic()
             pygame.mixer.music.unpause()
             self.is_playing = True
+            self._playback_state = 'playing'
+            if self._pb_tracker:
+                self._pb_tracker.resume(time.monotonic())
     
     def pause(self):
         """Pause playback"""
@@ -3987,14 +4317,19 @@ class MusicPlayerGUI:
         
         pygame.mixer.music.pause()
         self.is_playing = False
-    
+        self._playback_state = 'paused'
+        if self._pb_tracker:
+            self._pb_tracker.pause(time.monotonic())
+
     def stop(self):
         """Stop playback"""
         if not self.audio_available:
             return
-        
+
+        self._finalize_playback('stop')   # Task 8: stop is not a dislike
         pygame.mixer.music.stop()
         self.is_playing = False
+        self._playback_state = 'stopped'
         self.now_playing_label.config(text="Not Playing")
         self.now_playing_artist.config(text="")
         self._show_placeholder_artwork()
@@ -4011,44 +4346,36 @@ class MusicPlayerGUI:
             print("⚠ Navigation disabled during shuffle")
             return
         
-        # V2: Track skip count only if user manually skipped AND track was less than 80% complete
-        if not _internal and self.is_playing and 0 <= self.current_index < len(self.current_playlist):
-            track = self.current_playlist[self.current_index]
-            
-            # Calculate completion percentage
-            should_count_skip = True
-            duration = self._get_safe_duration(track)
-            if duration > 0.01 and self._segment_start_mono is not None:
-                try:
-                    pos = self._seek_base_sec + (time.monotonic() - self._segment_start_mono)
-                    completion_pct = pos / duration
-                    # Only count as skip if less than threshold complete
-                    if completion_pct >= SKIP_COMPLETION_THRESHOLD:
-                        should_count_skip = False
-                        print(f"⏭ Near end, not counting as skip: {track.title} ({completion_pct*100:.0f}% complete)")
-                except Exception:
-                    # If calculation fails, default to counting it as a skip
-                    pass
-            
-            if should_count_skip:
-                try:
-                    track.skips = int(track.skips or 0) + 1
-                except (ValueError, TypeError):
-                    track.skips = 1
-                self._update_track_metadata(track)
-                print(f"⏭ Skipped: {track.title} (skips: {track.skips})")
-        
+        # Task 8: a manual Next is a candidate skip - the audible-time tracker
+        # decides (seeking near the end is not "listening"; a natural end that
+        # auto-advances here with _internal=True is not a skip).  The legacy
+        # `skips` heuristic counter is left frozen.
+        if not _internal:
+            self._finalize_playback('next')
+
+        # Smart Shuffle regenerates a fresh order at the cycle boundary instead
+        # of replaying the same sequence forever (Task 5).
+        smart = getattr(self, '_active_algo', 'Smart Shuffle') == 'Smart Shuffle'
         action, new_index, new_queued_count, new_is_temp_view = playlist_queue.advance(
-            self.current_index, len(self.current_playlist), self.queued_count, self.is_temp_view
+            self.current_index, len(self.current_playlist), self.queued_count,
+            self.is_temp_view, reshuffle_on_wrap=smart,
         )
 
         if action == 'stop':
             return
 
         if action == 'reshuffle':
+            # Guard against an all-unplayable library spinning forever: if we
+            # wrapped again within a couple of seconds, the tracks are failing
+            # instantly - stop instead of reshuffling in a tight loop.
+            now_mono = time.monotonic()
+            if now_mono - getattr(self, '_last_wrap_mono', 0.0) < 2.0:
+                self.status_label.config(text="⚠ No playable tracks")
+                return
+            self._last_wrap_mono = now_mono
             self.queued_count = 0
             self.is_temp_view = False
-            self.apply_shuffle(auto_play=True)
+            self.apply_shuffle(auto_play=True)  # no-arg -> Smart Shuffle; branch is Smart-only
             return
 
         self.current_index = new_index
@@ -4065,9 +4392,13 @@ class MusicPlayerGUI:
             print("⚠ Navigation disabled during shuffle")
             return
         
+        self._finalize_playback('previous')   # Task 8: not a dislike
         self.current_index = playlist_queue.previous_position(
             self.current_index, len(self.current_playlist)
         )
+        # Going backward abandons the forward-looking Up Next queue: keeping the
+        # block "adjacent to current" is impossible once you navigate past it,
+        # and re-consuming it on the way forward again would be surprising.
         self.queued_count = 0
         self.play_track_at_index(self.current_index)
     
@@ -4199,6 +4530,8 @@ class MusicPlayerGUI:
                 print(f"✓ Completed: {track.title}")
             
             self.is_playing = False
+            self._playback_state = 'stopped'  # until the next track starts
+            self._finalize_playback('natural_end')  # Task 8
             self.next_track(_internal=True)  # Allow auto-advance even during shuffle
 
 

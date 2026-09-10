@@ -1,0 +1,339 @@
+"""
+tests/test_shuffle_quality.py - measurable spacing/variety regression tests.
+
+Several tests here are @unittest.expectedFailure against the current
+draft-and-repair core.  Task 2 (bucketed stride-interleave) removes the
+decorator as each defect is fixed - a test that starts passing early will
+flag itself as an "unexpected success".
+
+Run:
+    python -m unittest tests.test_shuffle_quality -v
+"""
+
+import os
+import random
+import sys
+import unittest
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+
+from shuffle_core import CustomShuffleAlgorithm
+
+NOW = 1_700_000_000.0
+
+
+class QTrack:
+    __slots__ = ('filepath', 'artist', 'album', 'genre', 'rating',
+                 'play_count', 'skips', 'loved', 'last_played', 'date_added', 'bpm',
+                 'qualified_play_count', 'manual_skip_count', 'last_skipped_at')
+
+    def __init__(self, filepath, artist='', album='', genre='',
+                 rating=0, play_count=0, skips=0):
+        self.filepath = filepath
+        self.artist = artist
+        self.album = album
+        self.genre = genre
+        self.rating = rating
+        self.play_count = play_count
+        self.skips = skips
+        self.loved = None
+        self.last_played = None
+        self.date_added = None
+        self.bpm = 0
+        self.qualified_play_count = None
+        self.manual_skip_count = None
+        self.last_skipped_at = None
+
+
+def _adjacent(seq, key):
+    return sum(1 for a, b in zip(seq, seq[1:]) if key(a) == key(b) and key(a))
+
+
+def _longest_run(seq, key):
+    longest = run = 0
+    prev = object()
+    for t in seq:
+        k = key(t)
+        run = run + 1 if (k == prev and k) else 1
+        prev = k
+        longest = max(longest, run)
+    return longest
+
+
+class TestBalancedTwoArtist(unittest.TestCase):
+    """10 A + 10 B, no album/genre constraint: perfect alternation is feasible."""
+
+    def _lib(self):
+        return ([QTrack(f'/a{i}.mp3', 'A') for i in range(10)] +
+                [QTrack(f'/b{i}.mp3', 'B') for i in range(10)])
+
+    def test_no_adjacent_repeats_across_seeds(self):  # fixed: Task 2b
+        total = 0
+        for seed in range(100):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                self._lib(), {'adaptive_constraints': True},
+                rng=random.Random(seed), now=NOW)
+            total += _adjacent(out, lambda t: t.artist)
+        self.assertEqual(total, 0,
+                         f"perfect A/B alternation is feasible; got {total} "
+                         f"adjacent repeats over 100 seeds")
+
+    def test_completeness(self):
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            self._lib(), {}, rng=random.Random(0), now=NOW)
+        self.assertEqual(len(out), 20)
+        self.assertEqual({t.filepath for t in out},
+                         {t.filepath for t in self._lib()})
+
+
+class TestSkewedLibrary(unittest.TestCase):
+    """700 dominant + 300 spread: min adjacent 399, but runs should be short."""
+
+    def _lib(self):
+        return ([QTrack(f'/d{i}.mp3', 'Dom') for i in range(700)] +
+                [QTrack(f'/o{i}.mp3', f'Art{i % 30}') for i in range(300)])
+
+    def test_dominant_artist_not_one_long_tail_run(self):  # fixed: Task 2b
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            self._lib(), {}, rng=random.Random(0), now=NOW)
+        self.assertLessEqual(_longest_run(out, lambda t: t.artist), 5,
+                             "dominant artist should be spread as short runs, "
+                             "not dumped as one tail block")
+
+    def test_no_tracks_lost_on_skew(self):
+        lib = self._lib()
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {}, rng=random.Random(0), now=NOW)
+        self.assertEqual(len(out), len(lib))
+
+
+class TestHistoryGuardSizeZero(unittest.TestCase):
+
+    def test_zero_guard_size_disables_history(self):  # fixed: Task 2a
+        """history_guard_size=0 must mean 'no guard', not '[-0:] == whole list'.
+
+        Only the first 10 (unique-artist) tracks are 'recent'.  With the guard
+        genuinely disabled, passing that history changes nothing; the current
+        `[-0:]` bug still penalises those 10 and reorders them.
+        """
+        tracks = [QTrack(f'/t{i:03d}.mp3', f'Art{i}', play_count=i % 7)
+                  for i in range(40)]
+        recent = [(t.filepath, t.artist.lower()) for t in tracks[:10]]
+
+        cfg = {'history_guard_size': 0, 'history_track_penalty': 0.9,
+               'random_min': 0.0, 'random_range': 0.0,
+               'adaptive_constraints': False,
+               'recent_artists': 1, 'recent_albums': 1, 'recent_genres': 1}
+
+        with_hist = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), cfg, recent_history=recent,
+            rng=random.Random(1), now=NOW)
+        without = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), cfg, recent_history=None,
+            rng=random.Random(1), now=NOW)
+
+        self.assertEqual([t.filepath for t in with_hist],
+                         [t.filepath for t in without],
+                         "guard size 0 must be a no-op")
+
+
+class TestStartProtection(unittest.TestCase):
+    """context={'protected_paths': [...]} keeps just-played tracks out of the
+    first few positions of a fresh shuffle."""
+
+    def _lib(self, n=40):
+        return [QTrack(f'/t{i:02d}.mp3', f'Art{i}') for i in range(n)]
+
+    def test_protected_tracks_not_in_first_three(self):
+        lib = self._lib()
+        protected = {t.filepath for t in lib[:3]}
+        for seed in range(30):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                list(lib), {}, rng=random.Random(seed), now=NOW,
+                context={'protected_paths': protected, 'protect_positions': 3})
+            first3 = {t.filepath for t in out[:3]}
+            self.assertEqual(first3 & protected, set(),
+                             f"seed {seed}: protected track in first 3")
+
+    def test_still_complete(self):
+        lib = self._lib()
+        protected = {t.filepath for t in lib[:3]}
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {}, rng=random.Random(1), now=NOW,
+            context={'protected_paths': protected})
+        self.assertEqual(sorted(t.filepath for t in out),
+                         sorted(t.filepath for t in lib))
+
+    def test_degrades_when_pool_too_small(self):
+        # 2 tracks, both protected -> cannot honour protection, must not hang
+        a, b = QTrack('/a.mp3', 'A'), QTrack('/b.mp3', 'B')
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            [a, b], {}, rng=random.Random(1), now=NOW,
+            context={'protected_paths': {'/a.mp3', '/b.mp3'}, 'protect_positions': 3})
+        self.assertEqual(len(out), 2)
+
+    def test_context_recent_history_still_penalises(self):
+        lib = self._lib(60)
+        recent = [(t.filepath, t.artist.lower()) for t in lib[:10]]
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {'random_min': 0.0, 'random_range': 0.0},
+            recent_history=recent, rng=random.Random(1), now=NOW)
+        positions = {t.filepath: i for i, t in enumerate(out)}
+        recent_mean = sum(positions[t.filepath] for t in lib[:10]) / 10
+        other_mean = sum(positions[t.filepath] for t in lib[10:]) / 50
+        self.assertGreater(recent_mean, other_mean)
+
+
+class TestWeightedMode(unittest.TestCase):
+    """scoring_mode='weighted': favourites lead more often, but not always."""
+
+    def _pair_lib(self):
+        hi = QTrack('/hi.mp3', 'X', rating=100)
+        hi.loved = True
+        lo = QTrack('/lo.mp3', 'Y', rating=20)
+        lo.loved = False
+        return hi, lo
+
+    def test_favoured_leads_more_often_but_not_always(self):
+        hi_first = 0
+        for seed in range(400):
+            hi, lo = self._pair_lib()
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                [hi, lo], {'scoring_mode': 'weighted', 'beta': 1.5},
+                rng=random.Random(seed), now=NOW)
+            hi_first += (out[0].filepath == '/hi.mp3')
+        self.assertGreater(hi_first, 220, "favoured should usually lead")
+        self.assertLess(hi_first, 400, "but not deterministically")
+
+    def test_beta_zero_is_roughly_uniform(self):
+        hi_first = 0
+        for seed in range(400):
+            hi, lo = self._pair_lib()
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                [hi, lo], {'scoring_mode': 'weighted', 'beta': 0.0},
+                rng=random.Random(seed), now=NOW)
+            hi_first += (out[0].filepath == '/hi.mp3')
+        self.assertGreater(hi_first, 150)
+        self.assertLess(hi_first, 250)
+
+    def test_completeness_and_no_loss(self):
+        lib = [QTrack(f'/t{i}.mp3', f'Art{i % 12}', rating=(i % 5) * 20)
+               for i in range(120)]
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(lib), {'scoring_mode': 'weighted'}, rng=random.Random(1), now=NOW)
+        self.assertEqual(sorted(t.filepath for t in out),
+                         sorted(t.filepath for t in lib))
+
+    def test_favorite_beats_high_rating_in_weighted_mode(self):
+        # weighted mode: taste is the favorite, not numeric rating (Task 7b).
+        fav_first = rated_first = 0
+        for seed in range(300):
+            fav = QTrack('/fav.mp3', 'X', rating=0)
+            fav.loved = True
+            rated = QTrack('/rated.mp3', 'Y', rating=100)   # 5 stars, not faved
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                [fav, rated], {'scoring_mode': 'weighted', 'beta': 1.5},
+                rng=random.Random(seed), now=NOW)
+            fav_first += (out[0].filepath == '/fav.mp3')
+            rated_first += (out[0].filepath == '/rated.mp3')
+        self.assertGreater(fav_first, rated_first * 1.8,
+                           "the favorited track should clearly lead the 5-star one")
+
+
+class TestListeningFeedback(unittest.TestCase):
+    """Tracks with real skip observations are deferred (Task 8)."""
+
+    def test_skipped_track_ranks_later(self):
+        n = 60
+        tracks = []
+        for i in range(n):
+            t = QTrack(f'/m/t{i:02d}.mp3', f'Art{i}')  # unique artists, no repair swaps
+            tracks.append(t)
+        # first 8 tracks have a strong skip history
+        for t in tracks[:8]:
+            t.manual_skip_count = 6
+            t.qualified_play_count = 0
+            t.last_skipped_at = NOW - 3600
+
+        cfg = {'random_min': 0.0, 'random_range': 0.0, 'adaptive_constraints': False,
+               'recent_artists': 1}
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), cfg, rng=random.Random(1), now=NOW)
+        pos = {t.filepath: i for i, t in enumerate(out)}
+        skipped_mean = sum(pos[t.filepath] for t in tracks[:8]) / 8
+        other_mean = sum(pos[t.filepath] for t in tracks[8:]) / (n - 8)
+        self.assertGreater(skipped_mean, other_mean)
+
+    def test_heavily_skipped_track_is_not_parked_forever(self):
+        # legacy (default) mode: even an extreme skip history must not exclude
+        # a track - it needs to still surface so it can earn qualified plays.
+        n = 100
+        tracks = [QTrack(f'/m/t{i:03d}.mp3', f'Art{i}') for i in range(n)]
+        pariah = tracks[0]
+        pariah.manual_skip_count = 50
+        pariah.qualified_play_count = 0
+        pariah.last_skipped_at = NOW - 3600
+
+        seen_in_first_half = 0
+        for s in range(40):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                list(tracks), {'adaptive_constraints': False},
+                rng=random.Random(s), now=NOW)
+            pos = next(i for i, t in enumerate(out) if t.filepath == pariah.filepath)
+            self.assertLess(pos, n, "must still be in the playlist")
+            seen_in_first_half += (pos < n // 2)
+        # over many shuffles it should land in the first half at least sometimes
+        self.assertGreater(seen_in_first_half, 0,
+                           "a disliked track is demoted, not permanently excluded")
+
+    def test_many_qualified_plays_dilute_the_penalty(self):
+        # A track skipped a few times but mostly enjoyed should rank far ahead
+        # of one skipped the same number of times with no qualified plays.
+        n = 60
+        tracks = [QTrack(f'/m/t{i:02d}.mp3', f'Art{i}') for i in range(n)]
+        enjoyed = tracks[0]
+        enjoyed.manual_skip_count = 4
+        enjoyed.qualified_play_count = 40
+        hated = tracks[1]
+        hated.manual_skip_count = 4
+        hated.qualified_play_count = 0
+
+        cfg = {'random_min': 0.0, 'random_range': 0.0, 'adaptive_constraints': False,
+               'recent_artists': 1}
+        e_pos = h_pos = 0
+        for s in range(40):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                list(tracks), cfg, rng=random.Random(s), now=NOW)
+            pos = {t.filepath: i for i, t in enumerate(out)}
+            e_pos += pos[enjoyed.filepath]
+            h_pos += pos[hated.filepath]
+        self.assertLess(e_pos, h_pos, "enjoyed-despite-skips must rank ahead of pure-skip")
+
+
+class TestUnknownTagPositionalSpacing(unittest.TestCase):
+
+    def test_unknown_artist_songs_advance_the_window(self):  # fixed: Task 2b
+        """Songs with no artist must still consume spacing positions.
+
+        Layout: A, <unknown>, <unknown>, A, ...  With a positional window of 3
+        the two A's are 3 apart and should be accepted; the bug counts only
+        tagged entries so unknowns are invisible to the cooldown.
+        """
+        tracks = []
+        for block in range(20):
+            tracks.append(QTrack(f'/a{block}.mp3', 'A'))
+            tracks.append(QTrack(f'/u{block}a.mp3', ''))
+            tracks.append(QTrack(f'/u{block}b.mp3', ''))
+
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), {'adaptive_constraints': False, 'recent_artists': 2,
+                           'recent_albums': 0, 'recent_genres': 0},
+            rng=random.Random(0), now=NOW)
+
+        # No two 'A' tracks adjacent, and every unknown still placed.
+        self.assertEqual(_adjacent(out, lambda t: t.artist), 0)
+        self.assertEqual(len(out), 60)
+
+
+if __name__ == '__main__':
+    unittest.main()

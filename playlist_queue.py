@@ -59,14 +59,17 @@ def queue_target(current_index, queued_count, play_next, existing_index):
     return existing_index, insert_index, new_current_index, new_queued_count
 
 
-def advance(current_index, length, queued_count, is_temp_view):
+def advance(current_index, length, queued_count, is_temp_view, *,
+            reshuffle_on_wrap=False):
     """Decide the next track.
 
     Returns (action, new_index, new_queued_count, new_is_temp_view).
     action is one of:
         'play'      - play new_index in the current playlist
-        'reshuffle' - the temp (taken-over) view ended; caller should
-                      regenerate a full shuffle and start at index 0
+        'reshuffle' - regenerate a full shuffle and start at index 0.  Happens
+                      when a taken-over search view ends, or (with
+                      reshuffle_on_wrap=True, i.e. Smart Shuffle) at a normal
+                      end-of-playlist wrap instead of replaying the same order.
         'stop'      - nothing to play (empty playlist)
     """
     if length == 0:
@@ -77,10 +80,40 @@ def advance(current_index, length, queued_count, is_temp_view):
     if next_index >= length:
         if is_temp_view:
             return 'reshuffle', 0, 0, False
+        if reshuffle_on_wrap:
+            return 'reshuffle', 0, 0, False
         return 'play', 0, 0, False
 
     new_queued_count = queued_count - 1 if queued_count > 0 else 0
     return 'play', next_index, new_queued_count, is_temp_view
+
+
+def reshuffle_tail_input(all_tracks, active_track, queued_tracks, *, norm_fn=None):
+    """Library tracks eligible for a fresh shuffle, i.e. everything except the
+    fixed prefix (the active track plus the queued block).
+
+    Excludes by object identity - `all_tracks`, the active track and the queued
+    block all hold the same MusicTrack objects - so duplicate/case-variant
+    filepaths and empty paths are handled correctly.  `norm_fn` is accepted for
+    call-site symmetry but unused.
+    """
+    exclude = {id(t) for t in queued_tracks}
+    if active_track is not None:
+        exclude.add(id(active_track))
+    return [t for t in all_tracks if id(t) not in exclude]
+
+
+def reshuffle_compose(active_track, queued_tracks, shuffled_tail):
+    """Assemble the new playlist: active track, then the untouched queued block,
+    then the freshly shuffled tail.
+
+    Returns (playlist, current_index, queued_count).
+    """
+    prefix = ([active_track] if active_track is not None else []) + list(queued_tracks)
+    playlist = prefix + list(shuffled_tail)
+    current_index = 0
+    queued_count = len(queued_tracks)
+    return playlist, current_index, queued_count
 
 
 def previous_position(current_index, length):

@@ -1,5 +1,6 @@
 # Cache and runtime data
 music_shuffler_cache/
+shuffler_preferences.json
 
 # Archived/legacy files
 Old/

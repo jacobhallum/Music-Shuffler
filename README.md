@@ -4,13 +4,31 @@ A custom music player for large iTunes/M4A libraries with a smart shuffle algori
 
 ## Features
 
-- **Smart Shuffle** — weighted by play count, rating, recency, newness, loved status, and skip count
+- **Smart Shuffle** — a bucketed stride-interleave that spaces artists evenly at
+  any library skew, runs in well under a second on 15K+ tracks, varies between
+  sessions, and keeps recently-played tracks out of the next shuffle's opening.
+  Regenerates a fresh order when the playlist wraps.
 - **Background M4A pre-conversion** — converts tracks via FFmpeg so playback is instant
-- **Unified metadata** — tracks play count, skip count, rating, and loved state for all 8K+ tracks
+- **Unified metadata** — play count, rating, favorite, and honest listening
+  outcomes (`qualified_play_count` / `manual_skip_count`) for all 8K+ tracks
+- **Favorites drive taste** — the ♥ button is the preference signal (legacy
+  numeric rating still works); favorites are stored outside the cache so
+  "Clear Cache" can't wipe them. "Import iTunes Ratings as Favorites" seeds
+  them one-off from existing 4★+ ratings.
 - **Album artwork** display
-- **Up Next queue** with drag-free ordering
+- **Up Next queue** — survives a reshuffle
 - **Global media keys** (F5–F8) work system-wide
 - **Search & filter** across the full library
+
+### Shuffle scoring modes
+
+`legacy` (default) keeps the historical additive weighting including numeric
+rating. `weighted` (opt-in, set `scoring_mode` in `shuffle_config.json`) uses
+scale-free favorite-forward weighting with a single `beta` strength knob and
+drops numeric rating. Both modes share the interleave; neither can effectively
+exclude a track. Listening feedback (`min(240s, 80%)` = a qualified play; a
+manual Next before that = a skip; seeking is never "listening") gently demotes
+tracks you consistently skip and lets that decay over ~a week.
 
 ## Requirements
 
@@ -50,14 +68,19 @@ pip install pygame mutagen Pillow PyQt6 pywin32
 
 ## Privacy note
 
-The `music_shuffler_cache/` directory contains your personal library index and listening history and is intentionally excluded from version control. Never commit it.
+The `music_shuffler_cache/` directory contains your personal library index and
+listening history and is intentionally excluded from version control. Never
+commit it. `shuffler_preferences.json` (favorites, kept beside the cache dir so
+a cache wipe doesn't lose it) is likewise personal — don't commit it.
 
 ## Utilities
 
 | Script | Purpose |
 |--------|---------|
 | `utlities/list_albums.py` | List albums ranked by play count, cross-referenced against a local download wishlist |
-| `utlities/check_track_stats.py <path>` | Show Smart Shuffle weight breakdown for a specific track |
+| `utlities/check_track_stats.py <path-or-fragment>` | Smart Shuffle score breakdown for a track — reads the app's own metadata + config and the real scorer (never a copy) |
+| `scripts/benchmark_shuffle.py [--skew F] [--sizes ...] [--iters N]` | Runtime + spacing quality (adjacency, longest run, session coverage); `--skew 0.7` exercises a dominant-artist library |
+| `scripts/shuffle_probes.py [probe ...]` | Reproduces every headline measurement in `docs/plans/2026-09-09-smart-shuffle-enhancements.md` |
 | `utlities/detect_media_keys.py` | Debug global media key detection |
 | `scripts/preflight_privacy_check.sh` | Verify no personal paths/cache files would be committed before a push |
 | `utlities/library_manager.py` | GUI tool to sort album track order by date-added and edit all song metadata. Run: `python utlities/library_manager.py` |
