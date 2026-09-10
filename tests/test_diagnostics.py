@@ -13,7 +13,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from shuffle_core import (explain_preference_score, legacy_preference_score,
-                          normalize_shuffle_config)
+                          normalize_shuffle_config, weighted_score_cfg)
 
 NOW = 1_700_000_000.0
 
@@ -46,18 +46,21 @@ class TestExplain(unittest.TestCase):
     def test_score_matches_real_scorer_weighted(self):
         t = T(rating=100, loved=True, play_count=1)
         info = explain_preference_score(t, {'scoring_mode': 'weighted'}, now=NOW)
-        cfg = {**normalize_shuffle_config(None), 'rating_weight': 0.0, 'loved_weight': 0.85}
+        cfg = weighted_score_cfg(normalize_shuffle_config(None))
         self.assertAlmostEqual(info['score'],
                                legacy_preference_score(t, cfg, now=NOW), places=9)
 
-    def test_components_sum_close_to_score(self):
-        t = T(rating=60, play_count=10, loved=False, last_played=NOW - 5 * 86400,
-              manual_skip_count=3, qualified_play_count=1, last_skipped_at=NOW - 3600)
-        info = explain_preference_score(t, None, now=NOW)
-        comp_total = sum(v for _, v in info['components'])
-        # score also carries a documented positive base weight from bpm etc.;
-        # the components should account for the bulk of it.
-        self.assertLess(abs(comp_total - info['score']), 0.11)
+    def test_components_sum_to_score(self):
+        # No artist_skip_rate / history passed here, so the components account
+        # for the score exactly (bpm_bonus included).
+        for bpm in (0, 128):
+            t = T(rating=60, play_count=10, loved=False, last_played=NOW - 5 * 86400,
+                  bpm=bpm, manual_skip_count=3, qualified_play_count=1,
+                  last_skipped_at=NOW - 3600)
+            info = explain_preference_score(t, None, now=NOW)
+            comp_total = sum(v for _, v in info['components'])
+            self.assertAlmostEqual(comp_total, info['score'], places=6,
+                                   msg=f"bpm={bpm}")
 
     def test_weighted_mode_zeroes_rating_component(self):
         t = T(rating=100)

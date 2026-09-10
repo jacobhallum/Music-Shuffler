@@ -215,6 +215,16 @@ def _love_score(loved):
     return 1.0 if loved else 0.0
 
 
+# Weighted mode: favorite is the taste axis, numeric rating drops out (Task 7b).
+WEIGHTED_LOVED_WEIGHT = 0.85
+
+
+def weighted_score_cfg(cfg):
+    """The config `smart_shuffle` scores against in 'weighted' mode - one place
+    so the diagnostic and the shuffle can't disagree."""
+    return {**cfg, 'rating_weight': 0.0, 'loved_weight': WEIGHTED_LOVED_WEIGHT}
+
+
 # The feedback penalty alone can never exceed this, so a disliked track is
 # demoted, never parked-forever (see the relative race-weight floor below).
 _FEEDBACK_PENALTY_CAP = 0.50
@@ -285,30 +295,32 @@ def explain_preference_score(track, config=None, *, now=None, scoring_mode=None)
     'feedback', 'notes': [...]}.  Used by the diagnostic tool so it can never
     drift from the real scorer (Task 9).
     """
-    import time as _t
     cfg = normalize_shuffle_config(config)
     if now is None:
-        now = _t.time()
+        now = time.time()
     mode = scoring_mode or cfg['scoring_mode']
-    wcfg = cfg
-    if mode == 'weighted':
-        wcfg = {**cfg, 'rating_weight': 0.0, 'loved_weight': 0.85}
+    wcfg = weighted_score_cfg(cfg) if mode == 'weighted' else cfg
 
+    bpm_on = (getattr(track, 'bpm', 0) or 0) > 0
     comps = [
         ('rating',   wcfg['rating_weight']  * _norm_rating(getattr(track, 'rating', None))),
         ('novelty',  wcfg['novelty_weight'] * _novelty_score(getattr(track, 'play_count', None))),
         ('recency',  wcfg['recency_weight'] * _recency_boost(getattr(track, 'last_played', None), now)),
         ('newness',  wcfg['newness_weight'] * _newness_boost(getattr(track, 'date_added', None), now)),
         ('favorite', wcfg['loved_weight']   * _love_score(getattr(track, 'loved', None))),
+        ('bpm_bonus', wcfg['bpm_bonus'] if bpm_on else 0.0),
         ('skip_penalty(legacy)', -wcfg['skip_penalty_weight'] * _skip_penalty(track)),
         ('feedback_penalty',     -_feedback_penalty(track, wcfg, now)),
     ]
     score = legacy_preference_score(track, wcfg, now=now)
     notes = []
     if mode == 'weighted':
-        notes.append("weighted mode: numeric rating is ignored; favorite weight = 0.85")
+        notes.append(f"weighted mode: numeric rating is ignored; "
+                     f"favorite weight = {WEIGHTED_LOVED_WEIGHT}")
     else:
         notes.append("legacy mode: numeric rating still contributes")
+    notes.append("artist-skip-rate and the recent-history guard also affect the "
+                 "score but need the whole library, so they are not shown here")
     notes.append("final playlist position also depends on artist stride + a "
                  "per-seed random race, so rank varies run to run")
     return {
@@ -425,9 +437,7 @@ class CustomShuffleAlgorithm:
         # ---- Deterministic preference score per track (by index) -------------
         # In 'weighted' mode the taste axis is the favorite, not numeric rating
         # (Task 7b): rating drops out, favorite weight goes up.
-        score_cfg = cfg
-        if scoring_mode == 'weighted':
-            score_cfg = {**cfg, 'rating_weight': 0.0, 'loved_weight': 0.85}
+        score_cfg = weighted_score_cfg(cfg) if scoring_mode == 'weighted' else cfg
         scores = [
             legacy_preference_score(
                 t, score_cfg, now=now,

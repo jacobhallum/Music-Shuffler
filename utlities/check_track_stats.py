@@ -40,8 +40,10 @@ def _load_player_metadata():
     try:
         with open(path, "rb") as f:
             data = plistlib.load(f)
+        if not isinstance(data, dict):
+            return {}, 0
         return data.get("tracks", {}), int(data.get("schema_version", 1))
-    except (OSError, ValueError):
+    except (OSError, ValueError, AttributeError):
         return {}, 0
 
 
@@ -54,7 +56,7 @@ class _Track:
         self.genre = md.get("genre", "")
         self.rating = md.get("rating", 0) or 0
         self.play_count = md.get("play_count", 0) or 0
-        self.skips = md.get("skip_count")
+        self.skips = md.get("skip_count") or 0
         self.loved = md.get("loved")
         self.last_played = md.get("last_played")
         self.date_added = md.get("date_added")
@@ -77,6 +79,10 @@ def report(fragment):
     tracks, schema = _load_player_metadata()
     cfg = _load_config()
     now = time.time()
+    if schema < 2 and tracks:
+        print("note: metadata is pre-v2; the app migrates it on load "
+              "(bare loved=False -> unknown, 0 sentinels -> None). This tool "
+              "reads it raw, so favorite/age fields may differ from the app.\n")
 
     frag = fragment.lower()
     matches = [(k, v) for k, v in tracks.items() if frag in k.lower()]
@@ -105,7 +111,7 @@ def report(fragment):
               f"manual_skips {fb['manual_skip_count']}   "
               f"last_skipped {_fmt_ts(fb['last_skipped_at'])}")
         print()
-        print(f"  scoring mode: {info['mode']}   config schema v{schema}")
+        print(f"  scoring mode: {info['mode']}   metadata schema v{schema}")
         print(f"  deterministic preference score: {info['score']:.4f}")
         print("  component contributions:")
         for label, val in info["components"]:
