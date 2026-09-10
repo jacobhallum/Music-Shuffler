@@ -199,8 +199,10 @@ def _skip_penalty(track):
 
 
 def _love_score(loved):
+    # None / unknown -> neutral (Task 7).  A track you have never had an
+    # opinion about should not be scored the same as one you actively unfaved.
     if loved is None:
-        return 0.25
+        return 0.35
     return 1.0 if loved else 0.0
 
 
@@ -340,9 +342,14 @@ class CustomShuffleAlgorithm:
         }
 
         # ---- Deterministic preference score per track (by index) -------------
+        # In 'weighted' mode the taste axis is the favorite, not numeric rating
+        # (Task 7b): rating drops out, favorite weight goes up.
+        score_cfg = cfg
+        if scoring_mode == 'weighted':
+            score_cfg = {**cfg, 'rating_weight': 0.0, 'loved_weight': 0.85}
         scores = [
             legacy_preference_score(
-                t, cfg, now=now,
+                t, score_cfg, now=now,
                 artist_skip_rate=artist_skip_rate,
                 recent_tracks=recent_track_set,
                 recent_artists=recent_artist_set)

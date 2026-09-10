@@ -220,6 +220,21 @@ class TestWeightedMode(unittest.TestCase):
         self.assertEqual(sorted(t.filepath for t in out),
                          sorted(t.filepath for t in lib))
 
+    def test_favorite_beats_high_rating_in_weighted_mode(self):
+        # weighted mode: taste is the favorite, not numeric rating (Task 7b).
+        fav_first = rated_first = 0
+        for seed in range(300):
+            fav = QTrack('/fav.mp3', 'X', rating=0)
+            fav.loved = True
+            rated = QTrack('/rated.mp3', 'Y', rating=100)   # 5 stars, not faved
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                [fav, rated], {'scoring_mode': 'weighted', 'beta': 1.5},
+                rng=random.Random(seed), now=NOW)
+            fav_first += (out[0].filepath == '/fav.mp3')
+            rated_first += (out[0].filepath == '/rated.mp3')
+        self.assertGreater(fav_first, rated_first * 1.8,
+                           "the favorited track should clearly lead the 5-star one")
+
 
 class TestUnknownTagPositionalSpacing(unittest.TestCase):
 

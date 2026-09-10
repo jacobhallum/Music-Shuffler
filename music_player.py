@@ -596,6 +596,9 @@ class MusicPlayerGUI:
         self.player_metadata_file = cache_dir / "music_player_metadata.xml"
         self.shuffle_config_file = cache_dir / "shuffle_config.json"
         self.shuffle_history_file = cache_dir / "shuffle_history.json"
+        # Favorites store: sibling of the cache dir, NOT inside it, so
+        # "Clear Cache" cannot destroy the shuffle taste signal (Task 7c).
+        self.preferences_file = cache_dir.parent / "shuffler_preferences.json"
         print(f"Cache directory: {cache_dir}")
 
         # Persisted ordered listening history (Task 3) - survives restarts so
@@ -693,7 +696,20 @@ class MusicPlayerGUI:
         
         # V2: Load unified player metadata
         self._load_player_metadata()
-        
+
+        # Task 7c: favorites live in a durable store outside the cache; they are
+        # authoritative for loved/loved_source and survive a cache wipe.
+        try:
+            import preferences as _pf
+            self._favorites = _pf.load(str(self.preferences_file))
+            with self._metadata_lock:
+                _pf.merge_into_metadata(self._favorites, self.player_metadata)
+            if self._favorites:
+                print(f"✓ Loaded {len(self._favorites)} favorites")
+        except Exception as e:
+            print(f"⚠ Could not load favorites: {e}")
+            self._favorites = {}
+
         # Auto-load library on startup
         self.root.after(100, self.scan_library)
     
@@ -745,6 +761,7 @@ class MusicPlayerGUI:
         settings_menu.add_command(label="Library Info", command=self.show_library_info)
         settings_menu.add_separator()
         settings_menu.add_command(label="Shuffle Settings", command=self.edit_shuffle_settings)
+        settings_menu.add_command(label="Import iTunes Ratings as Favorites…", command=self.migrate_ratings_to_favorites)
         settings_menu.add_separator()
         settings_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
         settings_menu.add_separator()
@@ -1695,6 +1712,17 @@ class MusicPlayerGUI:
         track.loved = not track.loved if track.loved is not None else True
         track.loved_source = 'user'
 
+        # Persist to the durable favorites store (Task 7c)
+        try:
+            import preferences as _pf
+            self._favorites = _pf.set_favorite(
+                getattr(self, '_favorites', {}),
+                getattr(track, 'original_filepath', track.filepath),
+                track.loved, source='user')
+            _pf.save(str(self.preferences_file), self._favorites)
+        except Exception as e:
+            print(f"⚠ Could not save favorite: {e}")
+
         # Update button - use unicode hearts that respond to foreground color
         if track.loved:
             self.love_button.config(text="♥", foreground="red", font=('Arial', 14, 'bold'))
@@ -1706,6 +1734,55 @@ class MusicPlayerGUI:
         
         print(f"{'♥' if track.loved else '♡'} {track.title}")
     
+    def migrate_ratings_to_favorites(self):
+        """One-time, opt-in: seed favorites from existing high iTunes ratings
+        for tracks that have no favorite opinion yet (Task 7b)."""
+        RATING_THRESHOLD = 80  # 0-100 scale (4+ stars)
+        candidates = []
+        for t in getattr(self, 'library_tracks', []) or self.all_tracks:
+            if getattr(t, 'loved', None) is not None:
+                continue
+            if getattr(t, 'loved_source', None) not in (None, 'unknown'):
+                continue
+            r = getattr(t, 'rating', 0) or 0
+            # Only migrate unambiguous 0-100 iTunes-scale ratings.
+            if 0 < r <= 100 and r >= RATING_THRESHOLD:
+                candidates.append(t)
+
+        if not candidates:
+            messagebox.showinfo("Import Ratings",
+                                "No un-favorited tracks rated 4+ stars were found.")
+            return
+        if not messagebox.askyesno(
+                "Import Ratings as Favorites",
+                f"Mark {len(candidates)} track(s) rated 4+ stars as favorites?\n\n"
+                "This only affects tracks you haven't favorited or un-favorited "
+                "yourself, and is recorded as 'migrated' so you can tell them "
+                "apart later."):
+            return
+
+        try:
+            import preferences as _pf
+        except Exception as e:
+            messagebox.showerror("Import Ratings", f"Could not load favorites store:\n{e}")
+            return
+        favs = getattr(self, '_favorites', {})
+        for t in candidates:
+            t.loved = True
+            t.loved_source = 'migrated'
+            self._update_track_metadata(t)
+            favs = _pf.set_favorite(favs, getattr(t, 'original_filepath', t.filepath),
+                                    True, source='migrated')
+        self._favorites = favs
+        try:
+            _pf.save(str(self.preferences_file), favs)
+        except Exception as e:
+            print(f"⚠ Could not save migrated favorites: {e}")
+        if self._validate_playlist_index():
+            self._update_love_button(self.current_playlist[self.current_index])
+        messagebox.showinfo("Import Ratings",
+                            f"Marked {len(candidates)} track(s) as favorites.")
+
     def _update_love_button(self, track):
         """V2: Update love button state (always visible)"""
         self.love_button.grid()  # Make button visible for all tracks
@@ -3018,13 +3095,16 @@ class MusicPlayerGUI:
                 self.player_metadata_file.unlink()
 
             # Metadata reset also clears persisted listening history (Task 3)
-            try:
-                if self.shuffle_history_file.exists():
-                    self.shuffle_history_file.unlink()
-            except OSError:
-                pass
+            # and the durable favorites store (Task 7c).
+            for f in (self.shuffle_history_file, self.preferences_file):
+                try:
+                    if f.exists():
+                        f.unlink()
+                except OSError:
+                    pass
             self._history_entries = []
             self._history_dirty = False
+            self._favorites = {}
 
             # Reset all loaded tracks
             for track in self.all_tracks:

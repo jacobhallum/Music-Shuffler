@@ -346,7 +346,7 @@ class TestLegacyScoring(unittest.TestCase):
             dict(rating=60,  play_count=5,   last_played=now - 30*86400, loved=None,  bpm=140),
             dict(rating=255, play_count=0,   last_played=0,              loved=True,  bpm=0),
         ]
-        expected = [1.1150, 1.1544, 0.1619, 0.9708, 1.6150]
+        expected = [1.1450, 1.1544, 0.1619, 1.0008, 1.6150]
         for spec, exp in zip(cases, expected):
             t = _make_tracks(1)[0]
             for k, v in spec.items():
