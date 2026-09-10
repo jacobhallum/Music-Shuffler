@@ -24,7 +24,8 @@ NOW = 1_700_000_000.0
 
 class QTrack:
     __slots__ = ('filepath', 'artist', 'album', 'genre', 'rating',
-                 'play_count', 'skips', 'loved', 'last_played', 'date_added', 'bpm')
+                 'play_count', 'skips', 'loved', 'last_played', 'date_added', 'bpm',
+                 'qualified_play_count', 'manual_skip_count', 'last_skipped_at')
 
     def __init__(self, filepath, artist='', album='', genre='',
                  rating=0, play_count=0, skips=0):
@@ -39,6 +40,9 @@ class QTrack:
         self.last_played = None
         self.date_added = None
         self.bpm = 0
+        self.qualified_play_count = None
+        self.manual_skip_count = None
+        self.last_skipped_at = None
 
 
 def _adjacent(seq, key):
@@ -234,6 +238,76 @@ class TestWeightedMode(unittest.TestCase):
             rated_first += (out[0].filepath == '/rated.mp3')
         self.assertGreater(fav_first, rated_first * 1.8,
                            "the favorited track should clearly lead the 5-star one")
+
+
+class TestListeningFeedback(unittest.TestCase):
+    """Tracks with real skip observations are deferred (Task 8)."""
+
+    def test_skipped_track_ranks_later(self):
+        n = 60
+        tracks = []
+        for i in range(n):
+            t = QTrack(f'/m/t{i:02d}.mp3', f'Art{i}')  # unique artists, no repair swaps
+            tracks.append(t)
+        # first 8 tracks have a strong skip history
+        for t in tracks[:8]:
+            t.manual_skip_count = 6
+            t.qualified_play_count = 0
+            t.last_skipped_at = NOW - 3600
+
+        cfg = {'random_min': 0.0, 'random_range': 0.0, 'adaptive_constraints': False,
+               'recent_artists': 1}
+        out = CustomShuffleAlgorithm.smart_shuffle(
+            list(tracks), cfg, rng=random.Random(1), now=NOW)
+        pos = {t.filepath: i for i, t in enumerate(out)}
+        skipped_mean = sum(pos[t.filepath] for t in tracks[:8]) / 8
+        other_mean = sum(pos[t.filepath] for t in tracks[8:]) / (n - 8)
+        self.assertGreater(skipped_mean, other_mean)
+
+    def test_heavily_skipped_track_is_not_parked_forever(self):
+        # legacy (default) mode: even an extreme skip history must not exclude
+        # a track - it needs to still surface so it can earn qualified plays.
+        n = 100
+        tracks = [QTrack(f'/m/t{i:03d}.mp3', f'Art{i}') for i in range(n)]
+        pariah = tracks[0]
+        pariah.manual_skip_count = 50
+        pariah.qualified_play_count = 0
+        pariah.last_skipped_at = NOW - 3600
+
+        seen_in_first_half = 0
+        for s in range(40):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                list(tracks), {'adaptive_constraints': False},
+                rng=random.Random(s), now=NOW)
+            pos = next(i for i, t in enumerate(out) if t.filepath == pariah.filepath)
+            self.assertLess(pos, n, "must still be in the playlist")
+            seen_in_first_half += (pos < n // 2)
+        # over many shuffles it should land in the first half at least sometimes
+        self.assertGreater(seen_in_first_half, 0,
+                           "a disliked track is demoted, not permanently excluded")
+
+    def test_many_qualified_plays_dilute_the_penalty(self):
+        # A track skipped a few times but mostly enjoyed should rank far ahead
+        # of one skipped the same number of times with no qualified plays.
+        n = 60
+        tracks = [QTrack(f'/m/t{i:02d}.mp3', f'Art{i}') for i in range(n)]
+        enjoyed = tracks[0]
+        enjoyed.manual_skip_count = 4
+        enjoyed.qualified_play_count = 40
+        hated = tracks[1]
+        hated.manual_skip_count = 4
+        hated.qualified_play_count = 0
+
+        cfg = {'random_min': 0.0, 'random_range': 0.0, 'adaptive_constraints': False,
+               'recent_artists': 1}
+        e_pos = h_pos = 0
+        for s in range(40):
+            out = CustomShuffleAlgorithm.smart_shuffle(
+                list(tracks), cfg, rng=random.Random(s), now=NOW)
+            pos = {t.filepath: i for i, t in enumerate(out)}
+            e_pos += pos[enjoyed.filepath]
+            h_pos += pos[hated.filepath]
+        self.assertLess(e_pos, h_pos, "enjoyed-despite-skips must rank ahead of pure-skip")
 
 
 class TestUnknownTagPositionalSpacing(unittest.TestCase):

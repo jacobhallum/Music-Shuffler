@@ -198,5 +198,101 @@ class ReshufflePrefixTests(unittest.TestCase):
         self.assertTrue(p._nav_enabled)
 
 
+class _FakeFeedbackPlayer:
+    """Minimal surface for the Task 8 finalize/start helpers."""
+    _start_playback_tracking = MusicPlayerGUI._start_playback_tracking
+    _finalize_playback = MusicPlayerGUI._finalize_playback
+
+    def __init__(self):
+        self._pb_tracker = None
+        self._pb_track = None
+        self._pb_seq = 0
+        self.updated = []
+
+    def _update_track_metadata(self, track):
+        self.updated.append(track)
+
+
+class _CounterTrack:
+    def __init__(self, duration):
+        self.duration = duration
+        self.qualified_play_count = None
+        self.manual_skip_count = None
+        self.last_skipped_at = None
+
+
+class ListeningFeedbackWiringTests(unittest.TestCase):
+
+    def test_quick_next_records_a_skip_not_a_play(self):
+        import playback_feedback as pf
+        p = _FakeFeedbackPlayer()
+        t = _CounterTrack(duration=200)
+        p._start_playback_tracking(t)
+        # simulate ~3 seconds of audible time
+        p._pb_tracker._audible = 3.0
+        p._pb_tracker._running_since = None
+        p._finalize_playback('next')
+        self.assertEqual(t.manual_skip_count, 1)
+        self.assertIsNone(t.qualified_play_count)
+        self.assertIsNotNone(t.last_skipped_at)
+
+    def test_natural_end_records_a_qualified_play(self):
+        p = _FakeFeedbackPlayer()
+        t = _CounterTrack(duration=200)
+        p._start_playback_tracking(t)
+        p._pb_tracker._audible = 195.0
+        p._pb_tracker._running_since = None
+        p._finalize_playback('natural_end')
+        self.assertEqual(t.qualified_play_count, 1)
+        self.assertIsNone(t.manual_skip_count)
+
+    def test_stop_and_previous_are_not_dislike(self):
+        for reason in ('stop', 'previous', 'select'):
+            p = _FakeFeedbackPlayer()
+            t = _CounterTrack(duration=200)
+            p._start_playback_tracking(t)
+            p._pb_tracker._audible = 2.0
+            p._pb_tracker._running_since = None
+            p._finalize_playback(reason)
+            self.assertIsNone(t.manual_skip_count, reason)
+
+    def test_finalize_is_idempotent(self):
+        p = _FakeFeedbackPlayer()
+        t = _CounterTrack(duration=200)
+        p._start_playback_tracking(t)
+        p._pb_tracker._audible = 2.0
+        p._pb_tracker._running_since = None
+        p._finalize_playback('next')
+        p._finalize_playback('stop')
+        self.assertEqual(t.manual_skip_count, 1)   # not 2
+
+    def test_natural_end_then_select_no_op(self):
+        # mirrors _handle_track_end -> next_track(_internal) -> play_track_at_index
+        p = _FakeFeedbackPlayer()
+        t = _CounterTrack(duration=200)
+        p._start_playback_tracking(t)
+        p._pb_tracker._audible = 199.0
+        p._pb_tracker._running_since = None
+        p._finalize_playback('natural_end')
+        p._finalize_playback('select')          # trailing no-op
+        self.assertEqual(t.qualified_play_count, 1)
+        self.assertIsNone(t.manual_skip_count)
+
+    def test_no_phantom_skip_when_nothing_playing(self):
+        p = _FakeFeedbackPlayer()          # never started a tracker
+        p._finalize_playback('next')       # must not raise / must be a no-op
+        self.assertEqual(p.updated, [])
+
+    def test_detaches_tracker_after_finalize(self):
+        p = _FakeFeedbackPlayer()
+        t = _CounterTrack(duration=200)
+        p._start_playback_tracking(t)
+        p._pb_tracker._audible = 2.0
+        p._pb_tracker._running_since = None
+        p._finalize_playback('stop')
+        self.assertIsNone(p._pb_tracker)
+        self.assertIsNone(p._pb_track)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -23,6 +23,9 @@ import random
 import time
 from collections import defaultdict, deque
 
+from playback_feedback import decayed_skip_aversion as _decayed_skip_aversion
+from playback_feedback import skip_signal as _skip_signal
+
 CONFIG_VERSION = 2
 
 # Single source of truth for shuffle defaults (music_player imports these).
@@ -50,13 +53,19 @@ DEFAULT_SHUFFLE_CONFIG = {
     'history_guard_size':    30,
     'history_track_penalty': 0.35,
     'history_artist_penalty': 0.15,
+
+    # Listening feedback (Task 8): confidence-adjusted skip signal + a
+    # temporary post-skip aversion that decays over ~a week.
+    'feedback_skip_weight':  0.40,
+    'feedback_decay_weight': 0.20,
 }
 
 _WINDOW_KEYS  = ('recent_artists', 'recent_albums', 'recent_genres')
 _WEIGHT_KEYS  = ('random_min', 'random_range', 'rating_weight', 'novelty_weight',
                  'recency_weight', 'newness_weight', 'loved_weight',
                  'skip_penalty_weight', 'artist_skip_weight', 'bpm_bonus',
-                 'history_track_penalty', 'history_artist_penalty', 'beta')
+                 'history_track_penalty', 'history_artist_penalty', 'beta',
+                 'feedback_skip_weight', 'feedback_decay_weight')
 _SCORING_MODES = ('legacy', 'weighted')
 _WINDOW_MAX = 50
 
@@ -206,6 +215,31 @@ def _love_score(loved):
     return 1.0 if loved else 0.0
 
 
+# The feedback penalty alone can never exceed this, so a disliked track is
+# demoted, never parked-forever (see the relative race-weight floor below).
+_FEEDBACK_PENALTY_CAP = 0.50
+
+
+def _feedback_penalty(track, cfg, now):
+    """Learned dislike from actual listening outcomes (Task 8).
+
+    Uses versioned counters when present; contributes nothing for a track with
+    no new observations (backs off to the rest of the score).
+    """
+    qp = getattr(track, 'qualified_play_count', None)
+    ms = getattr(track, 'manual_skip_count', None)
+    if not qp and not ms:
+        return 0.0
+    pen = cfg['feedback_skip_weight'] * _skip_signal(int(ms or 0), int(qp or 0))
+    last = getattr(track, 'last_skipped_at', None)
+    if last is not None:
+        try:
+            pen += cfg['feedback_decay_weight'] * _decayed_skip_aversion(float(last), now)
+        except (TypeError, ValueError):
+            pass
+    return min(pen, _FEEDBACK_PENALTY_CAP)
+
+
 def legacy_preference_score(track, cfg, *, now, base=0.0,
                             artist_skip_rate=None,
                             recent_tracks=frozenset(),
@@ -225,6 +259,7 @@ def legacy_preference_score(track, cfg, *, now, base=0.0,
     w += cfg['newness_weight']      * _newness_boost(getattr(track, 'date_added', None), now)
     w += cfg['loved_weight']        * _love_score(getattr(track, 'loved', None))
     w -= cfg['skip_penalty_weight'] * _skip_penalty(track)
+    w -= _feedback_penalty(track, cfg, now)
 
     ak = _norm_artist_key(track)
     if ak is not None and artist_skip_rate:
@@ -359,7 +394,13 @@ class CustomShuffleAlgorithm:
         if scoring_mode == 'weighted':
             race_weight = _boltzmann_weights(scores, cfg['beta'])
         else:
-            race_weight = [max(s, 1e-6) for s in scores]
+            # Relative floor (like weighted mode) so a heavily-penalised track
+            # is demoted, never effectively excluded - otherwise a
+            # consistently-skipped track parks at the end of every shuffle and
+            # can never earn the qualified plays that would rehabilitate it.
+            _pos = [s for s in scores if s > 0]
+            _floor = 0.02 * (sorted(_pos)[len(_pos) // 2] if _pos else 1.0)
+            race_weight = [max(s, _floor) for s in scores]
 
         # Cross-bucket bias: a fraction of a bucket's stride, bounded by tanh so
         # phase randomness (spread == stride) can always overcome it - this is

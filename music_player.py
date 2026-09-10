@@ -54,7 +54,6 @@ from urllib.parse import unquote, urlparse  # For decoding iTunes file URLs
 # =============================================================================
 # Constants
 # =============================================================================
-SKIP_COMPLETION_THRESHOLD = 0.80  # Track must be <80% complete to count as skip
 MIN_DISK_SPACE_MB = 50  # Minimum disk space for cache operations
 MIN_DISK_SPACE_PRECONV_MB = 500  # Minimum disk space for pre-conversion
 MIN_VALID_CACHE_SIZE = 1024  # Minimum bytes for valid converted file
@@ -91,8 +90,13 @@ class MusicTrack:
         self.loved = None        # bool|None
         self.loved_source = None  # 'user' | 'migrated' | None (Task 7a)
         self.last_played = None  # epoch seconds|None
-        self.skips = None        # int|None
+        self.skips = None        # int|None (legacy heuristic counter)
         self.date_added = None   # epoch seconds|None
+        # Task 8: honest listening-outcome counters (versioned, additive - do
+        # NOT reinterpret the legacy `skips`/`play_count`).
+        self.qualified_play_count = None  # int|None
+        self.manual_skip_count = None     # int|None
+        self.last_skipped_at = None       # epoch seconds|None
         
         self._load_metadata()
         
@@ -134,6 +138,14 @@ class MusicTrack:
         if loved is not None:
             self.loved = loved
             self.loved_source = metadata.get('loved_source') or 'user'
+
+        # Task 8 listening-outcome counters
+        for attr, key in (('qualified_play_count', 'qualified_play_count'),
+                          ('manual_skip_count', 'manual_skip_count'),
+                          ('last_skipped_at', 'last_skipped_at')):
+            v = metadata.get(key)
+            if v is not None:
+                setattr(self, attr, v)
 
     def _load_metadata(self):
         """Load metadata from the meta_path"""
@@ -437,6 +449,9 @@ class MusicTrack:
             'last_played': self.last_played,
             'skips': self.skips,
             'date_added': self.date_added,
+            'qualified_play_count': self.qualified_play_count,
+            'manual_skip_count': self.manual_skip_count,
+            'last_skipped_at': self.last_skipped_at,
         }
 
     @classmethod
@@ -463,6 +478,9 @@ class MusicTrack:
         track.last_played = data.get('last_played')
         track.skips = data.get('skips')
         track.date_added = data.get('date_added')
+        track.qualified_play_count = data.get('qualified_play_count')
+        track.manual_skip_count = data.get('manual_skip_count')
+        track.last_skipped_at = data.get('last_skipped_at')
 
         # Apply player metadata if provided (takes precedence)
         if player_metadata:
@@ -671,6 +689,10 @@ class MusicPlayerGUI:
         # Playback state
         self.is_playing = False
         self.current_position = 0
+        # Task 8: audible-time tracker for the current playback instance
+        self._pb_tracker = None
+        self._pb_track = None
+        self._pb_seq = 0
         self.audio_available = False
         
         # Playback position tracking
@@ -1811,6 +1833,8 @@ class MusicPlayerGUI:
             pygame.mixer.music.pause()
             self.is_playing = False
             self._playback_state = 'paused'
+            if self._pb_tracker:
+                self._pb_tracker.pause(time.monotonic())
             print("Paused")
         else:
             # Reset segment start time when unpausing
@@ -1820,6 +1844,8 @@ class MusicPlayerGUI:
             if pygame.mixer.music.get_busy():
                 self.is_playing = True
                 self._playback_state = 'playing'
+                if self._pb_tracker:
+                    self._pb_tracker.resume(time.monotonic())
                 print("Unpaused")
             else:
                 self.play_track_at_index(self.current_index)
@@ -1875,7 +1901,13 @@ class MusicPlayerGUI:
                 # Update position tracking
                 self._seek_base_sec = float(target_pos)
                 self._segment_start_mono = time.monotonic()
-                
+                # Task 8: a seek settles audible time - the jumped interval is
+                # never credited as listening.
+                if self._pb_tracker:
+                    self._pb_tracker.seek(time.monotonic())
+                    if not was_playing:
+                        self._pb_tracker.pause(time.monotonic())
+
                 # Update UI
                 self.progress_var.set(percentage)
                 
@@ -1974,6 +2006,9 @@ class MusicPlayerGUI:
                         return None
                     return v
 
+                def _opt_int2(v):
+                    return None if v in (None, '') else int(v)
+
                 def _load_loved(td):
                     raw = td.get('loved', None)
                     src = td.get('loved_source', None)
@@ -1998,6 +2033,10 @@ class MusicPlayerGUI:
                             'loved': loved,
                             'loved_source': loved_source,
                             'date_added': _opt_int(track_data.get('date_added')),
+                            # Task 8 counters (never had a v1 sentinel)
+                            'qualified_play_count': _opt_int2(track_data.get('qualified_play_count')),
+                            'manual_skip_count': _opt_int2(track_data.get('manual_skip_count')),
+                            'last_skipped_at': _opt_int2(track_data.get('last_skipped_at')),
                         }
 
                 try:
@@ -2053,8 +2092,9 @@ class MusicPlayerGUI:
                     'rating': int(track_data.get('rating') or 0),
                 }
                 # Tri-state fields: only written when known, so a missing key
-                # reads back as None ("never set") rather than 0/False (Task 7a).
-                for k in ('skip_count', 'last_played', 'date_added'):
+                # reads back as None ("never set") rather than 0/False (Task 7a/8).
+                for k in ('skip_count', 'last_played', 'date_added',
+                          'qualified_play_count', 'manual_skip_count', 'last_skipped_at'):
                     v = track_data.get(k)
                     if v is not None:
                         entry[k] = int(v)
@@ -2115,6 +2155,9 @@ class MusicPlayerGUI:
                 'loved': getattr(track, 'loved', None),          # True | False | None
                 'loved_source': getattr(track, 'loved_source', None),
                 'date_added': _int_or_none(getattr(track, 'date_added', None)),
+                'qualified_play_count': _int_or_none(getattr(track, 'qualified_play_count', None)),
+                'manual_skip_count': _int_or_none(getattr(track, 'manual_skip_count', None)),
+                'last_skipped_at': _int_or_none(getattr(track, 'last_skipped_at', None)),
             }
 
         self._queue_metadata_save()
@@ -2623,6 +2666,12 @@ class MusicPlayerGUI:
         except (OSError, IOError, Exception) as e:
             print(f"⚠ Error saving metadata on close: {e}")
 
+        # Close the current playback instance (not a dislike) then flush.
+        try:
+            self._finalize_playback('stop')
+        except Exception:
+            pass
+
         # Final listening-history flush
         try:
             if self._history_save_job is not None:
@@ -3126,6 +3175,9 @@ class MusicPlayerGUI:
                 track.loved = None
                 track.loved_source = None
                 track.date_added = None
+                track.qualified_play_count = None
+                track.manual_skip_count = None
+                track.last_skipped_at = None
             
             # Update love button for current track if playing
             if self.is_playing and 0 <= self.current_index < len(self.current_playlist):
@@ -3991,6 +4043,47 @@ class MusicPlayerGUI:
         end = start + self.queued_count
         return self.current_playlist[start:end]
 
+    # ---- Task 8: listening-outcome tracking ------------------------------
+
+    def _start_playback_tracking(self, track):
+        """Begin a fresh audible-time instance for `track`."""
+        from playback_feedback import PlaybackTracker
+        self._pb_seq += 1
+        dur = getattr(track, 'duration', 0) or None
+        self._pb_tracker = PlaybackTracker(
+            self._pb_seq, duration=dur, now=time.monotonic())
+        self._pb_track = track
+
+    def _finalize_playback(self, reason):
+        """Close the current playback instance once and fold its outcome into
+        the versioned counters.  Idempotent (safe to call from every path)."""
+        tracker = self._pb_tracker
+        track = self._pb_track
+        if tracker is None or track is None:
+            return
+        try:
+            outcome = tracker.finalize(time.monotonic(), reason)
+        except Exception as e:
+            print(f"! playback finalize failed: {e}")
+            outcome = None
+        # Detach regardless: the instance is done, and a stale tracker must not
+        # keep receiving pause/resume/seek.
+        self._pb_tracker = None
+        self._pb_track = None
+        if outcome is None:
+            return
+
+        changed = False
+        if outcome.qualified_play:
+            track.qualified_play_count = int(track.qualified_play_count or 0) + 1
+            changed = True
+        if outcome.manual_skip:
+            track.manual_skip_count = int(track.manual_skip_count or 0) + 1
+            track.last_skipped_at = int(time.time())
+            changed = True
+        if changed:
+            self._update_track_metadata(track)
+
     def _active_track(self):
         """The track the player is currently on - playing OR paused (not
         stopped).  Used to keep the play position aligned across a reshuffle."""
@@ -4059,10 +4152,15 @@ class MusicPlayerGUI:
         
         if not self.current_playlist or index >= len(self.current_playlist):
             return
-        
+
+        # Close out the previous instance.  Callers that know a more specific
+        # reason (next_track, previous_track, _handle_track_end) finalize first;
+        # finalize is idempotent so this default only fires for direct picks.
+        self._finalize_playback('select')
+
         self.current_index = index
         track = self.current_playlist[index]
-        
+
         playback_path = track.filepath
         
         if track.filepath.lower().endswith('.m4a'):
@@ -4115,6 +4213,7 @@ class MusicPlayerGUI:
             pygame.mixer.music.play()
             self.is_playing = True
             self._playback_state = 'playing'
+            self._start_playback_tracking(track)   # Task 8
             # A track actually started - clear the cycle-wrap loop guard so it
             # only trips when nothing plays between two wraps (Task 5).
             self._last_wrap_mono = 0.0
@@ -4203,6 +4302,8 @@ class MusicPlayerGUI:
             pygame.mixer.music.unpause()
             self.is_playing = True
             self._playback_state = 'playing'
+            if self._pb_tracker:
+                self._pb_tracker.resume(time.monotonic())
     
     def pause(self):
         """Pause playback"""
@@ -4217,12 +4318,15 @@ class MusicPlayerGUI:
         pygame.mixer.music.pause()
         self.is_playing = False
         self._playback_state = 'paused'
+        if self._pb_tracker:
+            self._pb_tracker.pause(time.monotonic())
 
     def stop(self):
         """Stop playback"""
         if not self.audio_available:
             return
 
+        self._finalize_playback('stop')   # Task 8: stop is not a dislike
         pygame.mixer.music.stop()
         self.is_playing = False
         self._playback_state = 'stopped'
@@ -4242,33 +4346,13 @@ class MusicPlayerGUI:
             print("⚠ Navigation disabled during shuffle")
             return
         
-        # V2: Track skip count only if user manually skipped AND track was less than 80% complete
-        if not _internal and self.is_playing and 0 <= self.current_index < len(self.current_playlist):
-            track = self.current_playlist[self.current_index]
-            
-            # Calculate completion percentage
-            should_count_skip = True
-            duration = self._get_safe_duration(track)
-            if duration > 0.01 and self._segment_start_mono is not None:
-                try:
-                    pos = self._seek_base_sec + (time.monotonic() - self._segment_start_mono)
-                    completion_pct = pos / duration
-                    # Only count as skip if less than threshold complete
-                    if completion_pct >= SKIP_COMPLETION_THRESHOLD:
-                        should_count_skip = False
-                        print(f"⏭ Near end, not counting as skip: {track.title} ({completion_pct*100:.0f}% complete)")
-                except Exception:
-                    # If calculation fails, default to counting it as a skip
-                    pass
-            
-            if should_count_skip:
-                try:
-                    track.skips = int(track.skips or 0) + 1
-                except (ValueError, TypeError):
-                    track.skips = 1
-                self._update_track_metadata(track)
-                print(f"⏭ Skipped: {track.title} (skips: {track.skips})")
-        
+        # Task 8: a manual Next is a candidate skip - the audible-time tracker
+        # decides (seeking near the end is not "listening"; a natural end that
+        # auto-advances here with _internal=True is not a skip).  The legacy
+        # `skips` heuristic counter is left frozen.
+        if not _internal:
+            self._finalize_playback('next')
+
         # Smart Shuffle regenerates a fresh order at the cycle boundary instead
         # of replaying the same sequence forever (Task 5).
         smart = getattr(self, '_active_algo', 'Smart Shuffle') == 'Smart Shuffle'
@@ -4308,6 +4392,7 @@ class MusicPlayerGUI:
             print("⚠ Navigation disabled during shuffle")
             return
         
+        self._finalize_playback('previous')   # Task 8: not a dislike
         self.current_index = playlist_queue.previous_position(
             self.current_index, len(self.current_playlist)
         )
@@ -4446,6 +4531,7 @@ class MusicPlayerGUI:
             
             self.is_playing = False
             self._playback_state = 'stopped'  # until the next track starts
+            self._finalize_playback('natural_end')  # Task 8
             self.next_track(_internal=True)  # Allow auto-advance even during shuffle
 
 
