@@ -27,6 +27,7 @@ config.local.json
 CLAUDE.md
 
 docs/
+assets/
 
 # Personal music lists and data
 utlities/albums_needed.txt

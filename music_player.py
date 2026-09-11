@@ -27,6 +27,7 @@ from collections import deque
 from shuffle_core import CustomShuffleAlgorithm
 import playlist_queue
 import appcommand
+from icon_utils import make_icon_images
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
@@ -63,6 +64,7 @@ METADATA_SAVE_DEBOUNCE_SEC = 0.1  # Debounce delay for metadata saves
 HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
+ICON_SIZES = (16, 32, 48, 64, 128, 256)  # Window/taskbar icon sizes to generate
 
 
 class MusicTrack:
@@ -580,7 +582,26 @@ class MusicPlayerGUI:
         except (NameError, AttributeError, OSError):
             self.script_dir = Path.cwd()
             print(f"Using current directory: {self.script_dir}")
-        
+
+        # Window/taskbar icon - default (overridden per-track once artwork loads).
+        # Best-effort: the app must still start if the icon file is missing/corrupt.
+        self._default_icon_photos = None
+        self._track_icon_photos = None
+        try:
+            # PyInstaller onefile builds extract bundled `datas` (assets/app_icon.ico)
+            # to sys._MEIPASS at runtime, NOT next to sys.executable - script_dir is
+            # the exe's own folder (correct for persistent cache/config, wrong here).
+            bundle_dir = Path(getattr(sys, '_MEIPASS', self.script_dir)) if getattr(sys, 'frozen', False) else self.script_dir
+            icon_path = bundle_dir / "assets" / "app_icon.ico"
+            self.root.iconbitmap(default=str(icon_path))
+            default_icon_source = Image.open(io.BytesIO(icon_path.read_bytes()))
+            self._default_icon_photos = [
+                ImageTk.PhotoImage(im) for im in make_icon_images(default_icon_source, sizes=ICON_SIZES)
+            ]
+            self.root.iconphoto(True, *self._default_icon_photos)
+        except Exception as e:
+            print(f"⚠ Could not set app icon: {e}")
+
         # First try: D:\iTunes Shuffler\music_shuffler_cache (next to exe/script)
         cache_dir = self.script_dir / "music_shuffler_cache"
         try:
@@ -2293,6 +2314,13 @@ class MusicPlayerGUI:
                 photo = ImageTk.PhotoImage(image)
                 self.current_artwork = photo
                 self.artwork_label.config(image=photo)
+                try:
+                    self._track_icon_photos = [
+                        ImageTk.PhotoImage(im) for im in make_icon_images(image, sizes=ICON_SIZES)
+                    ]
+                    self.root.iconphoto(True, *self._track_icon_photos)
+                except Exception as e:
+                    print(f"⚠ Could not update taskbar icon: {e}")
                 return True
             else:
                 self._show_placeholder_artwork()
@@ -2318,6 +2346,12 @@ class MusicPlayerGUI:
             photo = ImageTk.PhotoImage(placeholder)
             self.current_artwork = photo
             self.artwork_label.config(image=photo)
+            if self._default_icon_photos:
+                try:
+                    self._track_icon_photos = self._default_icon_photos
+                    self.root.iconphoto(True, *self._default_icon_photos)
+                except Exception as e:
+                    print(f"⚠ Could not reset taskbar icon: {e}")
         except (ValueError, KeyError, AttributeError) as e:
             print(f"⚠ Could not create placeholder: {e}")
             self.artwork_label.config(image='')
