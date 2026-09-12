@@ -4646,6 +4646,21 @@ def main():
         except:
             pass
     
+    # Must be set before any window exists so Windows correlates this running
+    # process with its own taskbar identity/grouping (standard practice for
+    # non-manifest Win32 apps). NOTE: this does NOT make a pinned taskbar
+    # tile's icon track live iconphoto() changes - confirmed that a pinned
+    # tile's primary icon is sourced from System.AppUserModel.RelaunchIconResource
+    # (or the exe's static PE icon as fallback), by Windows Shell design,
+    # regardless of AUMID. Only the titlebar/Alt-Tab/unpinned-taskbar icon
+    # updates live; that's a hard OS limitation, not a bug here.
+    if sys.platform == 'win32':
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("iTunesShuffler.MusicPlayerV2")
+        except Exception as e:
+            print(f"⚠ Could not set AppUserModelID: {e}")
+
     try:
         root = tk.Tk()
         app = MusicPlayerGUI(root)

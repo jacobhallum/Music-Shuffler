@@ -3,7 +3,7 @@ Alternative build script - builds exe WITH console window
 Useful for debugging and seeing error messages
 
 Usage:
-    python build_exe_with_console.py
+    python BUILDBUILDBUILD.py
 """
 
 import os
@@ -38,11 +38,14 @@ def build_exe():
     print("This may take 2-3 minutes...\n")
     
     # PyInstaller command - NO --windowed flag = console stays visible
+    icon_path = Path(__file__).parent / "assets" / "app_icon.ico"
     cmd = [
         "pyinstaller",
         "--name=MusicPlayerV2_Console",    # Output name
         "--onefile",                        # Single exe file
         "--clean",                          # Clean cache
+        f"--icon={icon_path}",              # Exe file icon
+        f"--add-data={icon_path};assets",   # Bundle for the live taskbar-icon fallback (sys._MEIPASS)
         str(script_path)
     ]
     
