@@ -156,12 +156,12 @@ class TestContextForCore(unittest.TestCase):
             os.path.normcase(os.path.normpath('/r2.mp3')),
         ])
 
-    @unittest.expectedFailure
     def test_protected_paths_count_zero_returns_empty(self):
-        # Docstring promises the last 0 starts, i.e. nothing.
+        # The last 0 starts is nothing (entries[-0:] would be the whole list).
         now = 1_000_000.0
         entries = [sh.make_entry('/p.mp3', ts=now - 60)]
         self.assertEqual(sh.protected_paths(entries, now=now, count=0), [])
+        self.assertEqual(sh.protected_paths(entries, now=now, count=-1), [])
 
     def test_protected_paths_includes_entry_exactly_at_cutoff(self):
         now = 1_000_000.0

@@ -97,6 +97,8 @@ def protected_paths(entries, *, now=None, count=3, max_age_h=24):
     """Normalised paths of the last *count* starts still within *max_age_h*."""
     if now is None:
         now = time.time()
+    if count <= 0:
+        return []
     cutoff = now - max_age_h * 3600.0
     out = []
     for e in entries[-count:]:
