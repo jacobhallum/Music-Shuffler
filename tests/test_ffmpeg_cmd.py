@@ -37,7 +37,7 @@ class DecodeArgsTests(unittest.TestCase):
     def test_start_sec_adds_ss_before_input(self):
         args = decode_args('ffmpeg', 'song.mp3', start_sec=1.5)
         self.assertEqual(args[5:7], ['-ss', '1.500'])
-        self.assertEqual(args[8:10], ['-i', 'song.mp3'])
+        self.assertEqual(args[7:9], ['-i', 'song.mp3'])
 
     def test_start_sec_three_decimals(self):
         args = decode_args('ffmpeg', 'song.mp3', start_sec=12.345678)
