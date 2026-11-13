@@ -11,6 +11,7 @@ Results are cached in a JSON file as compact "tenths of a dB" records
 """
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -41,7 +42,7 @@ def _m_value(token):
         m = float(token)
     except ValueError:
         return SILENCE_LUFS
-    if m != m or m <= SILENCE_LUFS:  # nan / -inf / silent / below floor
+    if not math.isfinite(m) or m <= SILENCE_LUFS:  # nan / +-inf / silent / below floor
         return SILENCE_LUFS
     return round(m, 1)
 

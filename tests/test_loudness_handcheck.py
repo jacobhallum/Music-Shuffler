@@ -41,6 +41,11 @@ class LoudnessHandcheck(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_ebur128(FRAME.format(t='0.1', m='-20.0'))
 
+    def test_inf_momentary_is_silence(self):
+        t = parse_ebur128(stderr(['inf', '+inf', '-14.0']))
+        self.assertEqual(t.head, (-70.0, -70.0, -14.0))
+        to_record(t)  # must not raise OverflowError
+
     def test_gain(self):
         cases = [(-19.6, -3.0), (-9.4, -0.5), (-13.6, -1.9), (-75.0, -120.0), (-20.0, -10.0)]
         self.assertEqual([leveling_gain_db(*a) for a in cases], [2.0, -4.6, -0.4, 0.0, 6.0])
