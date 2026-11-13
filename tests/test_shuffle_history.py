@@ -140,6 +140,58 @@ class TestContextForCore(unittest.TestCase):
         entries = [sh.make_entry('/p.mp3', ts=now - 25 * 3600)]
         self.assertEqual(sh.protected_paths(entries, now=now, count=3, max_age_h=24), [])
 
+    def test_protected_paths_empty_entries(self):
+        self.assertEqual(sh.protected_paths([], now=1_000_000.0), [])
+
+    def test_protected_paths_count_larger_than_entries(self):
+        now = 1_000_000.0
+        entries = [
+            sh.make_entry('/expired.mp3', ts=now - 48 * 3600),
+            sh.make_entry('/r1.mp3', ts=now - 3600),
+            sh.make_entry('/r2.mp3', ts=now - 60),
+        ]
+        protected = sh.protected_paths(entries, now=now, count=10, max_age_h=24)
+        self.assertEqual(protected, [
+            os.path.normcase(os.path.normpath('/r1.mp3')),
+            os.path.normcase(os.path.normpath('/r2.mp3')),
+        ])
+
+    @unittest.expectedFailure
+    def test_protected_paths_count_zero_returns_empty(self):
+        # Docstring promises the last 0 starts, i.e. nothing.
+        now = 1_000_000.0
+        entries = [sh.make_entry('/p.mp3', ts=now - 60)]
+        self.assertEqual(sh.protected_paths(entries, now=now, count=0), [])
+
+    def test_protected_paths_includes_entry_exactly_at_cutoff(self):
+        now = 1_000_000.0
+        entries = [sh.make_entry('/edge.mp3', ts=now - 24 * 3600)]
+        protected = sh.protected_paths(entries, now=now, count=3, max_age_h=24)
+        self.assertEqual(protected, [
+            os.path.normcase(os.path.normpath('/edge.mp3')),
+        ])
+
+    def test_protected_paths_non_numeric_ts_is_expired(self):
+        now = 1_000_000.0
+        entry = sh.make_entry('/bad.mp3', ts=now - 60)
+        entry['ts'] = 'abc'
+        self.assertEqual(
+            sh.protected_paths([entry], now=now, count=3, max_age_h=24), [])
+
+    def test_protected_paths_preserves_order_oldest_first(self):
+        now = 1_000_000.0
+        entries = [
+            sh.make_entry('/a.mp3', ts=now - 300),
+            sh.make_entry('/b.mp3', ts=now - 200),
+            sh.make_entry('/c.mp3', ts=now - 100),
+        ]
+        protected = sh.protected_paths(entries, now=now, count=3, max_age_h=24)
+        self.assertEqual(protected, [
+            os.path.normcase(os.path.normpath('/a.mp3')),
+            os.path.normcase(os.path.normpath('/b.mp3')),
+            os.path.normcase(os.path.normpath('/c.mp3')),
+        ])
+
 
 if __name__ == '__main__':
     unittest.main()
