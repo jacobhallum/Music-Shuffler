@@ -4446,11 +4446,10 @@ class MusicPlayerGUI:
         out_l, in_l = self._loudness_for(out_track), self._loudness_for(in_track)
         out_dur = out_l.duration_sec if out_l else float(getattr(out_track, 'duration', 0) or 0)
         in_dur = in_l.duration_sec if in_l else float(getattr(in_track, 'duration', 0) or 0)
-        consecutive = transitions.is_consecutive_album_track(
-            out_track.filepath, getattr(out_track, 'track_number', None),
-            in_track.filepath, getattr(in_track, 'track_number', None))
+        # Every natural end fades in Crossfade and Smart, consecutive album tracks included (decided
+        # 2026-11-13); Off is the gapless mode.
         plan = transitions.plan_transition(s['transition_mode'], s['transition_seconds'], out_dur, in_dur,
-                                           consecutive_album=consecutive, out_loudness=out_l, in_loudness=in_l)
+                                           out_loudness=out_l, in_loudness=in_l)
         item = self._play_item_for(in_track)
         prev = self._next_item
         if prev is not None and prev.key is item.key and prev.path == item.path \

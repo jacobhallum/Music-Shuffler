@@ -12,8 +12,8 @@ A custom music player for large iTunes/M4A libraries with a smart shuffle algori
   into the player; no conversion cache.
   - **Song transitions** (Settings > Sound): Off (gapless), Crossfade, or Smart
     (trims silence and fades where the song tails off), 1–12 s. Only songs that
-    end on their own fade; Next or picking a song switches instantly. Consecutive
-    tracks of an album always play gapless.
+    end on their own fade, album tracks included; Next or picking a song switches
+    instantly. Use Off for gapless albums.
   - **Equalizer** (Settings > Equalizer, or the EQ button): Winamp's 10 bands
     plus preamp, Winamp's built-in presets, your own presets, and `.eqf` import.
   - **Loudness leveling**: each song is measured once (EBU R128) and played at a

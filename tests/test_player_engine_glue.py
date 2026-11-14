@@ -215,6 +215,16 @@ class PrepareNextTests(unittest.TestCase):
         p._prepare_next = lambda **kw: MusicPlayerGUI._prepare_next(p, **kw)
         return p
 
+    def test_album_tracks_fade_like_any_other(self):
+        # Decided 2026-11-13: a fade mode fades every natural end, consecutive album tracks included.
+        p = self._fake(0)
+        p.current_playlist[0].track_number, p.current_playlist[1].track_number = '1', '2'
+        p._prepare_next()
+        item, plan = p._engine.prepared[-1]
+        self.assertIs(item.key, p.current_playlist[1])
+        self.assertEqual((plan.kind, plan.overlap_sec), ('overlap', 6))
+        self.assertEqual(p._next_tr, 'crossfade')
+
     def test_unchanged_next_song_keeps_its_prepared_item(self):
         # The engine matches by identity: a fresh PlayItem would drop its pre-opened stream.
         p = self._fake(0)
