@@ -15,10 +15,10 @@ echo ""
 # --cached: already staged; --others --exclude-standard: untracked but not ignored
 COMMITTABLE=$(git -C "$REPO_ROOT" ls-files --cached --others --exclude-standard 2>/dev/null)
 
-# 1. Check for hardcoded Windows user paths (case-insensitive)
+# 1. Check for hardcoded Windows user paths (case-insensitive; backslash and forward-slash forms)
 echo "[1/4] Scanning for hardcoded user paths..."
 MATCHES=$(echo "$COMMITTABLE" | (grep -E '\.(py|json|sh|txt|md)$' || true) | while read -r f; do
-    grep -ni 'c:\\users\\' "$REPO_ROOT/$f" 2>/dev/null | grep -iv 'YourName' | sed "s|^|$f:|" || true
+    grep -niE 'c:(\\|/)+users(\\|/)' "$REPO_ROOT/$f" 2>/dev/null | grep -iv 'YourName' | sed "s|^|$f:|" || true
 done)
 if [ -n "$MATCHES" ]; then
     echo "$MATCHES"
