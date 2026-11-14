@@ -86,6 +86,19 @@ class EngineEventGlueTests(unittest.TestCase):
         p._on_engine_event('finished', item=p._engine_item, reason='failure', continued=False)
         self.assertEqual(p.calls, [('finalize', 'failure'), ('next', True)])
 
+    def test_failure_resumes_the_loudness_scan(self):
+        # play_track_at_index paused the scan; a song that never starts must not leave it paused.
+        p = _FakePlayer()
+        resumed = []
+
+        class Svc:
+            def resume_background(self):
+                resumed.append(1)
+
+        p._loudness = Svc()
+        p._on_engine_event('finished', item=p._engine_item, reason='failure', continued=False)
+        self.assertEqual(resumed, [1])
+
     def test_cut_finish_does_nothing(self):
         p = _FakePlayer()
         p._on_engine_event('finished', item=p._engine_item, reason='cut', continued=False)
@@ -123,6 +136,22 @@ class _TransitionFake(_FakePlayer):
 
 
 class TransitionGlueTests(unittest.TestCase):
+    def test_start_of_a_superseded_prepared_item_still_transitions(self):
+        # A re-prepare can land between the engine starting the song and the main thread handling it.
+        p = _TransitionFake()
+        started = p._next_item
+        p._next_item = PlayItem(key=started.key, path=started.path, duration_sec=200.0)
+        p._on_engine_event('started', item=started, how='overlap')
+        self.assertEqual(p.current_index, 1)
+        self.assertIs(p._engine_item, started)
+        self.assertIn(('bookkeeping', '/m/t1.mp3'), p.calls)
+
+    def test_failed_song_that_continued_is_a_failure(self):
+        # The decoder failed mid-song and the engine went straight on to the prepared one.
+        p = _TransitionFake()
+        p._on_engine_event('finished', item=p._engine_item, reason='failure', continued=True)
+        self.assertEqual(p.calls, [('finalize', 'failure', 'cut', 'T0')])
+
     def test_transition_start_makes_incoming_current(self):
         p = _TransitionFake()
         inc = p._next_item
@@ -185,6 +214,13 @@ class PrepareNextTests(unittest.TestCase):
         p._play_item_for = lambda track: MusicPlayerGUI._play_item_for(p, track)
         p._prepare_next = lambda **kw: MusicPlayerGUI._prepare_next(p, **kw)
         return p
+
+    def test_unchanged_next_song_keeps_its_prepared_item(self):
+        # The engine matches by identity: a fresh PlayItem would drop its pre-opened stream.
+        p = self._fake(0)
+        p._prepare_next()
+        p._prepare_next()
+        self.assertIs(p._engine.prepared[0][0], p._engine.prepared[1][0])
 
     def test_missing_loudness_is_analysed_once_per_prepare(self):
         # An unreadable next song never gets loudness: re-preparing must not re-analyse it forever.
@@ -315,6 +351,36 @@ class SoundSettingsGlueTests(unittest.TestCase):
             p.root.run_all()
             self.assertEqual((p.prepared, p._engine.refilters), (1, 0))
 
+    def test_windows_change_only_their_own_settings(self):
+        # Sound and Equalizer both open: each emits its whole snapshot from when it opened.
+        import tempfile
+        import music_player
+        with tempfile.TemporaryDirectory() as d:
+            p = self._fake(d)
+            stale = dict(p.audio_settings)
+            s = dict(stale)
+            s['leveling_enabled'] = True
+            p._apply_sound_settings(s, getattr(music_player, 'SOUND_DIALOG_KEYS', None))
+            e = dict(stale)
+            e['eq_enabled'], e['eq_bands_db'] = True, [4.0] + [0.0] * 9
+            p._apply_sound_settings(e, getattr(music_player, 'EQ_WINDOW_KEYS', None))
+            p.root.run_all()
+            self.assertTrue(p.audio_settings['leveling_enabled'])
+            self.assertEqual(p.audio_settings['eq_bands_db'][0], 4.0)
+
+    def test_close_saves_a_change_still_in_its_debounce(self):
+        import tempfile
+        import audio_settings
+        with tempfile.TemporaryDirectory() as d:
+            p = self._fake(d)
+            p._flush_sound_settings = getattr(MusicPlayerGUI, '_flush_sound_settings').__get__(p)
+            s = dict(p.audio_settings)
+            s['transition_mode'] = 'smart'
+            p._apply_sound_settings(s)
+            p._flush_sound_settings()
+            self.assertIsNone(p._sound_apply_job)
+            self.assertEqual(audio_settings.load(p.audio_settings_file)['transition_mode'], 'smart')
+
     def test_import_eqf_adds_user_presets(self):
         import tempfile
         from eq import build_eqf
@@ -439,6 +505,34 @@ class MainThreadPostingTests(unittest.TestCase):
         done = []
         p._analyze_then([_Track('/m/a.mp3')], lambda: done.append(1))
         self.assertTrue(_drain_until(p, lambda: done == [1]))
+
+
+class FfmpegPathTests(unittest.TestCase):
+    def test_loudness_uses_the_current_ffmpeg_and_retries_after_it_changes(self):
+        # FFmpeg set via Settings after startup: analysis must use it, and earlier failures get another go.
+        from unittest import mock
+        import music_player
+
+        class P:
+            _analyze_loudness = getattr(MusicPlayerGUI, '_analyze_loudness', None)
+            _ffmpeg_path_changed = getattr(MusicPlayerGUI, '_ffmpeg_path_changed', None)
+
+        p = P()
+        forgot, scans = [], []
+
+        class Svc:
+            def forget_failures(self):
+                forgot.append(1)
+
+        p._loudness = Svc()
+        p._start_loudness_scan = lambda: scans.append(1)
+        p.ffmpeg_path = None
+        with mock.patch.object(music_player, 'analyze_file', lambda ff, path, **kw: (ff, path)):
+            self.assertEqual(p._analyze_loudness('/m/a.mp3'), ('ffmpeg', '/m/a.mp3'))
+            p.ffmpeg_path = 'C:/tools/ffmpeg.exe'
+            self.assertEqual(p._analyze_loudness('/m/a.mp3')[0], 'C:/tools/ffmpeg.exe')
+        p._ffmpeg_path_changed()
+        self.assertEqual((forgot, scans), ([1], [1]))
 
 
 class _Label:

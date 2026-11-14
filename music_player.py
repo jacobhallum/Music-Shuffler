@@ -31,7 +31,7 @@ import audio_settings
 import listening_log
 import transitions
 from audio_engine import AudioEngine, PlayItem
-from audio_backend import FfmpegDecoder, PygameChannel
+from audio_backend import FfmpegDecoder, PygameChannel, analyze_file
 from eq import BUILTIN_PRESETS, filter_chain, parse_eqf
 from sound_ui import EqualizerWindow, SoundDialog
 from loudness import leveling_gain_db
@@ -73,6 +73,10 @@ METADATA_SAVE_DEBOUNCE_SEC = 0.1  # Debounce delay for metadata saves
 HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
 MAIN_CALLS_POLL_MS = 20  # How often the main thread runs callbacks posted by worker threads
+# The settings each window edits. Each emits its whole snapshot from when it opened, so only these
+# keys are taken from it; the rest may be stale if the other window changed them meanwhile.
+SOUND_DIALOG_KEYS = ('transition_mode', 'transition_seconds', 'leveling_enabled')
+EQ_WINDOW_KEYS = ('eq_enabled', 'eq_preset', 'eq_bands_db', 'eq_preamp_db')
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
 ICON_SIZES = (16, 32, 48, 64, 128, 256)  # Window/taskbar icon sizes to generate
 
@@ -772,7 +776,8 @@ class MusicPlayerGUI:
         self._set_dark_title_bar()
         self.check_ffmpeg()
         # Loudness analysis (leveling + smart transitions); its cache loads off the main thread.
-        self._loudness = LoudnessService(self.ffmpeg_path or "ffmpeg", str(self.loudness_cache_file)) \
+        self._loudness = LoudnessService(self.ffmpeg_path or "ffmpeg", str(self.loudness_cache_file),
+                                         analyze=self._analyze_loudness) \
             if self._engine is not None else None
         self._drain_main_calls()
         self._start_engine_loop()
@@ -2490,6 +2495,11 @@ class MusicPlayerGUI:
             print(f"⚠ Error saving listening history on close: {e}")
 
         try:
+            self._flush_sound_settings()
+        except Exception as e:
+            print(f"⚠ Error saving sound settings on close: {e}")
+
+        try:
             self._shutdown_engine()
         except Exception as e:
             print(f"⚠ Error stopping the sound engine: {e}")
@@ -3135,9 +3145,9 @@ class MusicPlayerGUI:
             "A standalone music player with advanced shuffle algorithms\n\n"
             "Features:\n"
             "• Smart shuffle algorithms\n"
-            "• .m4a support via FFmpeg\n"
+            "• Every format (M4A, MP3, FLAC) played through FFmpeg\n"
+            "• Song transitions, equalizer and loudness leveling\n"
             "• Metadata reading and display\n"
-            "• On-demand file conversion\n"
             "• Keyboard shortcuts (media keys)\n\n"
             "Cache location:\n"
             f"{self.cache_file.parent}"
@@ -3451,7 +3461,8 @@ class MusicPlayerGUI:
                                            encoding='utf-8', errors='ignore', timeout=2)
                     if result.returncode == 0 and "ffmpeg" in result.stdout.lower():
                         self.ffmpeg_path = filepath
-                        messagebox.showinfo("Success", f"FFmpeg path set to:\n{filepath}\n\n.m4a files will now convert on-demand when played.")
+                        self._ffmpeg_path_changed()
+                        messagebox.showinfo("Success", f"FFmpeg path set to:\n{filepath}\n\nSongs play through it right away.")
                     else:
                         messagebox.showerror("Error", "This doesn't appear to be a valid FFmpeg executable.")
                 except Exception as e:
@@ -3462,7 +3473,8 @@ class MusicPlayerGUI:
                                        encoding='utf-8', errors='ignore', timeout=2)
                 if result.returncode == 0:
                     self.ffmpeg_path = "ffmpeg"
-                    messagebox.showinfo("Success", ".m4a files will now convert on-demand when played.")
+                    self._ffmpeg_path_changed()
+                    messagebox.showinfo("Success", "Using ffmpeg from PATH. Songs play through it right away.")
                 else:
                     messagebox.showerror("Error", "'ffmpeg' command doesn't work. Try browsing for ffmpeg.exe instead.")
             except:
@@ -4053,6 +4065,8 @@ class MusicPlayerGUI:
             # FFmpeg could not start at all: stop instead of racing through the playlist.
             print(f"⚠ Could not start FFmpeg: {e}")
             self._engine_item = None
+            if getattr(self, '_loudness', None) is not None:
+                self._loudness.resume_background()
             self.is_playing = False
             self._playback_state = 'stopped'
             self.status_label.config(text="⚠ FFmpeg could not start - Settings > Set FFmpeg Path")
@@ -4107,6 +4121,17 @@ class MusicPlayerGUI:
     def _open_decoder(self, path, start_sec, filters):
         return FfmpegDecoder(self.ffmpeg_path or "ffmpeg", path, start_sec, filters)
 
+    def _analyze_loudness(self, path):
+        """LoudnessService analyzer: always the FFmpeg currently set (it can be set after startup)."""
+        return analyze_file(self.ffmpeg_path or "ffmpeg", path, low_priority=True)
+
+    def _ffmpeg_path_changed(self):
+        """Settings > Set FFmpeg Path succeeded: songs that failed to measure without it get another go."""
+        svc = getattr(self, '_loudness', None)
+        if svc is not None:
+            svc.forget_failures()
+            self._start_loudness_scan()
+
     def _filters_for(self, track):
         s = self.audio_settings
         gain = 0.0
@@ -4139,8 +4164,16 @@ class MusicPlayerGUI:
 
         threading.Thread(target=work, daemon=True, name='loudness-now').start()
 
-    def _apply_sound_settings(self, new):
-        """Sound/Equalizer window callback: validate now, save and apply after a short debounce."""
+    def _apply_sound_settings(self, new, keys=None):
+        """Sound/Equalizer window callback: validate now, save and apply after a short debounce.
+
+        keys: the settings the calling window owns (SOUND_DIALOG_KEYS / EQ_WINDOW_KEYS); only those are
+        taken from `new`. None takes all of `new` (callers that built it from the current settings).
+        """
+        if keys is not None:
+            merged = dict(self.audio_settings)
+            merged.update({k: new[k] for k in keys if k in new})
+            new = merged
         if self._sound_apply_job is None:
             self._sound_before = self.audio_settings
         else:
@@ -4168,6 +4201,20 @@ class MusicPlayerGUI:
         if (s['leveling_enabled'] and not before['leveling_enabled']) or \
                 (s['transition_mode'] == 'smart' and before['transition_mode'] != 'smart'):
             self._start_loudness_scan()
+
+    def _flush_sound_settings(self):
+        """On close: save a Sound/Equalizer change that is still inside its 150 ms debounce."""
+        if self._sound_apply_job is None:
+            return
+        try:
+            self.root.after_cancel(self._sound_apply_job)
+        except Exception:
+            pass
+        self._sound_apply_job = None
+        try:
+            audio_settings.save(str(self.audio_settings_file), self.audio_settings)
+        except OSError as e:
+            print(f"⚠ Could not save sound settings: {e}")
 
     def _eq_presets(self):
         presets = dict(BUILTIN_PRESETS)
@@ -4229,7 +4276,8 @@ class MusicPlayerGUI:
         if self._sound_dialog is not None and self._sound_dialog.winfo_exists():
             self._sound_dialog.lift()
             return
-        self._sound_dialog = SoundDialog(self.root, self.audio_settings, self._apply_sound_settings,
+        self._sound_dialog = SoundDialog(self.root, self.audio_settings,
+                                         lambda s: self._apply_sound_settings(s, SOUND_DIALOG_KEYS),
                                          self._loudness_status_text)
 
     def open_equalizer(self):
@@ -4237,7 +4285,8 @@ class MusicPlayerGUI:
             self._eq_window.lift()
             return
         self._eq_window = EqualizerWindow(self.root, self.audio_settings, self._eq_presets(),
-                                          self._apply_sound_settings, self._save_eq_preset, self._import_eqf)
+                                          lambda s: self._apply_sound_settings(s, EQ_WINDOW_KEYS),
+                                          self._save_eq_preset, self._import_eqf)
 
     def _start_loudness_scan(self):
         """Measure the whole library in the background once leveling or smart transitions need it."""
@@ -4296,7 +4345,8 @@ class MusicPlayerGUI:
                 if item is self._engine_item:
                     self._begin_track_bookkeeping(item.key)
                     self._prepare_next()
-            elif item is self._next_item:
+            elif self._next_item is not None and (item is self._next_item or item.key is self._next_item.key):
+                # identity, or the same song re-prepared after the engine had already started it
                 self._on_transition_started(item, how)
             return
         if name != 'finished':
@@ -4308,10 +4358,15 @@ class MusicPlayerGUI:
         if item is not self._engine_item or reason == 'cut':
             return  # stale, or a manual action already finalized it
         if data.get('continued'):
-            # gapless: the prepared song starts right now on the same channel
-            self._finalize_playback('natural_end', self._next_tr)
+            # the prepared song starts right now on the same channel (gapless, or after a decode failure)
+            if reason == 'failure':
+                self._finalize_playback('failure')
+            else:
+                self._finalize_playback('natural_end', self._next_tr)
             return
         if reason == 'failure':
+            if getattr(self, '_loudness', None) is not None:
+                self._loudness.resume_background()   # paused for a start that never came
             self.is_playing = False
             self._playback_state = 'stopped'
             self._finalize_playback('failure')
@@ -4397,6 +4452,10 @@ class MusicPlayerGUI:
         plan = transitions.plan_transition(s['transition_mode'], s['transition_seconds'], out_dur, in_dur,
                                            consecutive_album=consecutive, out_loudness=out_l, in_loudness=in_l)
         item = self._play_item_for(in_track)
+        prev = self._next_item
+        if prev is not None and prev.key is item.key and prev.path == item.path \
+                and prev.filters == item.filters and prev.duration_sec == item.duration_sec:
+            item = prev   # same song, same sound: the engine keeps its pre-opened stream
         self._next_item = item
         if plan.kind == 'gapless':
             self._next_tr = 'gapless'
