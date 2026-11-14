@@ -28,13 +28,14 @@ from shuffle_core import CustomShuffleAlgorithm
 import playlist_queue
 import appcommand
 import audio_settings
+import library_index
 import listening_log
 import transitions
 from audio_engine import AudioEngine, PlayItem
 from audio_backend import FfmpegDecoder, PygameChannel, analyze_file
 from eq import BUILTIN_PRESETS, filter_chain, parse_eqf
 from sound_ui import EqualizerWindow, SoundDialog
-from loudness import leveling_gain_db
+from loudness import album_gain_db, leveling_gain_db
 from loudness_service import LoudnessService
 from icon_utils import make_icon_images
 from mutagen import File as MutagenFile
@@ -74,6 +75,8 @@ VOLUME_SYNC_INTERVAL_SEC = 2.0  # How often to sync volume slider with system
 METADATA_SAVE_DEBOUNCE_SEC = 0.1  # Debounce delay for metadata saves
 HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
+ALBUMS_SEARCH_OPEN_CAP = 50   # Albums search: at most this many albums open with their matching songs
+TYPE_JUMP_RESET_MS = 800      # Albums tab type-to-jump: typing pause that starts a new prefix
 MAIN_CALLS_POLL_MS = 20  # How often the main thread runs callbacks posted by worker threads
 # The settings each window edits. Each emits its whole snapshot from when it opened, so only these
 # keys are taken from it; the rest may be stale if the other window changed them meanwhile.
@@ -608,6 +611,8 @@ class MusicPlayerGUI:
         self.current_index = 0
         self.queued_count = 0          # Manually-queued tracks right after current_index
         self.is_temp_view = False      # True when current_playlist is a taken-over search view
+        self.library_index = None      # Artists/albums of library_tracks (library_index.py)
+        self._play_context = None      # ('album'|'artist', key) while that list plays in order
 
         # Recent play history for the shuffle history guard.  The persisted
         # source of truth is self._history_entries (list of shuffle_history
@@ -1073,12 +1078,14 @@ class MusicPlayerGUI:
         self.transport_frame.place_forget()
         self._transport_hide_job = None
         
-        # Playlist display
-        playlist_frame = ttk.LabelFrame(main_frame, text="Playlist", padding="5")
-        playlist_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 10))
+        # Playlist and Albums tabs
+        self.playlist_notebook = ttk.Notebook(main_frame)
+        self.playlist_notebook.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(5, 10))
+        main_frame.rowconfigure(1, weight=1)
+        playlist_frame = ttk.Frame(self.playlist_notebook, padding="5")
         playlist_frame.columnconfigure(0, weight=1)
         playlist_frame.rowconfigure(1, weight=1)  # Treeview is on row 1
-        main_frame.rowconfigure(1, weight=1)
+        self.playlist_notebook.add(playlist_frame, text="Playlist")
         
         columns = ('Artist', 'Title', 'Album', 'Duration')
         self.playlist_tree = ttk.Treeview(playlist_frame, columns=columns, 
@@ -1109,10 +1116,22 @@ class MusicPlayerGUI:
         self.playlist_menu = tk.Menu(self.root, tearoff=0)
         self.playlist_menu.add_command(label="Play Next", command=self._ctx_play_next)
         self.playlist_menu.add_command(label="Add to Up Next", command=self._ctx_add_up_next)
-        
+        self.playlist_menu.add_separator()
+        self.playlist_menu.add_command(label="Play album from start",
+                                       command=lambda: self._ctx_album_action('album'))
+        self.playlist_menu.add_command(label="Play artist", command=lambda: self._ctx_album_action('artist'))
+        self.playlist_menu.add_command(label="Add album to Up Next",
+                                       command=lambda: self._ctx_album_action('queue'))
+
         # Right-click support (Windows and Mac)
         self.playlist_tree.bind("<Button-3>", self._on_playlist_right_click)  # Windows/Linux
         self.playlist_tree.bind("<Control-Button-1>", self._on_playlist_right_click)  # Mac
+
+        self.albums_tab = ttk.Frame(self.playlist_notebook, padding="5")
+        self.playlist_notebook.add(self.albums_tab, text="Albums")
+        self._setup_albums_tab(self.albums_tab)
+        # The one search box filters whichever tab is showing.
+        self.playlist_notebook.bind('<<NotebookTabChanged>>', lambda e: self._run_filter())
         
         # Status bar
         self.status_label = ttk.Label(main_frame, text="Ready", 
@@ -1159,7 +1178,14 @@ class MusicPlayerGUI:
                        background=theme['button_bg'],
                        foreground=theme['fg'])
         style.map('Treeview', background=[('selected', theme['button_bg'])])
-        
+
+        style.configure('TNotebook', background=theme['bg'], borderwidth=0)
+        style.configure('TNotebook.Tab', background=theme['button_bg'], foreground=theme['fg'],
+                        padding=(12, 3))
+        style.map('TNotebook.Tab',
+                  background=[('selected', theme['frame_bg']), ('active', theme['frame_bg'])],
+                  foreground=[('selected', theme['fg'])])
+
         style.configure('TProgressbar',
                        background=theme['fg'],
                        troughcolor=theme['frame_bg'],
@@ -2833,6 +2859,7 @@ class MusicPlayerGUI:
 
             self.library_tracks = unique_tracks          # Task 1: full source-of-truth
             self.all_tracks = list(self.library_tracks)  # active working subset
+            self._rebuild_library_index()
             
             self.save_cache(current_files)
             
@@ -3723,6 +3750,7 @@ class MusicPlayerGUI:
         self.current_playlist, self.current_index, self.queued_count = \
             playlist_queue.reshuffle_compose(active_track, queued_block, tail)
         self.is_temp_view = False
+        self._play_context = None
 
         # Clear search filter to show full shuffled playlist
         self.filtered_playlist = []
@@ -3749,6 +3777,7 @@ class MusicPlayerGUI:
             playlist_queue.reshuffle_compose(active_track, queued_block, playlist)
 
         self.is_temp_view = False
+        self._play_context = None
         self.filtered_playlist = []  # Clear search filter
         self.search_var.set('')  # Clear search box
         self.display_playlist()
@@ -3802,16 +3831,161 @@ class MusicPlayerGUI:
                 self.queued_count = 0
                 self.play_track_at_index(display_index)
 
-    def _takeover_playlist(self, tracks, start_index):
-        """Make the given (displayed) track order the main playlist and play
-        from start_index. Used when a search/filtered view is clicked."""
-        self.current_playlist = list(tracks)
+    def _takeover_playlist(self, tracks, start_index, context=None):
+        """Make the given track order the main playlist and play from start_index.
+
+        A search/filtered view (context None) drops Up Next, like it always has. An album or artist
+        pick (context ('album'|'artist', key)) keeps the songs in Up Next and plays them after its own
+        songs, keeps the search text while the Albums tab shows, and measures the context's songs for
+        album leveling. Either way the list ends in a fresh shuffle (is_temp_view).
+        """
+        new_list = list(tracks)
+        if context is not None:
+            have = {self._norm_path(t.filepath) for t in new_list}
+            new_list += [t for t in self._get_queued_tracks() if self._norm_path(t.filepath) not in have]
+        self.current_playlist = new_list
         self.filtered_playlist = []
-        self.search_var.set('')
+        if context is None or not self._albums_tab_showing():
+            self.search_var.set('')
         self.queued_count = 0
         self.is_temp_view = True
+        self._play_context = context
         self.display_playlist()
         self.play_track_at_index(start_index)
+        if context is not None:
+            self._measure_context()
+
+    # ---- Albums: in-order album/artist plays and album leveling -----------
+
+    def _rebuild_library_index(self):
+        t0 = time.perf_counter()
+        try:
+            self.library_index = library_index.build_index(self.library_tracks, roots=self.music_dirs)
+        except Exception as e:
+            print(f"⚠ Album index failed: {e}")
+            self.library_index = None
+            return
+        print(f"✓ Album index: {len(self.library_index.artists)} artists "
+              f"in {(time.perf_counter() - t0) * 1000:.0f} ms")
+        refresh = getattr(self, '_refresh_albums_tree', None)
+        if refresh is not None:
+            refresh()
+
+    def _albums_tab_showing(self):
+        nb = getattr(self, 'playlist_notebook', None)
+        try:
+            return nb is not None and nb.select() == str(self.albums_tab)
+        except (RuntimeError, tk.TclError):
+            return False
+
+    def play_album(self, album_key, start_track=None):
+        """Play an album in track order, from its first song or from start_track."""
+        idx = self.library_index
+        tracks = idx.album_tracks(album_key) if idx is not None else []
+        if not tracks:
+            return
+        start = 0
+        if start_track is not None:
+            want = self._norm_path(start_track.filepath)
+            start = next((i for i, t in enumerate(tracks) if self._norm_path(t.filepath) == want), 0)
+        self._takeover_playlist(tracks, start, context=('album', album_key))
+
+    def play_artist(self, artist_key):
+        """Play all of an artist's albums, oldest first, each in track order."""
+        idx = self.library_index
+        tracks = idx.artist_tracks(artist_key) if idx is not None else []
+        if tracks:
+            self._takeover_playlist(tracks, 0, context=('artist', artist_key))
+
+    def queue_album(self, album_key):
+        """Add an album's songs, in order, to the end of Up Next (the playing song is skipped)."""
+        idx = self.library_index
+        tracks = idx.album_tracks(album_key) if idx is not None else []
+        if not tracks:
+            return
+        playing = None
+        if 0 <= self.current_index < len(self.current_playlist):
+            playing = self._norm_path(self.current_playlist[self.current_index].filepath)
+        added = 0
+        for t in tracks:
+            if self._norm_path(t.filepath) == playing:
+                continue
+            self.queue_track(t, play_next=False, refresh=False)
+            added += 1
+        self.display_playlist()
+        self.status_label.config(text=f"Added {added} songs to Up Next")
+
+    def _context_albums(self, context):
+        idx = self.library_index
+        if idx is None or context is None:
+            return []
+        kind, key = context
+        if kind == 'album':
+            album = idx.album(key)
+            return [album] if album is not None else []
+        artist = idx.artist(key)
+        return list(artist.albums) if artist is not None else []
+
+    def _measure_context(self, albums=None):
+        """Measure the play context's unmeasured songs, album by album in play order, ahead of the
+        background scan. After each album the next song is prepared again so it can pick up album gain."""
+        context = self._play_context
+        svc = getattr(self, '_loudness', None)
+        if context is None or svc is None or not self.audio_settings['leveling_enabled']:
+            return
+        if albums is None:
+            albums = self._context_albums(context)
+        for i, album in enumerate(albums):
+            missing = [t for t in album.tracks
+                       if svc.get(t.filepath) is None and not svc.known_bad(t.filepath)]
+            if missing:
+                rest = albums[i + 1:]
+
+                def done():
+                    if self._play_context == context:
+                        self._prepare_next()
+                        self._measure_context(rest)
+
+                self._analyze_then(missing, done)
+                return
+
+    def _context_album_for(self, track):
+        """track's Album when it belongs to the play context (Up Next strangers don't), else None."""
+        context = getattr(self, '_play_context', None)
+        idx = getattr(self, 'library_index', None)
+        if context is None or idx is None:
+            return None
+        album = idx.album_of(track)
+        if album is None:
+            return None
+        kind, key = context
+        if (kind == 'album' and album.key == key) or (kind == 'artist' and album.artist_key == key):
+            return album
+        return None
+
+    def _context_kind_for(self, track):
+        """'album'/'artist' for the listening log when track plays as part of the context, else None."""
+        if self._context_album_for(track) is None:
+            return None
+        return self._play_context[0]
+
+    def _album_gain_for(self, track):
+        """Album leveling gain for a song of the play context, or None (song gain applies).
+
+        None until every song of the album is measured; songs that can't be measured are left out."""
+        album = self._context_album_for(track)
+        svc = getattr(self, '_loudness', None)
+        if album is None or svc is None:
+            return None
+        louds = []
+        for t in album.tracks:
+            loud = svc.get(t.filepath)
+            if loud is None:
+                if svc.known_bad(t.filepath):
+                    continue
+                return None
+            louds.append(loud)
+        return album_gain_db(louds)
     
     def _schedule_filter(self):
         """Schedule a debounced search filter update"""
@@ -3823,9 +3997,12 @@ class MusicPlayerGUI:
         self._search_job = self.root.after(SEARCH_DEBOUNCE_MS, self._run_filter)
     
     def _run_filter(self):
-        """Execute the search filter (called after debounce delay)"""
+        """Execute the search filter (called after debounce delay) on whichever tab is showing"""
         self._search_job = None
-        self.filter_playlist()
+        if self._albums_tab_showing():
+            self._filter_albums()
+        else:
+            self.filter_playlist()
     
     def filter_playlist(self):
         """Filter playlist based on search query - searches active playlist/view"""
@@ -3861,6 +4038,13 @@ class MusicPlayerGUI:
     
     def _play_first_result(self):
         """Play first search result when Enter is pressed - takes over the playlist"""
+        if self._albums_tab_showing():
+            q = self.search_var.get().strip()
+            hits = self.library_index.search(q) if (q and self.library_index is not None) else []
+            if hits:
+                hit = hits[0]
+                self.play_album(hit.album.key, start_track=None if hit.whole_album else hit.tracks[0])
+            return
         if not self.filtered_playlist:
             return
 
@@ -3874,6 +4058,11 @@ class MusicPlayerGUI:
             row_id = self.playlist_tree.identify_row(event.y)
             if row_id:
                 self.playlist_tree.selection_set(row_id)
+                track = self._get_selected_track()
+                has_album = (track is not None and self.library_index is not None
+                             and self.library_index.album_of(track) is not None)
+                for label in ("Play album from start", "Play artist", "Add album to Up Next"):
+                    self.playlist_menu.entryconfigure(label, state=tk.NORMAL if has_album else tk.DISABLED)
                 self.playlist_menu.tk_popup(event.x_root, event.y_root)
         finally:
             try:
@@ -3911,9 +4100,243 @@ class MusicPlayerGUI:
         track = self._get_selected_track()
         if track:
             self.queue_track(track, play_next=False)
+
+    def _ctx_album_action(self, action):
+        """Playlist context menu: album/artist actions for the selected song."""
+        track = self._get_selected_track()
+        album = self.library_index.album_of(track) if (track and self.library_index is not None) else None
+        if album is not None:
+            self._album_action(album, action)
+
+    def _album_action(self, album, action):
+        if action == 'album':
+            self.play_album(album.key)
+        elif action == 'artist':
+            self.play_artist(album.artist_key)
+        elif action == 'queue':
+            self.queue_album(album.key)
+
+    # ---- Albums tab ------------------------------------------------------
+
+    def _setup_albums_tab(self, frame):
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        tree = ttk.Treeview(frame, columns=('Info',), show='tree headings', height=5, selectmode='browse')
+        tree.heading('#0', text='Artist / Album / Song')
+        tree.heading('Info', text='Info')
+        tree.column('#0', width=380)
+        tree.column('Info', width=130, stretch=False, anchor=tk.E)
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+        tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.albums_tree = tree
+        self._albums_rows = {}         # iid -> ('artist', key) | ('album', key) | ('song', album_key, track)
+        self._albums_artist_iids = {}  # artist key -> iid
+        self._albums_pending = {}      # album iid -> album key, songs not inserted yet
+        self._albums_query = None      # search text the tree shows (None: rebuild on next filter)
+        self._type_jump = ''
+        self._type_jump_job = None
+        self.albums_menu = tk.Menu(self.root, tearoff=0)
+        tree.bind('<<TreeviewOpen>>', self._on_album_open)
+        tree.bind('<Double-1>', self._on_albums_double_click)
+        tree.bind('<Return>', lambda e: self._play_albums_row(self.albums_tree.focus()) or 'break')
+        tree.bind('<Button-3>', self._on_albums_right_click)
+        tree.bind('<Control-Button-1>', self._on_albums_right_click)
+        tree.bind('<Key>', self._on_albums_key)
+        self._refresh_albums_tree()
+
+    def _refresh_albums_tree(self):
+        """The library index changed: rebuild the tree, keeping the Albums search."""
+        if not hasattr(self, 'albums_tree'):
+            return
+        self._albums_query = None
+        if self._albums_tab_showing():
+            self._filter_albums()
+        else:
+            self._fill_albums_tree(None)
+            self._albums_query = ''
+
+    def _filter_albums(self):
+        q = self.search_var.get().strip()
+        if q == self._albums_query:
+            return
+        self._albums_query = q
+        idx = self.library_index
+        if not q or idx is None:
+            self._fill_albums_tree(None)
+            if idx is not None:
+                self.status_label.config(text=f"{len(idx.artists)} artists")
+            return
+        hits = idx.search(q)
+        self._fill_albums_tree(hits)
+        songs = sum(len(h.tracks) for h in hits if not h.whole_album)
+        self.status_label.config(text=f"{len(hits)} albums match" + (f" ({songs} songs)" if songs else ""))
+
+    def _fill_albums_tree(self, hits):
+        """hits None: every artist, folded. Else the search hits: their artists open, albums with song-level
+        matches open showing those songs (the first ALBUMS_SEARCH_OPEN_CAP), other albums folded."""
+        tree = self.albums_tree
+        tree.delete(*tree.get_children())
+        self._albums_rows.clear()
+        self._albums_artist_iids.clear()
+        self._albums_pending.clear()
+        idx = self.library_index
+        if idx is None:
+            return
+        if hits is None:
+            for artist in idx.artists:
+                a_iid = self._insert_artist_row(artist, open_=False)
+                for album in artist.albums:
+                    self._insert_album_row(a_iid, album)
+            return
+        opened = 0
+        for hit in hits:
+            artist = idx.artist(hit.album.artist_key)
+            if artist is None:
+                continue
+            a_iid = self._albums_artist_iids.get(artist.key) or self._insert_artist_row(artist, open_=True)
+            if not hit.whole_album and opened < ALBUMS_SEARCH_OPEN_CAP:
+                self._insert_album_row(a_iid, hit.album, songs=hit.tracks)
+                opened += 1
+            else:
+                self._insert_album_row(a_iid, hit.album)
+
+    def _insert_artist_row(self, artist, open_):
+        n = len(artist.albums)
+        iid = self.albums_tree.insert('', 'end', text=artist.name, open=open_,
+                                      values=(f"{n} album{'s' if n != 1 else ''}",))
+        self._albums_rows[iid] = ('artist', artist.key)
+        self._albums_artist_iids[artist.key] = iid
+        return iid
+
+    def _insert_album_row(self, parent, album, songs=None):
+        """songs None: fold the album and load its songs when it is first opened."""
+        n = len(album.tracks)
+        info = f"{n} song{'s' if n != 1 else ''}"
+        if album.year:
+            info = f"{album.year} · {info}"
+        iid = self.albums_tree.insert(parent, 'end', text=album.name, values=(info,), open=songs is not None)
+        self._albums_rows[iid] = ('album', album.key)
+        if songs is None:
+            self.albums_tree.insert(iid, 'end', text='…')   # placeholder so the row can fold open
+            self._albums_pending[iid] = album.key
+        else:
+            self._insert_song_rows(iid, album, songs)
+        return iid
+
+    def _insert_song_rows(self, parent, album, songs):
+        for t in songs:
+            key = library_index.song_sort_key(t)
+            num = '' if key[0] else (f"{key[1]}-{key[2]:02}" if key[1] > 1 else str(key[2]))
+            dur = t.format_duration() if hasattr(t, 'format_duration') else ''
+            iid = self.albums_tree.insert(parent, 'end', text=f"{num:>4}   {t.title}", values=(dur,))
+            self._albums_rows[iid] = ('song', album.key, t)
+
+    def _on_album_open(self, event):
+        iid = self.albums_tree.focus()
+        album_key = self._albums_pending.pop(iid, None)
+        if album_key is None or self.library_index is None:
+            return
+        album = self.library_index.album(album_key)
+        self.albums_tree.delete(*self.albums_tree.get_children(iid))
+        if album is not None:
+            self._insert_song_rows(iid, album, album.tracks)
+
+    def _play_albums_row(self, iid):
+        row = self._albums_rows.get(iid) if iid else None
+        if row is None:
+            return
+        if row[0] == 'artist':
+            self.play_artist(row[1])
+        elif row[0] == 'album':
+            self.play_album(row[1])
+        else:
+            self.play_album(row[1], start_track=row[2])
+
+    def _on_albums_double_click(self, event):
+        iid = self.albums_tree.identify_row(event.y)
+        if not iid or self.albums_tree.identify_element(event.x, event.y).endswith('indicator'):
+            return None   # the fold arrow folds, as usual
+        self._play_albums_row(iid)
+        return 'break'    # play without also folding the row
+
+    def _on_albums_right_click(self, event):
+        tree = self.albums_tree
+        iid = tree.identify_row(event.y)
+        row = self._albums_rows.get(iid) if iid else None
+        idx = self.library_index
+        if row is None or idx is None:
+            return
+        tree.selection_set(iid)
+        tree.focus(iid)
+        menu = self.albums_menu
+        menu.delete(0, tk.END)
+        if row[0] == 'artist':
+            menu.add_command(label="Play artist", command=lambda k=row[1]: self.play_artist(k))
+        else:
+            album = idx.album(row[1])
+            if album is None:
+                return
+            if row[0] == 'song':
+                track = row[2]
+                menu.add_command(label="Play Next", command=lambda: self.queue_track(track, play_next=True))
+                menu.add_command(label="Add to Up Next", command=lambda: self.queue_track(track))
+                menu.add_separator()
+            menu.add_command(label="Play album from start", command=lambda: self._album_action(album, 'album'))
+            menu.add_command(label="Play artist", command=lambda: self._album_action(album, 'artist'))
+            menu.add_command(label="Add album to Up Next", command=lambda: self._album_action(album, 'queue'))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            try:
+                menu.grab_release()
+            except (RuntimeError, tk.TclError):
+                pass
+
+    def _albums_artist_key_at(self, iid):
+        tree = self.albums_tree
+        while iid and tree.parent(iid):
+            iid = tree.parent(iid)
+        row = self._albums_rows.get(iid) if iid else None
+        return row[1] if row and row[0] == 'artist' else None
+
+    def _on_albums_key(self, event):
+        """Type-to-jump: typed letters jump to the next artist whose name starts with them."""
+        if event.state & 0x4 or event.state & 0x20000:   # Ctrl or Alt: leave shortcuts alone
+            return None
+        ch = event.char
+        if not ch or not ch.isprintable() or (ch == ' ' and not self._type_jump):
+            return None
+        idx = self.library_index
+        if idx is None or not idx.artists:
+            return 'break'
+        if self._type_jump_job is not None:
+            self.root.after_cancel(self._type_jump_job)
+        self._type_jump += ch
+        self._type_jump_job = self.root.after(TYPE_JUMP_RESET_MS, self._reset_type_jump)
+        from_key = self._albums_artist_key_at(self.albums_tree.focus())
+        if from_key is not None and len(self._type_jump) == 1:
+            keys = [a.key for a in idx.artists]   # a fresh letter starts after the current artist
+            pos = keys.index(from_key) if from_key in keys else -1
+            from_key = keys[(pos + 1) % len(keys)]
+        artist = idx.find_artist(self._type_jump, from_key=from_key)
+        iid = self._albums_artist_iids.get(artist.key) if artist is not None else None
+        if iid:
+            self.albums_tree.selection_set(iid)
+            self.albums_tree.focus(iid)
+            self.albums_tree.see(iid)
+        return 'break'
+
+    def _reset_type_jump(self):
+        self._type_jump = ''
+        self._type_jump_job = None
     
-    def queue_track(self, track, play_next=False):
-        """Move track into the queued block right after the current song"""
+    def queue_track(self, track, play_next=False, refresh=True):
+        """Move track into the queued block right after the current song.
+
+        refresh=False skips the status line and the playlist redraw (queue_album queues many songs, then
+        redraws once)."""
         fp = getattr(track, 'filepath', None)
         if not fp:
             return
@@ -3957,6 +4380,8 @@ class MusicPlayerGUI:
         # its result would drop this newly-queued track (Task 4).
         self._shuffle_token = getattr(self, "_shuffle_token", 0) + 1
 
+        if not refresh:
+            return
         if play_next:
             self.status_label.config(text=f"▶ Will play next: {track.title}")
         else:
@@ -3979,6 +4404,7 @@ class MusicPlayerGUI:
         dur = getattr(track, 'duration', 0) or None
         self._pb_tracker = PlaybackTracker(
             self._pb_seq, duration=dur, now=time.monotonic())
+        self._pb_tracker.ctx = self._context_kind_for(track)   # for the listening log
         self._pb_track = track
 
     def _finalize_playback(self, reason, transition='cut'):
@@ -4019,7 +4445,8 @@ class MusicPlayerGUI:
                 album=getattr(track, 'album', ''), genre=getattr(track, 'genre', ''),
                 duration_sec=getattr(track, 'duration', 0) or 0, audible_sec=outcome.audible,
                 reason=outcome.reason, qualified=outcome.qualified_play, skip=outcome.manual_skip,
-                transition=transition if outcome.reason == 'natural_end' else 'cut'))
+                transition=transition if outcome.reason == 'natural_end' else 'cut',
+                ctx=getattr(tracker, 'ctx', None)))
         except Exception as e:
             print(f"⚠ Could not write listening log: {e}")
 
@@ -4212,9 +4639,13 @@ class MusicPlayerGUI:
         s = self.audio_settings
         gain = 0.0
         if s['leveling_enabled']:
-            loud = self._loudness_for(track)
-            if loud is not None:
-                gain = leveling_gain_db(loud.integrated_lufs, loud.true_peak_dbtp)
+            album_gain = self._album_gain_for(track)
+            if album_gain is not None:
+                gain = album_gain
+            else:
+                loud = self._loudness_for(track)
+                if loud is not None:
+                    gain = leveling_gain_db(loud.integrated_lufs, loud.true_peak_dbtp)
         return filter_chain(s['eq_bands_db'], s['eq_preamp_db'], gain, enabled=s['eq_enabled'])
 
     def _needs_analysis(self, track):
@@ -4636,6 +5067,7 @@ class MusicPlayerGUI:
             return
 
         self._finalize_playback('stop')   # Task 8: stop is not a dislike
+        self._play_context = None         # an album/artist play ends on Stop
         self._cancel_pending_start()
         self._engine_item = None
         with self._engine_lock:
