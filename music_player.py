@@ -1061,8 +1061,6 @@ class MusicPlayerGUI:
                                        orient=tk.HORIZONTAL, length=180,
                                        command=self.on_volume_change)
         self.volume_slider.grid(row=0, column=6, padx=5)
-        ttk.Button(self.transport_frame, text="EQ", width=4,
-                   command=self.open_equalizer).grid(row=0, column=7, padx=(0, 5))
         
         # Set initial volume
         if self.volume_interface:

@@ -14,7 +14,7 @@ A custom music player for large iTunes/M4A libraries with a smart shuffle algori
     (trims silence and fades where the song tails off), 1–12 s. Only songs that
     end on their own fade, album tracks included; Next or picking a song switches
     instantly. Use Off for gapless albums.
-  - **Equalizer** (Settings > Equalizer, or the EQ button): Winamp's 10 bands
+  - **Equalizer** (Settings > Equalizer): Winamp's 10 bands
     plus preamp, Winamp's built-in presets, your own presets, and `.eqf` import.
   - **Loudness leveling**: each song is measured once (EBU R128) and played at a
     common level, never pushed past its peak.
