@@ -16,7 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import loudness
 from loudness import (TrackLoudness, parse_ebur128, leveling_gain_db,
-                      cache_key, to_record, from_record, load_cache, save_cache)
+                      album_gain_db, cache_key, to_record, from_record,
+                      load_cache, save_cache)
 
 
 def _frame(t, m):
@@ -151,6 +152,53 @@ class LevelingGainTests(unittest.TestCase):
     def test_custom_target_and_ceiling(self):
         self.assertEqual(leveling_gain_db(-20.0, -10.0,
                                           target=-18.0, ceiling=-2.0), 2.0)
+
+
+def _song(lufs, peak, duration=100.0):
+    return TrackLoudness(integrated_lufs=lufs, true_peak_dbtp=peak,
+                         duration_sec=duration, head=(), tail=())
+
+
+class AlbumGainTests(unittest.TestCase):
+    """album_gain_db: duration-weighted energy mean over non-silent songs."""
+
+    def test_equal_songs_match_single_song_gain(self):
+        songs = [_song(-20.0, -8.0), _song(-20.0, -8.0)]
+        self.assertEqual(album_gain_db(songs),
+                         leveling_gain_db(-20.0, -8.0))
+
+    def test_two_song_energy_mean(self):
+        # L = 10*log10((100*10^-1 + 100*10^-2)/200) ~= -12.596
+        songs = [_song(-10.0, -8.0), _song(-20.0, -8.0)]
+        self.assertEqual(album_gain_db(songs), -1.4)
+
+    def test_duration_weighting_changes_result(self):
+        even = album_gain_db([_song(-10.0, -8.0), _song(-20.0, -8.0)])
+        weighted = album_gain_db([_song(-10.0, -8.0, duration=300.0),
+                                  _song(-20.0, -8.0, duration=100.0)])
+        self.assertNotEqual(even, weighted)
+        self.assertEqual(weighted, -2.9)
+
+    def test_loud_peak_caps_the_gain(self):
+        songs = [_song(-20.0, -2.0), _song(-20.0, -2.0)]
+        self.assertEqual(album_gain_db(songs),
+                         leveling_gain_db(-20.0, -2.0))
+        self.assertEqual(album_gain_db(songs), 1.0)
+
+    def test_silent_songs_left_out(self):
+        songs = [_song(-70.0, -120.0), _song(-20.0, -8.0)]
+        self.assertEqual(album_gain_db(songs), leveling_gain_db(-20.0, -8.0))
+
+    def test_empty_input_returns_zero(self):
+        self.assertEqual(album_gain_db([]), 0.0)
+
+    def test_all_silent_returns_zero(self):
+        songs = [_song(-70.0, -120.0), _song(-75.0, -120.0)]
+        self.assertEqual(album_gain_db(songs), 0.0)
+
+    def test_zero_duration_songs_left_out(self):
+        songs = [_song(-10.0, -8.0, duration=0.0), _song(-20.0, -8.0)]
+        self.assertEqual(album_gain_db(songs), leveling_gain_db(-20.0, -8.0))
 
 
 class RecordRoundTripTests(unittest.TestCase):
