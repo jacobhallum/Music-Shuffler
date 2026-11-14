@@ -18,6 +18,7 @@ from listening_stats import (
     NO_ALBUM, UNKNOWN_ARTIST, Place, Row, TrackInfo,
     month_bounds, period_bounds, place_for_record, period_stats, months,
 )
+from listening_stats import all_time_stats, forgotten_favorites, never_played
 
 
 def ts(dt):
@@ -365,6 +366,136 @@ class MonthsTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0].top_artist, 'Bob')
         self.assertEqual(rows[0].top_song, '')
+
+
+class AllTimeAndLibraryTests(unittest.TestCase):
+    def tracks(self):
+        return [
+            TrackInfo(path='/a.mp3', title='Song A', place=PLACE_A,
+                      duration=3600.0, play_count=3, qualified_play_count=3),
+            TrackInfo(path='/b.mp3', title='Song B', place=PLACE_B,
+                      duration=1800.0, play_count=2, qualified_play_count=1,
+                      manual_skip_count=2),
+            TrackInfo(path='/c.mp3', title='Song C', place=PLACE_B,
+                      duration=None, play_count=0, qualified_play_count=5,
+                      manual_skip_count=1),
+            TrackInfo(path='/d.mp3', title='Song D', place=PLACE_A,
+                      duration=None, play_count=4),
+        ]
+
+    def records(self):
+        return [
+            rec('/a.mp3', title='Song A', artist='Artist One', album='Album A',
+                heard=3600, q=True, start=ts(datetime(2026, 11, 1, 10, 0))),
+            rec('/b.mp3', title='Song B', artist='Artist Two', album='Album B',
+                heard=600, skip=True, start=ts(datetime(2026, 11, 2, 22, 0))),
+        ]
+
+    def test_top_songs_by_play_count(self):
+        stats = all_time_stats(self.records(), self.tracks(), LOCATE)
+        self.assertEqual([r.key for r in stats.top_songs],
+                         ['/d.mp3', '/a.mp3', '/b.mp3'])
+        self.assertEqual(stats.top_songs[0].plays, 4)
+        self.assertEqual(stats.top_songs[0].name, 'Song D')
+        self.assertEqual(stats.top_songs[0].sub, 'Artist One')
+
+    def test_play_count_zero_song_left_out(self):
+        stats = all_time_stats(self.records(), self.tracks(), LOCATE)
+        self.assertNotIn('/c.mp3', [r.key for r in stats.top_songs])
+
+    def test_artist_hours_from_play_count_times_duration(self):
+        stats = all_time_stats(self.records(), self.tracks(), LOCATE)
+        self.assertEqual([r.name for r in stats.top_artists],
+                         ['Artist One', 'Artist Two'])
+        self.assertAlmostEqual(stats.top_artists[0].hours, 3.0)
+        self.assertEqual(stats.top_artists[0].plays, 7)
+        self.assertAlmostEqual(stats.top_artists[1].hours, 1.0)
+        self.assertEqual(stats.top_artists[1].sub, '')
+        self.assertEqual([r.name for r in stats.top_albums],
+                         ['Album A', 'Album B'])
+        self.assertEqual(stats.top_albums[0].plays, 7)
+        self.assertEqual(stats.top_albums[1].sub, 'Artist Two')
+
+    def test_skip_rates_with_thresholds(self):
+        stats = all_time_stats(self.records(), self.tracks(), LOCATE)
+        self.assertEqual([r.name for r in stats.skipped_songs],
+                         ['Song B', 'Song C'])
+        self.assertEqual(stats.skipped_songs[0].skips, 2)
+        self.assertEqual(stats.skipped_songs[0].starts, 3)
+        self.assertAlmostEqual(stats.skipped_songs[0].skips / stats.skipped_songs[0].starts,
+                               2 / 3)
+        self.assertEqual(stats.skipped_songs[1].starts, 6)
+        # Artist One: starts = 3 + 0 = 3 < 5 -> excluded; Artist Two: 9 starts, 3 skips.
+        self.assertEqual([r.name for r in stats.skipped_artists], ['Artist Two'])
+        self.assertEqual(stats.skipped_artists[0].starts, 9)
+        self.assertEqual(stats.skipped_artists[0].skips, 3)
+
+    def test_summary_and_by_hour_match_period_stats(self):
+        tracks = self.tracks()
+        records = self.records()
+        base = period_stats(records, None, None, LOCATE, {t.path: t for t in tracks})
+        stats = all_time_stats(records, tracks, LOCATE)
+        self.assertEqual(stats.summary, base.summary)
+        self.assertEqual(stats.by_hour, base.by_hour)
+        self.assertEqual(stats.by_weekday, base.by_weekday)
+
+    def test_none_numbers_treated_as_zero(self):
+        tracks = [
+            TrackInfo(path='/n.mp3', title='None', place=PLACE_A,
+                      duration=None, play_count=None, qualified_play_count=2,
+                      manual_skip_count=None),
+        ]
+        stats = all_time_stats([], tracks, LOCATE)
+        self.assertEqual(stats.top_songs, [])
+        self.assertEqual(stats.top_artists, [])
+        self.assertEqual(stats.skipped_songs, [])
+
+    def test_forgotten_favorites_cut_order_and_limit(self):
+        now = ts(datetime(2026, 11, 14))
+        tracks = [
+            TrackInfo(path='/new.mp3', title='New', place=PLACE_A, loved=True,
+                      last_played=now - 10 * 86400),
+            TrackInfo(path='/old.mp3', title='Old', place=PLACE_A, loved=True,
+                      last_played=now - 100 * 86400),
+            TrackInfo(path='/never.mp3', title='Never', place=PLACE_A, loved=True,
+                      last_played=None),
+            TrackInfo(path='/edge.mp3', title='Edge', place=PLACE_A, loved=True,
+                      last_played=now - 90 * 86400),
+            TrackInfo(path='/unloved.mp3', title='Unloved', place=PLACE_A,
+                      last_played=now - 200 * 86400),
+        ]
+        got = forgotten_favorites(tracks, now)
+        self.assertEqual([t.path for t in got],
+                         ['/never.mp3', '/old.mp3', '/edge.mp3'])   # never, then oldest first
+        got = forgotten_favorites(tracks, now, limit=2)
+        self.assertEqual([t.path for t in got], ['/never.mp3', '/old.mp3'])
+
+    def test_never_played_order_and_exclusions(self):
+        records = [
+            rec('/heard.mp3', heard=60, q=True, start=ts(datetime(2026, 11, 1))),
+        ]
+        tracks = [
+            TrackInfo(path='/z.mp3', title='Z', place=PLACE_A,
+                      date_added=ts(datetime(2026, 1, 1))),
+            TrackInfo(path='/a.mp3', title='A', place=PLACE_A,
+                      date_added=ts(datetime(2026, 3, 1))),
+            TrackInfo(path='/heard.mp3', title='Heard', place=PLACE_A,
+                      date_added=ts(datetime(2026, 5, 1))),
+            TrackInfo(path='/played.mp3', title='Played', place=PLACE_A,
+                      play_count=1, date_added=ts(datetime(2026, 6, 1))),
+            TrackInfo(path='/qualified.mp3', title='Qualified', place=PLACE_A,
+                      qualified_play_count=1, date_added=ts(datetime(2026, 7, 1))),
+            TrackInfo(path='/zero.mp3', title='Zero', place=PLACE_A,
+                      play_count=0, qualified_play_count=0,
+                      date_added=ts(datetime(2026, 2, 1))),
+            TrackInfo(path='/unknown.mp3', title='Unknown', place=PLACE_A,
+                      date_added=None),
+        ]
+        got = never_played(tracks, records)
+        self.assertEqual([t.path for t in got],
+                         ['/a.mp3', '/zero.mp3', '/z.mp3', '/unknown.mp3'])
+        got = never_played([], records)
+        self.assertEqual(got, [])
 
 
 if __name__ == '__main__':

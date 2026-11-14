@@ -266,3 +266,88 @@ def months(records, locate) -> list:
             top_song=stats.top_songs[0].name if stats.top_songs else '',
         ))
     return out
+
+
+def all_time_stats(records, tracks, locate, top_n: int = 25) -> PeriodStats:
+    base = period_stats(records, None, None, locate, {t.path: t for t in tracks}, top_n)
+    songs = {}
+    artists = {}
+    albums = {}
+    for t in tracks:
+        pc = int(t.play_count or 0)
+        hours = pc * float(t.duration or 0) / 3600
+        sk = int(t.manual_skip_count or 0)
+        starts = int(t.qualified_play_count or 0) + sk
+
+        row = songs.get(t.path)
+        if row is None:
+            row = songs[t.path] = Row(key=t.path, name=t.title, sub=t.place.artist_name)
+        row.plays += pc
+        row.hours += hours
+        row.skips += sk
+        row.starts += starts
+
+        place = t.place
+        row = artists.get(place.artist_key)
+        if row is None:
+            row = artists[place.artist_key] = Row(key=place.artist_key,
+                                                  name=place.artist_name, sub='')
+        row.plays += pc
+        row.hours += hours
+        row.skips += sk
+        row.starts += starts
+
+        row = albums.get(place.album_key)
+        if row is None:
+            row = albums[place.album_key] = Row(key=place.album_key, name=place.album_name,
+                                                sub=place.artist_name)
+        row.plays += pc
+        row.hours += hours
+        row.skips += sk
+        row.starts += starts
+
+    return PeriodStats(
+        summary=base.summary,
+        top_songs=sorted(
+            (r for r in songs.values() if r.plays >= 1),
+            key=lambda r: (-r.plays, -r.hours, r.name.casefold(), r.key))[:top_n],
+        top_artists=sorted(
+            (r for r in artists.values() if r.plays >= 1 or r.hours > 0),
+            key=lambda r: (-r.hours, -r.plays, r.name.casefold(), r.key))[:top_n],
+        top_albums=sorted(
+            (r for r in albums.values() if r.plays >= 1 or r.hours > 0),
+            key=lambda r: (-r.hours, -r.plays, r.name.casefold(), r.key))[:top_n],
+        skipped_songs=sorted(
+            (r for r in songs.values() if r.starts >= 3 and r.skips >= 1),
+            key=lambda r: (-(r.skips / r.starts), -r.skips, r.name.casefold(), r.key))[:top_n],
+        skipped_artists=sorted(
+            (r for r in artists.values() if r.starts >= 5 and r.skips >= 1),
+            key=lambda r: (-(r.skips / r.starts), -r.skips, r.name.casefold(), r.key))[:top_n],
+        by_hour=base.by_hour,
+        by_weekday=base.by_weekday,
+    )
+
+
+def forgotten_favorites(tracks, now: float, days: int = 90, limit: int = 50) -> list:
+    out = []
+    for t in tracks:
+        if not t.loved:
+            continue
+        lp = t.last_played
+        if lp is not None and now - lp < days * 86400:
+            continue
+        out.append(t)
+    out.sort(key=lambda t: (t.last_played is not None, t.last_played or 0,
+                            t.title.casefold(), t.path))
+    return out[:limit]
+
+
+def never_played(tracks, records) -> list:
+    heard_paths = {rec.get('path') for rec in records}
+    out = [t for t in tracks
+           if int(t.play_count or 0) == 0
+           and int(t.qualified_play_count or 0) == 0
+           and t.path not in heard_paths]
+    out.sort(key=lambda t: (t.date_added is None, -(t.date_added or 0),
+                            t.title.casefold(), t.path))
+    return out
