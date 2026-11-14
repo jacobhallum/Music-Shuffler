@@ -1,6 +1,6 @@
 # iTunes Shuffler
 
-A custom music player for large iTunes/M4A libraries with a smart shuffle algorithm, album artwork, global media keys, and a pre-conversion cache for DRM-free tracks.
+A custom music player for large iTunes/M4A libraries with a smart shuffle algorithm, song transitions, a Winamp-style equalizer, loudness leveling, album artwork and global media keys.
 
 ## Features
 
@@ -8,7 +8,18 @@ A custom music player for large iTunes/M4A libraries with a smart shuffle algori
   any library skew, runs in well under a second on 15K+ tracks, varies between
   sessions, and keeps recently-played tracks out of the next shuffle's opening.
   Regenerates a fresh order when the playlist wraps.
-- **Background M4A pre-conversion** — converts tracks via FFmpeg so playback is instant
+- **Sound engine** — FFmpeg decodes every format (M4A, MP3, FLAC, hi-res) straight
+  into the player; no conversion cache.
+  - **Song transitions** (Settings > Sound): Off (gapless), Crossfade, or Smart
+    (trims silence and fades where the song tails off), 1–12 s. Only songs that
+    end on their own fade; Next or picking a song switches instantly. Consecutive
+    tracks of an album always play gapless.
+  - **Equalizer** (Settings > Equalizer, or the EQ button): Winamp's 10 bands
+    plus preamp, Winamp's built-in presets, your own presets, and `.eqf` import.
+  - **Loudness leveling**: each song is measured once (EBU R128) and played at a
+    common level, never pushed past its peak.
+  - **Listening log**: every finished song is recorded in `listening_log.jsonl`
+    for future stats.
 - **Unified metadata** — play count, rating, favorite, and honest listening
   outcomes (`qualified_play_count` / `manual_skip_count`) for all 8K+ tracks
 - **Favorites drive taste** — the ♥ button is the preference signal (legacy
@@ -36,12 +47,13 @@ tracks you consistently skip and lets that decay over ~a week.
 - [pygame](https://pypi.org/project/pygame/) — audio playback
 - [mutagen](https://pypi.org/project/mutagen/) — audio metadata
 - [Pillow](https://pypi.org/project/Pillow/) — album artwork
-- [FFmpeg](https://ffmpeg.org/download.html) — M4A/FLAC conversion (must be on PATH or configured)
+- [FFmpeg](https://ffmpeg.org/download.html) — required for all playback (must be on PATH or configured)
+- [keyboard](https://pypi.org/project/keyboard/) — global volume hotkeys
 - [PyQt6](https://pypi.org/project/PyQt6/) — GUI framework for Library Manager
 - [pywin32](https://pypi.org/project/pywin32/) — iTunes COM automation for Library Manager (Windows only)
 
 ```
-pip install pygame mutagen Pillow PyQt6 pywin32
+pip install pygame mutagen Pillow keyboard PyQt6 pywin32
 ```
 
 ## Setup
