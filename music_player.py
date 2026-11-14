@@ -38,6 +38,7 @@ from eq import BUILTIN_PRESETS, filter_chain, parse_eqf
 from sound_ui import EqualizerWindow, SoundDialog
 from stats_ui import StatsWindow, period_title
 from albums_browser import AlbumsBrowser
+from skin_mode import SkinController
 from loudness import album_gain_db, leveling_gain_db
 from loudness_service import LoudnessService
 from icon_utils import make_icon_images
@@ -865,7 +866,10 @@ class MusicPlayerGUI:
             if self._engine is not None else None
         self._drain_main_calls()
         self._start_engine_loop()
-        
+        # Winamp skins: a saved skin opens the skinned windows instead of this default view.
+        self.skins = SkinController(self)
+        self.root.after(150, self.skins.start)
+
         # V2: Load unified player metadata
         self._load_player_metadata()
 
@@ -929,7 +933,8 @@ class MusicPlayerGUI:
         settings_menu = tk.Menu(settings_btn, tearoff=0)
         settings_btn['menu'] = settings_menu
         settings_btn.grid(row=0, column=1, padx=(0, 5))
-        
+        self.settings_menu = settings_menu   # the skinned windows' right-click menu copies these items
+
         settings_menu.add_command(label="Library Info", command=self.show_library_info)
         settings_menu.add_separator()
         settings_menu.add_command(label="Shuffle Settings", command=self.edit_shuffle_settings)
@@ -938,6 +943,9 @@ class MusicPlayerGUI:
         settings_menu.add_command(label="Listening Stats…", command=self.open_stats_window)
         settings_menu.add_command(label="Import iTunes Ratings as Favorites…", command=self.migrate_ratings_to_favorites)
         settings_menu.add_separator()
+        self.skins_menu = tk.Menu(settings_menu, tearoff=0,
+                                  postcommand=lambda: self.skins.fill_skins_menu(self.skins_menu))
+        settings_menu.add_cascade(label="Skins", menu=self.skins_menu)
         settings_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
         settings_menu.add_separator()
         settings_menu.add_command(label="Scan Library", command=self.scan_library)
@@ -2566,6 +2574,9 @@ class MusicPlayerGUI:
     
     def _on_close(self):
         """Graceful shutdown: stop background processes and close"""
+        skins = getattr(self, 'skins', None)
+        if skins is not None:
+            skins.on_app_close()   # remember where the skinned windows were
         # Stop metadata save worker
         self._metadata_save_stop.set()
         if self._metadata_save_thread and self._metadata_save_thread.is_alive():
@@ -4536,6 +4547,13 @@ class MusicPlayerGUI:
             audio_settings.save(str(self.audio_settings_file), self.audio_settings)
         except OSError as e:
             print(f"⚠ Could not save sound settings: {e}")
+
+    def apply_eq(self, bands, preamp, enabled, preset=''):
+        """The skinned EQ window changed the EQ: same path as the Equalizer window."""
+        new = dict(self.audio_settings)
+        new.update(eq_bands_db=[float(b) for b in bands], eq_preamp_db=float(preamp), eq_enabled=bool(enabled),
+                   eq_preset=preset)
+        self._apply_sound_settings(new, EQ_WINDOW_KEYS)
 
     def _eq_presets(self):
         presets = dict(BUILTIN_PRESETS)
