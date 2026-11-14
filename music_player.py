@@ -40,6 +40,7 @@ from icon_utils import make_icon_images
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
 from mutagen.mp4 import MP4
+from mutagen.easymp4 import EasyMP4
 from mutagen.flac import FLAC
 
 # Suppress pygame pkg_resources deprecation warning
@@ -57,6 +58,7 @@ import subprocess  # For calling FFmpeg
 import hashlib  # For creating unique cache filenames
 from PIL import Image, ImageTk  # For album artwork
 import io
+import struct
 import plistlib  # For parsing iTunes XML library
 from urllib.parse import unquote, urlparse  # For decoding iTunes file URLs
 
@@ -79,6 +81,73 @@ SOUND_DIALOG_KEYS = ('transition_mode', 'transition_seconds', 'leveling_enabled'
 EQ_WINDOW_KEYS = ('eq_enabled', 'eq_preset', 'eq_bands_db', 'eq_preamp_db')
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
 ICON_SIZES = (16, 32, 48, 64, 128, 256)  # Window/taskbar icon sizes to generate
+
+
+def open_audio(path, easy=False):
+    """mutagen.File, trusting the file's content when its extension lies.
+
+    mutagen weighs a .flac extension above the header, so MP4 audio saved with a .flac name
+    fails to open there and the track would lose its duration, tags and artwork.
+    """
+    try:
+        return MutagenFile(path, easy=easy)
+    except Exception:
+        with open(path, 'rb') as fh:
+            header = fh.read(12)
+        if header[4:8] == b'ftyp':
+            return EasyMP4(path) if easy else MP4(path)
+        raise
+
+
+def _mp4_boxes(fh, start, end):
+    """(type, payload_start, box_end) for each MP4 box between start and end; stops at a torn box."""
+    pos = start
+    while pos + 8 <= end:
+        fh.seek(pos)
+        size, typ = struct.unpack('>I4s', fh.read(8))
+        payload = pos + 8
+        if size == 1:
+            size = struct.unpack('>Q', fh.read(8))[0]
+            payload = pos + 16
+        elif size == 0:
+            size = end - pos
+        if size < payload - pos or pos + size > end:
+            return
+        yield typ, payload, pos + size
+        pos += size
+
+
+def fragmented_mp4_duration(path):
+    """Seconds from a fragmented MP4's mvex/mehd box, or None.
+
+    mutagen reports 0 for fragmented (DASH) MP4 because the main header has no samples; the
+    total length is in mehd, in mvhd's timescale.
+    """
+    try:
+        with open(path, 'rb') as fh:
+            end = os.fstat(fh.fileno()).st_size
+            moov = next(((p, e) for t, p, e in _mp4_boxes(fh, 0, end) if t == b'moov'), None)
+            if moov is None:
+                return None
+            timescale = fragment = None
+            for typ, p, e in _mp4_boxes(fh, *moov):
+                if typ == b'mvhd' and e - p >= 24:
+                    fh.seek(p)
+                    v = fh.read(1)[0]
+                    fh.seek(p + (20 if v == 1 else 12))
+                    timescale = struct.unpack('>I', fh.read(4))[0]
+                elif typ == b'mvex':
+                    for t2, p2, e2 in _mp4_boxes(fh, p, e):
+                        if t2 == b'mehd' and e2 - p2 >= 8:
+                            fh.seek(p2)
+                            v = fh.read(1)[0]
+                            fh.seek(p2 + 4)
+                            fragment = struct.unpack('>Q' if v == 1 else '>I', fh.read(8 if v == 1 else 4))[0]
+            if timescale and fragment:
+                return fragment / timescale
+    except (OSError, struct.error, IndexError):
+        pass
+    return None
 
 
 class MusicTrack:
@@ -166,7 +235,7 @@ class MusicTrack:
     def _load_metadata(self):
         """Load metadata from the meta_path"""
         try:
-            audio = MutagenFile(self.meta_path, easy=True)
+            audio = open_audio(self.meta_path, easy=True)
             
             if audio is None:
                 return
@@ -186,10 +255,13 @@ class MusicTrack:
             # Get duration
             if hasattr(audio.info, 'length'):
                 self.duration = int(audio.info.length)
+            if not self.duration and isinstance(audio, MP4):
+                # fragmented (DASH) MP4: mutagen sees no samples, the length is in mvex/mehd
+                self.duration = int(fragmented_mp4_duration(self.meta_path) or 0)
             
             # Try to get additional metadata from full tags
             try:
-                full_audio = MutagenFile(self.meta_path)
+                full_audio = open_audio(self.meta_path)
                 
                 # MP3 specific tags
                 if isinstance(full_audio, MP3):
@@ -989,8 +1061,6 @@ class MusicPlayerGUI:
                                        orient=tk.HORIZONTAL, length=180,
                                        command=self.on_volume_change)
         self.volume_slider.grid(row=0, column=6, padx=5)
-        ttk.Button(self.transport_frame, text="EQ", width=4,
-                   command=self.open_equalizer).grid(row=0, column=7, padx=(0, 5))
         
         # Set initial volume
         if self.volume_interface:
@@ -2254,7 +2324,7 @@ class MusicPlayerGUI:
     def _load_album_artwork(self, track):
         """Load and display album artwork for a track"""
         try:
-            audio = MutagenFile(track.meta_path)
+            audio = open_audio(track.meta_path)
             artwork_data = None
             
             # Try embedded artwork first
@@ -2642,7 +2712,7 @@ class MusicPlayerGUI:
                         if filepath in cached_tracks:
                             track = cached_tracks[filepath]
 
-                            if not os.path.exists(track.filepath):
+                            if self._cached_track_needs_rescan(track):
                                 files_to_scan.append(filepath)
                                 if self.debug_scan_logging:
                                     print(f"⚠ Cache broken for {os.path.basename(filepath)} - will re-process")
@@ -2808,6 +2878,12 @@ class MusicPlayerGUI:
 
         return track
     
+    @staticmethod
+    def _cached_track_needs_rescan(track):
+        """A cached track is re-read when its file is gone or it has no duration (e.g. saved while an
+        MP4 named .flac couldn't be parsed)."""
+        return not os.path.exists(track.filepath) or not (track.duration or 0) > 0
+
     def load_cache(self):
         """Load cached library data from JSON"""
         try:
