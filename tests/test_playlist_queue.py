@@ -13,7 +13,20 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import playlist_queue
-from playlist_queue import queue_target, advance, previous_position
+from playlist_queue import queue_target, advance, previous_position, peek_next_index
+
+
+class PeekNextTests(unittest.TestCase):
+    def test_peek_next_matches_advance(self):
+        for length in (0, 1, 3):
+            for current in range(max(length, 1)):
+                for queued in (0, 1):
+                    for temp in (False, True):
+                        for wrap in (False, True):
+                            action, idx, _, _ = advance(current, length, queued, temp, reshuffle_on_wrap=wrap)
+                            want = idx if action == 'play' else None
+                            got = peek_next_index(current, length, queued, temp, reshuffle_on_wrap=wrap)
+                            self.assertEqual(got, want, (current, length, queued, temp, wrap))
 
 
 class QueueTargetTests(unittest.TestCase):

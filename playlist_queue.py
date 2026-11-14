@@ -88,6 +88,15 @@ def advance(current_index, length, queued_count, is_temp_view, *,
     return 'play', next_index, new_queued_count, is_temp_view
 
 
+def peek_next_index(current_index, length, queued_count, is_temp_view, *,
+                    reshuffle_on_wrap=False):
+    """The index `advance` would play next, without changing anything; None when the next step is a
+    reshuffle or a stop (the next song isn't known yet)."""
+    action, new_index, _, _ = advance(current_index, length, queued_count, is_temp_view,
+                                      reshuffle_on_wrap=reshuffle_on_wrap)
+    return new_index if action == 'play' else None
+
+
 def reshuffle_tail_input(all_tracks, active_track, queued_tracks, *, norm_fn=None):
     """Library tracks eligible for a fresh shuffle, i.e. everything except the
     fixed prefix (the active track plus the queued block).
