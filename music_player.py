@@ -30,11 +30,13 @@ import appcommand
 import audio_settings
 import library_index
 import listening_log
+import listening_stats
 import transitions
 from audio_engine import AudioEngine, PlayItem
 from audio_backend import FfmpegDecoder, PygameChannel, analyze_file
 from eq import BUILTIN_PRESETS, filter_chain, parse_eqf
 from sound_ui import EqualizerWindow, SoundDialog
+from stats_ui import StatsWindow, period_title
 from loudness import album_gain_db, leveling_gain_db
 from loudness_service import LoudnessService
 from icon_utils import make_icon_images
@@ -77,6 +79,7 @@ HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
 ALBUMS_SEARCH_OPEN_CAP = 50   # Albums search: at most this many albums open with their matching songs
 TYPE_JUMP_RESET_MS = 800      # Albums tab type-to-jump: typing pause that starts a new prefix
+STATS_MIN_START = 946684800   # 2000-01-01: listening-log lines that claim to start earlier are skipped
 MAIN_CALLS_POLL_MS = 20  # How often the main thread runs callbacks posted by worker threads
 # The settings each window edits. Each emits its whole snapshot from when it opened, so only these
 # keys are taken from it; the rest may be stale if the other window changed them meanwhile.
@@ -829,6 +832,10 @@ class MusicPlayerGUI:
         self._start_pending = False   # a picked song is waiting for its loudness before it starts
         self._sound_dialog = None
         self._eq_window = None
+        self._stats_window = None
+        self._stats_data = None      # (tracks, places, by_path) snapshot for the open stats window
+        self._stats_records = None   # listening-log records read for the open stats window
+        self._stats_token = 0
         try:
             pygame.mixer.init(frequency=48000, size=32, channels=2, buffer=2048)
             pygame.mixer.set_reserved(2)
@@ -929,6 +936,7 @@ class MusicPlayerGUI:
         settings_menu.add_command(label="Shuffle Settings", command=self.edit_shuffle_settings)
         settings_menu.add_command(label="Sound…", command=self.open_sound_dialog)
         settings_menu.add_command(label="Equalizer…", command=self.open_equalizer)
+        settings_menu.add_command(label="Listening Stats…", command=self.open_stats_window)
         settings_menu.add_command(label="Import iTunes Ratings as Favorites…", command=self.migrate_ratings_to_favorites)
         settings_menu.add_separator()
         settings_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
@@ -4803,6 +4811,130 @@ class MusicPlayerGUI:
         self._eq_window = EqualizerWindow(self.root, self.audio_settings, self._eq_presets(),
                                           lambda s: self._apply_sound_settings(s, EQ_WINDOW_KEYS),
                                           self._save_eq_preset, self._import_eqf)
+
+    # ---- Listening Stats window ----------------------------------------------
+
+    def open_stats_window(self):
+        if self._stats_window is not None and self._stats_window.winfo_exists():
+            self._stats_window.lift()
+            return
+        theme = self.themes['dark'] if self.dark_mode else self.themes['light']
+        self._stats_window = StatsWindow(self.root, self._stats_period, self._stats_menu_items, theme)
+        self._stats_data = self._stats_snapshot()
+        self._stats_records = None
+        self._stats_period('week')
+
+    def _stats_snapshot(self):
+        """Copy what the stats need on the main thread (playback keeps changing the counters).
+
+        Returns (tracks: list[TrackInfo], places: {path: Place}, by_path: {path: library track})."""
+        places = {}
+        idx = self.library_index
+        if idx is not None:
+            for artist in idx.artists:
+                for album in artist.albums:
+                    place = listening_stats.Place(artist.key, artist.name, album.key, album.name)
+                    for t in album.tracks:
+                        places[library_index.norm_path(t.filepath)] = place
+        tracks, by_path = [], {}
+        for t in self.library_tracks:
+            path = library_index.norm_path(t.filepath)
+            place = places.get(path) or listening_stats.place_for_record(
+                {'artist': getattr(t, 'artist', ''), 'album': getattr(t, 'album', '')}, lambda p: None)
+            tracks.append(listening_stats.TrackInfo(
+                path, t.title, place, duration=getattr(t, 'duration', 0) or 0,
+                play_count=getattr(t, 'play_count', 0) or 0,
+                qualified_play_count=getattr(t, 'qualified_play_count', 0) or 0,
+                manual_skip_count=getattr(t, 'manual_skip_count', 0) or 0,
+                last_played=getattr(t, 'last_played', None), date_added=getattr(t, 'date_added', None),
+                loved=bool(getattr(t, 'loved', False))))
+            by_path[path] = t
+        return tracks, places, by_path
+
+    @staticmethod
+    def _stats_compute(records, tracks, places, period, now):
+        """Worker thread: everything the window shows for one period (pure, no Tk)."""
+        locate = places.get
+        label = period_title(period)
+        if period == 'all':
+            stats = listening_stats.all_time_stats(records, tracks, locate)
+            first = min((r['start'] for r in records), default=None)
+            if first:
+                label += f" · summary since {time.strftime('%Y-%m-%d', time.localtime(first))}"
+        else:
+            if isinstance(period, tuple):
+                start, end = listening_stats.month_bounds(*period)
+            else:
+                start, end = listening_stats.period_bounds(period, now)
+            stats = listening_stats.period_stats(records, start, end, locate, {t.path: t for t in tracks})
+        return (label, stats, listening_stats.months(records, locate),
+                listening_stats.forgotten_favorites(tracks, now), listening_stats.never_played(tracks, records),
+                period == 'all')
+
+    def _stats_period(self, period):
+        """The window asked for a period: compute it off the main thread, then show it (the newest ask wins)."""
+        win = self._stats_window
+        if win is None or self._stats_data is None:
+            return
+        win.show_loading(period_title(period))
+        self._stats_token += 1
+        token = self._stats_token
+        tracks, places, _ = self._stats_data
+        records = self._stats_records
+        log_path = str(self.listening_log_file)
+
+        def work():
+            recs, result, error = None, None, None
+            try:
+                if records is not None:
+                    recs = records
+                else:   # a line with a nonsense start (Windows can't localize times near 1970) is skipped
+                    recs = [r for r in listening_log.read(log_path)
+                            if isinstance(r.get('start'), (int, float)) and r['start'] >= STATS_MIN_START]
+                result = self._stats_compute(recs, tracks, places, period, time.time())
+            except Exception as e:
+                print(f"⚠ Listening stats failed: {e}")
+                error = f"Couldn't load stats: {e}"
+
+            def done():
+                if recs is not None:
+                    self._stats_records = recs
+                if token == self._stats_token and win is self._stats_window and win.winfo_exists():
+                    if error is not None:
+                        win.show_error(error)
+                    else:
+                        win.show(*result)
+
+            self._post_to_main(done)
+
+        threading.Thread(target=work, daemon=True, name='listening-stats').start()
+
+    def _stats_menu_items(self, kind, key):
+        """Right-click items for a stats row; [] when the song/album/artist is no longer in the library."""
+        idx = self.library_index
+        if kind == 'song':
+            track = self._stats_data[2].get(key) if self._stats_data else None
+            if track is None:
+                return []
+            items = [("Play Next", lambda: self.queue_track(track, play_next=True)),
+                     ("Add to Up Next", lambda: self.queue_track(track))]
+            album = idx.album_of(track) if idx is not None else None
+            if album is not None:
+                items.append((None, None))
+                items += self._stats_album_items(album)
+            return items
+        album = idx.album(key) if (idx is not None and kind == 'album') else None
+        if album is not None:
+            return self._stats_album_items(album)
+        artist = idx.artist(key) if (idx is not None and kind == 'artist') else None
+        if artist is not None:
+            return [("Play artist", lambda: self.play_artist(artist.key))]
+        return []
+
+    def _stats_album_items(self, album):
+        return [("Play album from start", lambda: self._album_action(album, 'album')),
+                ("Play artist", lambda: self._album_action(album, 'artist')),
+                ("Add album to Up Next", lambda: self._album_action(album, 'queue'))]
 
     def _start_loudness_scan(self):
         """Measure the whole library in the background once leveling or smart transitions need it."""
