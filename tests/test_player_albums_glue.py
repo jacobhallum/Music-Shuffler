@@ -360,6 +360,40 @@ class AlbumGainTests(unittest.TestCase):
         self.assertEqual(self.p._filters_for(self.a1), '')
 
 
+class TabSwitchTests(unittest.TestCase):
+    """The one search box: a tab switch with unchanged text doesn't redraw the whole playlist."""
+
+    def _p(self):
+        p = _Fake()
+        p._playlist_query = ''
+        p._search_job = None
+        p.current_playlist = list(p.library_tracks)
+        p.filter_playlist = lambda: MusicPlayerGUI.filter_playlist(p)
+        p._filter_albums = lambda: None
+        return p
+
+    def test_tab_switch_with_same_text_does_not_redraw_playlist(self):
+        p = self._p()
+        MusicPlayerGUI._run_filter(p)
+        self.assertEqual(p.displays, 0)
+        p.search_var.set('A1')
+        MusicPlayerGUI._run_filter(p)
+        self.assertEqual(p.displays, 1)
+        self.assertEqual(titles(p.filtered_playlist), ['01 a1.mp3'])
+        MusicPlayerGUI._run_filter(p)               # e.g. back from the Albums tab
+        self.assertEqual(p.displays, 1)
+
+    def test_text_kept_by_an_album_pick_filters_the_new_list(self):
+        p = self._p()
+        p.search_var.set('c1')
+        MusicPlayerGUI._run_filter(p)
+        p.albums_tab = True
+        p.play_album(THREE)
+        p.albums_tab = False                        # switch to Playlist
+        MusicPlayerGUI._run_filter(p)
+        self.assertEqual(titles(p.filtered_playlist), ['01 c1.mp3'])
+
+
 class LogContextTests(unittest.TestCase):
     def test_log_record_gets_ctx(self):
         p = _Fake()

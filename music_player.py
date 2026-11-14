@@ -607,6 +607,7 @@ class MusicPlayerGUI:
         self.all_tracks = []           # Active working subset (filtered view)
         self.current_playlist = []
         self.filtered_playlist = []    # For search filtering
+        self._playlist_query = ''      # Search text the Playlist tab shows (None: stale, filter again)
         self._search_job = None        # For search debouncing
         self.current_index = 0
         self.queued_count = 0          # Manually-queued tracks right after current_index
@@ -3847,6 +3848,8 @@ class MusicPlayerGUI:
         self.filtered_playlist = []
         if context is None or not self._albums_tab_showing():
             self.search_var.set('')
+        else:
+            self._playlist_query = None   # the kept text applies to the new list when Playlist shows
         self.queued_count = 0
         self.is_temp_view = True
         self._play_context = context
@@ -3907,11 +3910,14 @@ class MusicPlayerGUI:
         if 0 <= self.current_index < len(self.current_playlist):
             playing = self._norm_path(self.current_playlist[self.current_index].filepath)
         added = 0
+        started = not self.current_playlist   # then the first song starts playing instead of queueing
         for t in tracks:
             if self._norm_path(t.filepath) == playing:
                 continue
             self.queue_track(t, play_next=False, refresh=False)
             added += 1
+        if started:
+            added -= 1
         self.display_playlist()
         self.status_label.config(text=f"Added {added} songs to Up Next")
 
@@ -3942,7 +3948,7 @@ class MusicPlayerGUI:
                 rest = albums[i + 1:]
 
                 def done():
-                    if self._play_context == context:
+                    if self._play_context is context:   # same pick (a re-pick starts its own chain)
                         self._prepare_next()
                         self._measure_context(rest)
 
@@ -4001,12 +4007,14 @@ class MusicPlayerGUI:
         self._search_job = None
         if self._albums_tab_showing():
             self._filter_albums()
-        else:
+        elif self.search_var.get().lower().strip() != self._playlist_query:
+            # a tab switch with the same text doesn't redraw the whole playlist
             self.filter_playlist()
     
     def filter_playlist(self):
         """Filter playlist based on search query - searches active playlist/view"""
         query = self.search_var.get().lower().strip()
+        self._playlist_query = query
 
         if not query:
             self.filtered_playlist = []
@@ -4303,7 +4311,8 @@ class MusicPlayerGUI:
 
     def _on_albums_key(self, event):
         """Type-to-jump: typed letters jump to the next artist whose name starts with them."""
-        if event.state & 0x4 or event.state & 0x20000:   # Ctrl or Alt: leave shortcuts alone
+        ctrl, alt = bool(event.state & 0x4), bool(event.state & 0x20000)
+        if ctrl != alt:   # Ctrl or Alt alone: leave shortcuts alone (both = AltGr, a typed letter)
             return None
         ch = event.char
         if not ch or not ch.isprintable() or (ch == ' ' and not self._type_jump):
