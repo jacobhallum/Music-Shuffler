@@ -49,9 +49,14 @@ class AlbumsBrowser:
         self.refresh()
 
     def refresh(self):
-        """The library index changed: rebuild the tree, keeping the search text."""
+        """The library index changed: rebuild the tree, keeping the search text (quietly when there is none)."""
         self._albums_query = None
-        self.filter(self._get_query())
+        query = (self._get_query() or '').strip()
+        if query:
+            self.filter(query)
+        else:
+            self._fill_albums_tree(None)
+            self._albums_query = ''
 
     def filter(self, query):
         q = (query or '').strip()

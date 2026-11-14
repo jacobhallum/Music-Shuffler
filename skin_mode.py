@@ -34,7 +34,23 @@ DEFAULTS = {'skin': None, 'double_size': False, 'always_on_top': False, 'vis_mod
             'eq_open': True, 'pl_open': True, 'positions': {}, 'pl_height': 232}
 
 
+def _log(text):
+    """print, but never raise (a console that can't show ⚠ must not break the skin)."""
+    try:
+        print(text)
+    except Exception:
+        try:
+            print(text.encode('ascii', 'replace').decode('ascii'))
+        except Exception:
+            pass
+
+
+def _is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
 def load_settings(path):
+    """ui_settings.json, with every value checked: anything odd falls back to its default."""
     try:
         with open(path, encoding='utf-8') as f:
             data = json.load(f)
@@ -42,13 +58,45 @@ def load_settings(path):
         data = {}
     out = dict(DEFAULTS)
     out['positions'] = {}
-    if isinstance(data, dict):
-        for k in DEFAULTS:
-            if k in data and isinstance(data[k], type(DEFAULTS[k]) if DEFAULTS[k] is not None else (str, type(None))):
-                out[k] = data[k]
-    if out['vis_mode'] not in VIS_MODES:
-        out['vis_mode'] = 'spectrum'
+    if not isinstance(data, dict):
+        return out
+    name = data.get('skin')
+    if isinstance(name, str) and name.lower().endswith('.wsz') and os.path.basename(name) == name \
+            and '/' not in name and '\\' not in name:
+        out['skin'] = name
+    for k in ('double_size', 'always_on_top', 'eq_open', 'pl_open'):
+        if isinstance(data.get(k), bool):
+            out[k] = data[k]
+    if data.get('vis_mode') in VIS_MODES:
+        out['vis_mode'] = data['vis_mode']
+    if _is_int(data.get('pl_height')):
+        out['pl_height'] = min(max(data['pl_height'], 116), 2000)
+    positions = data.get('positions')
+    if isinstance(positions, dict):
+        for k in ('main', 'eq', 'pl', 'albums'):
+            v = positions.get(k)
+            if isinstance(v, list) and len(v) == 2 and all(_is_int(n) for n in v):
+                out['positions'][k] = list(v)
     return out
+
+
+def virtual_screen(win):
+    """(x, y, w, h) of the whole desktop across monitors (Windows), else the primary screen."""
+    try:
+        m = ctypes.windll.user32.GetSystemMetrics
+        x, y, w, h = m(76), m(77), m(78), m(79)   # SM_XVIRTUALSCREEN .. SM_CYVIRTUALSCREEN
+        if w > 0 and h > 0:
+            return x, y, w, h
+    except AttributeError:
+        pass
+    return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
+
+
+def on_screen(pos, screen, margin=40):
+    """True when a saved top-left corner still leaves the window reachable on the desktop."""
+    x, y = pos
+    sx, sy, sw, sh = screen
+    return sx - 200 <= x <= sx + sw - margin and sy <= y <= sy + sh - margin
 
 
 def save_settings(path, settings):
@@ -72,7 +120,7 @@ def set_app_window(win):
         win.withdraw()
         win.after(10, win.deiconify)
     except Exception as e:
-        print(f"⚠ Could not give the skinned window a taskbar button: {e}")
+        _log(f"⚠ Could not give the skinned window a taskbar button: {e}")
 
 
 def minimize_window(win):
@@ -131,7 +179,9 @@ class SkinController:
         self.skin = None
         self.main = self.eq = self.pl = self.albums = None
         self._chunks = collections.deque(maxlen=4)
-        self._jobs = []
+        self._jobs = {}               # loop name -> its pending after() id
+        self._map_bind = None
+        self._albums_browser = None
         self._last_status = None
         self._last_icon = None
         self._last_rows = None
@@ -160,12 +210,16 @@ class SkinController:
             self.p.status_label.config(text=f"Skin {name} is missing from the skins folder - default view")
             return
         try:
-            self.enter(skin_lib.load_skin(path))
+            loaded = skin_lib.load_skin(path)
         except skin_lib.SkinError as e:
             self.p.status_label.config(text=f"Couldn't load skin {name}: {e} - default view")
+            return
+        error = self.enter(loaded)
+        if error:
+            self.p.status_label.config(text=f"Couldn't show skin {name}: {error} - default view")
 
     def pick(self, name):
-        """Menu: a skin file name, or None for the default view."""
+        """Menu: a skin file name, or None for the default view. A skin that fails keeps what was showing."""
         if name is None:
             self.settings['skin'] = None
             self.save()
@@ -176,12 +230,20 @@ class SkinController:
         except skin_lib.SkinError as e:
             messagebox.showwarning("Skin", f"Couldn't load {name}: {e}")
             return
-        self.settings['skin'] = name
-        self.save()
-        if self.active:
+        old = self.skin if self.active else None
+        if old is not None:
             self._remember_positions()
             self._close_windows()
-        self.enter(loaded)
+        error = self.enter(loaded)
+        if not error:
+            self.settings['skin'] = name
+            self.save()
+            return
+        messagebox.showwarning("Skin", f"Couldn't show {name}: {error}")
+        if old is not None and not self.enter(old):
+            return                                   # back on the previous skin, its name still saved
+        self.settings['skin'] = None
+        self.save()
 
     def open_folder(self):
         os.makedirs(self.skins_dir, exist_ok=True)
@@ -207,10 +269,34 @@ class SkinController:
     # ---- entering and leaving --------------------------------------------------------
 
     def enter(self, loaded):
+        """Show the skinned windows. Returns None, or a reason when it failed - then the default view is back
+        and nothing is left half-built."""
+        try:
+            self._enter(loaded)
+            return None
+        except Exception as e:
+            _log(f"⚠ Could not show skin {getattr(loaded, 'name', '?')}: {e!r}")
+            self._close_windows()
+            self.skin = None
+            p = self.p
+            if p._engine is not None:
+                p._engine.vis_tap = None
+            try:
+                p.apply_theme()
+            except Exception:
+                pass
+            p.root.deiconify()
+            return f"{e.__class__.__name__}: {e}"
+
+    def _enter(self, loaded):
         self.skin = loaded
         p, s = self.p, self.scale()
         self._apply_ttk_colors()
+        screen = virtual_screen(p.root)
         pos = self.settings['positions']
+        for k in list(pos):
+            if not on_screen(pos[k], screen):    # e.g. a monitor that is gone: start from the default spot
+                del pos[k]
         mx, my = pos.get('main', (200, 200))
         self.main = SkinMainWindow(p.root, loaded, s, self._main_callbacks())
         self.main.title("Music Player V2 (skin)")
@@ -222,7 +308,8 @@ class SkinController:
             self._open_pl()
         self._apply_topmost()
         p.root.withdraw()
-        p.root.bind('<Map>', self._on_root_mapped, add='+')
+        if self._map_bind is None:
+            self._map_bind = p.root.bind('<Map>', self._on_root_mapped, add='+')
         set_app_window(self.main)
         if p._engine is not None:
             p._engine.vis_tap = self._chunks.append
@@ -246,7 +333,7 @@ class SkinController:
         p.root.lift()
 
     def _close_windows(self):
-        for job in self._jobs:
+        for job in self._jobs.values():
             try:
                 self.p.root.after_cancel(job)
             except (tk.TclError, ValueError):
@@ -255,8 +342,6 @@ class SkinController:
         for name in ('albums', 'pl', 'eq', 'main'):
             w = getattr(self, name)
             if w is not None:
-                if name == 'albums' and w in getattr(self.p, '_album_browsers', []):
-                    pass
                 try:
                     w.destroy()
                 except tk.TclError:
@@ -265,13 +350,15 @@ class SkinController:
         browsers = getattr(self.p, '_album_browsers', None)
         if browsers is not None:
             self.p._album_browsers = [b for b in browsers if b is self.p.albums_browser]
+        self._albums_browser = None
         self._last_rows = None
+        self._main_pos = None
 
     def save(self):
         try:
             save_settings(self.settings_path, self.settings)
         except OSError as e:
-            print(f"⚠ Could not save ui_settings.json: {e}")
+            _log(f"⚠ Could not save ui_settings.json: {e}")
 
     def on_app_close(self):
         if self.active:
@@ -304,11 +391,20 @@ class SkinController:
         self.main.focus_force()
 
     def _schedule(self, ms, fn):
+        """Run fn every ms while skinned; one failing tick is logged and the loop keeps going."""
+        name = fn.__name__
+
         def run():
-            if self.active:
+            if not self.active:
+                return
+            try:
                 fn()
-                self._jobs.append(self.p.root.after(ms, run))
-        self._jobs.append(self.p.root.after(ms, run))
+            except Exception as e:
+                _log(f"⚠ Skin {name} failed: {e!r}")
+            finally:
+                if self.active:
+                    self._jobs[name] = self.p.root.after(ms, run)
+        self._jobs[name] = self.p.root.after(ms, run)
 
     def _apply_ttk_colors(self):
         c = self.skin.pledit
@@ -673,10 +769,8 @@ class SkinController:
         others = [self._rect(w) for w in self._windows() if w is not win]
         screen = (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
         x, y = skin_math.snap(self._rect(win), others, screen)
-        win.geometry(f'+{x}+{y}')
+        win.geometry(f'+{x}+{y}')     # for the main window, <Configure> then moves the docked ones too
         self.settings['positions'][name] = [x, y]
-        if win is self.main:
-            self._main_pos = (x, y)
         self.save()
 
     def _on_main_configure(self, event):

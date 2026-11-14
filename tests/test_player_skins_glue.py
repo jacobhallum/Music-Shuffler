@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -150,6 +151,69 @@ class SkinControllerTests(unittest.TestCase):
             f.write('{"skin": 5, "double_size": "yes", "vis_mode": "laser"}')
         s = skin_mode.load_settings(self.c.settings_path)
         self.assertEqual((s['skin'], s['double_size'], s['vis_mode']), (None, False, 'spectrum'))
+        bad = {'skin': '..\\..\\evil.wsz', 'pl_height': True,
+               'positions': {'main': [1, 2], 'eq': 'x', 'pl': [1, 2, 3], 'albums': [True, 4]}}
+        with open(self.c.settings_path, 'w', encoding='utf-8') as f:
+            json.dump(bad, f)
+        s = skin_mode.load_settings(self.c.settings_path)
+        self.assertEqual((s['skin'], s['pl_height'], s['positions']), (None, 232, {'main': [1, 2]}))
+        with open(self.c.settings_path, 'w', encoding='utf-8') as f:
+            json.dump({'pl_height': 99999}, f)
+        self.assertEqual(skin_mode.load_settings(self.c.settings_path)['pl_height'], 2000)
+
+    def test_offscreen_positions_start_from_the_default_spot(self):
+        self.c.settings['positions'] = {'main': [-99999, 50], 'eq': [300, 300]}
+        self.c.pick('syn.wsz')
+        self.assertNotIn('main', self.c.settings['positions'])
+        self.assertEqual(self.c.settings['positions'].get('eq'), [300, 300])
+
+    def test_a_skin_that_fails_to_show_brings_back_the_default_view(self):
+        real = skin_mode.SkinEqWindow
+
+        def broken(*a, **k):
+            raise ValueError('odd skin data')
+        skin_mode.SkinEqWindow = broken
+        self.addCleanup(setattr, skin_mode, 'SkinEqWindow', real)
+        with unittest.mock.patch.object(skin_mode.messagebox, 'showwarning'):
+            self.c.pick('syn.wsz')
+        _root.update()
+        self.assertFalse(self.c.active)
+        self.assertEqual(self.p.root.state(), 'normal')
+        self.assertIsNone(self.settings_file()['skin'])
+
+    def test_a_failing_switch_goes_back_to_the_previous_skin(self):
+        import shutil
+        shutil.copy(os.path.join(self.tmp.name, 'skins', 'syn.wsz'), os.path.join(self.tmp.name, 'skins', 'b.wsz'))
+        self.c.pick('syn.wsz')
+        real = skin_mode.SkinMainWindow
+
+        def picky(master, loaded, *a, **k):
+            if loaded.name == 'b.wsz':
+                raise tk.TclError('nope')
+            return real(master, loaded, *a, **k)
+        skin_mode.SkinMainWindow = picky
+        self.addCleanup(setattr, skin_mode, 'SkinMainWindow', real)
+        with unittest.mock.patch.object(skin_mode.messagebox, 'showwarning'):
+            self.c.pick('b.wsz')
+        self.assertTrue(self.c.active)
+        self.assertEqual(self.c.skin.name, 'syn.wsz')
+        self.assertEqual(self.settings_file()['skin'], 'syn.wsz')
+
+    def test_a_failing_tick_keeps_the_loop_alive(self):
+        self.c.pick('syn.wsz')
+        ticks = []
+
+        def flaky():
+            ticks.append(1)
+            raise RuntimeError('boom')
+        self.c._schedule(1, flaky)
+        for _ in range(30):
+            _root.update()
+            if len(ticks) >= 3:
+                break
+            _root.after(5)
+        self.assertGreaterEqual(len(ticks), 3)
+        self.assertEqual(len(self.c._jobs), 3)     # refresh, vis, flaky: one pending id each
 
 
 if __name__ == '__main__':

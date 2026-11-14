@@ -113,6 +113,13 @@ class SkinWindow(tk.Toplevel):
         if cb is not None:
             cb(*args)
 
+    def destroy(self):
+        # Drop the images here, on the Tk thread. Left to the garbage collector they could be freed on another
+        # thread, and freeing a PhotoImage calls into Tk.
+        self._photos.clear()
+        self._tag_photos.clear()
+        super().destroy()
+
     def _on_focus_in(self, event=None):
         self.focused = True
         self.redraw()

@@ -19,6 +19,7 @@ from skin_sprites import SPRITES
 
 FALLBACK_RGBA = (0, 0, 0, 0)   # pieces a skin doesn't have are see-through, so its background art shows
 EXTRA_SHEETS = ('text.bmp',)  # sheets read directly by the windows (the font), not via SPRITES
+MAX_SHEET_SIDE = 1024          # a sheet claiming to be bigger is ignored (real ones are at most ~450 px a side)
 TEXT_FILES = ('pledit.txt', 'viscolor.txt', 'region.txt')
 _SHEET_OF = {name: sheet for sheet, sprites in SPRITES.items() for name in sprites}
 
@@ -81,7 +82,7 @@ def _decode_rle8(data):
         off, hdr = struct.unpack_from('<II', data, 10)
         w, h, _planes, bpp, comp = struct.unpack_from('<iiHHI', data, 18)
         ncolors = struct.unpack_from('<I', data, 46)[0] or 256
-        if bpp != 8 or comp != 1 or not (0 < w <= 4096) or not (0 < abs(h) <= 4096):
+        if bpp != 8 or comp != 1 or not (0 < w <= MAX_SHEET_SIDE) or not (0 < abs(h) <= MAX_SHEET_SIDE):
             return None
         top_down, h = h < 0, abs(h)
         pal = data[14 + hdr:14 + hdr + 4 * min(ncolors, 256)]
@@ -129,6 +130,9 @@ def _open_bitmap(data):
         try:
             ImageFile.LOAD_TRUNCATED_IMAGES = truncated_ok
             img = Image.open(io.BytesIO(data))
+            w, h = img.size        # checked before any pixels are decoded: a tiny file can claim a huge image
+            if not (0 < w <= MAX_SHEET_SIDE and 0 < h <= MAX_SHEET_SIDE):
+                return None
             img.load()
             return img.convert('RGBA')
         except Exception:
@@ -145,12 +149,28 @@ def _read_text(z, members, name):
         return ''
     try:
         return z.read(member).decode('latin-1')
-    except (OSError, zipfile.BadZipFile, RuntimeError, ValueError):
+    except Exception:   # corrupt, encrypted or oddly compressed member: use the defaults
         return ''
 
 
+def _read_member(z, member):
+    try:
+        return z.read(member)
+    except Exception:   # CRC error, unsupported compression, encryption, ...: that sheet falls back
+        return None
+
+
 def load_skin(path):
-    """Load a .wsz file. Raises SkinError(reason) when it can't be used."""
+    """Load a .wsz file. Raises SkinError(reason) when it can't be used - never anything else."""
+    try:
+        return _load_skin(path)
+    except SkinError:
+        raise
+    except Exception as e:
+        raise SkinError(f"unreadable skin ({e.__class__.__name__})") from None
+
+
+def _load_skin(path):
     try:
         z = zipfile.ZipFile(path)
     except (zipfile.BadZipFile, OSError) as e:
@@ -164,7 +184,8 @@ def load_skin(path):
             member = members.get(sheet)
             if member is None:
                 continue
-            img = _open_bitmap(z.read(member))
+            data = _read_member(z, member)
+            img = _open_bitmap(data) if data is not None else None
             if img is not None:
                 sheets[sheet] = img
         if 'main.bmp' not in sheets:

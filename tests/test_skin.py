@@ -93,6 +93,22 @@ class SkinLoadTests(unittest.TestCase):
                                      'pledit.txt': 'Normal=#112233\n' + ' ' * (5 * 1024 * 1024)}))
         self.assertEqual(s.pledit['normal'], '#00ff00')
 
+    def test_corrupt_member_and_huge_claimed_bitmap_fall_back(self):
+        path = self.wsz({'main.bmp': bmp((275, 116), (5, 5, 5)), 'cbuttons.bmp': bmp((136, 36), (9, 9, 9))})
+        with open(path, 'r+b') as f:                      # flip a byte inside cbuttons.bmp's data: CRC error
+            data = f.read()
+            at = data.index(b'cbuttons.bmp') + 60
+            f.seek(at)
+            f.write(bytes([data[at] ^ 0xFF]))
+        s = skin.load_skin(path)
+        self.assertFalse(s.has('cbuttons.bmp'))
+        self.assertTrue(s.has('main.bmp'))
+        huge = bytearray(bmp((2, 2), (1, 1, 1)))
+        huge[18:26] = (5000).to_bytes(4, 'little') + (5000).to_bytes(4, 'little')   # claims 5000x5000
+        self.assertIsNone(skin._open_bitmap(bytes(huge)))
+        with self.assertRaises(skin.SkinError):
+            skin.load_skin(self.wsz({'main.bmp': bytes(huge)}, name='huge.wsz'))
+
     def test_list_skins(self):
         for n in ('b.WSZ', 'a.wsz', 'notes.txt'):
             open(os.path.join(self.tmp.name, n), 'w').close()

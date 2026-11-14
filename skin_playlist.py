@@ -63,6 +63,12 @@ class SkinPlaylistWindow(tk.Toplevel):
             self.focused = focused
             self.redraw()
 
+    def destroy(self):
+        # Drop the images on the Tk thread; freed later by the garbage collector on another thread they would
+        # call into Tk from there.
+        self._photos.clear()
+        super().destroy()
+
     def _blit(self, img, x, y):
         photo = ImageTk.PhotoImage(self.skin.scaled(img, self.scale), master=self.canvas)
         self._photos.append(photo)
