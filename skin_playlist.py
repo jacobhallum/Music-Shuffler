@@ -64,7 +64,7 @@ class SkinPlaylistWindow(tk.Toplevel):
             self.redraw()
 
     def _blit(self, img, x, y):
-        photo = ImageTk.PhotoImage(self.skin.scaled(img, self.scale))
+        photo = ImageTk.PhotoImage(self.skin.scaled(img, self.scale), master=self.canvas)
         self._photos.append(photo)
         self.canvas.create_image(x * self.scale, y * self.scale, anchor='nw', image=photo, tags=('frame',))
 

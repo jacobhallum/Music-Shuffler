@@ -79,7 +79,7 @@ class SkinWindow(tk.Toplevel):
         self.bind('<Button-3>', self._on_right_click)
 
     def blit(self, img, x, y, tag=None):
-        photo = ImageTk.PhotoImage(self.skin.scaled(img, self.scale))
+        photo = ImageTk.PhotoImage(self.skin.scaled(img, self.scale), master=self.canvas)
         self._photos.append(photo)
         if tag is not None:
             self._tag_photos.setdefault(tag, []).append(photo)
