@@ -98,6 +98,11 @@ class LoudnessService:
             self.flush()
         return result
 
+    def forget_failures(self):
+        """Let songs that failed to analyse be tried again (e.g. FFmpeg was missing and is now set)."""
+        with self._lock:
+            self._bad.clear()
+
     def start_background(self, paths):
         with self._lock:
             self._queue = deque(paths)

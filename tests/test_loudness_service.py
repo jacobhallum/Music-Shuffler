@@ -96,6 +96,18 @@ class LoudnessServiceTests(unittest.TestCase):
         self.assertTrue(s.known_bad(self.files[1]))
         s.stop()
 
+    def test_forget_failures_allows_a_retry(self):
+        # e.g. FFmpeg was missing at startup and every song failed; the user then set its path
+        f = _Counter(fail={'b.mp3'})
+        s = self._svc(f)
+        self.assertIsNone(s.analyze_now(self.files[1]))
+        s.forget_failures()
+        self.assertFalse(s.known_bad(self.files[1]))
+        f.fail.clear()
+        self.assertIsNotNone(s.analyze_now(self.files[1]))
+        self.assertEqual(len(f.calls), 2)
+        s.stop()
+
     def test_background_scan_counts_and_skips_cached(self):
         f = _Counter()
         s = self._svc(f)
