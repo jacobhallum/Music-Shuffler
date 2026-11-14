@@ -111,6 +111,22 @@ def leveling_gain_db(integrated_lufs: float, true_peak_dbtp: float, *,
     return round(min(target - integrated_lufs, ceiling - true_peak_dbtp), 1)
 
 
+def album_gain_db(songs, *, target: float = TARGET_LUFS,
+                  ceiling: float = PEAK_CEILING_DBTP) -> float:
+    """Duration-weighted energy mean gain for a whole album, silence left
+    out, so the album keeps its own quiet and loud songs."""
+    kept = [s for s in songs
+            if s.integrated_lufs > SILENCE_LUFS and s.duration_sec > 0]
+    if not kept:
+        return 0.0
+    total_energy = sum(s.duration_sec * 10 ** (s.integrated_lufs / 10)
+                       for s in kept)
+    total_duration = sum(s.duration_sec for s in kept)
+    l = 10 * math.log10(total_energy / total_duration)
+    peak = max(s.true_peak_dbtp for s in kept)
+    return leveling_gain_db(l, peak, target=target, ceiling=ceiling)
+
+
 def cache_key(path: str, size: int, mtime: float) -> str:
     """Stable cache key: normalised path + size + whole-second mtime."""
     return (os.path.normcase(os.path.normpath(path or ""))

@@ -76,6 +76,39 @@ class MakeRecordTests(unittest.TestCase):
             make_record(**_base_record(transition='fade'))
 
 
+class ContextFieldTests(unittest.TestCase):
+    """make_record stores an optional 'ctx' key after 'tr'."""
+
+    def test_no_ctx_means_no_ctx_key(self):
+        rec = make_record(**_base_record())
+        self.assertNotIn('ctx', rec)
+
+    def test_album_ctx_stored_after_tr(self):
+        rec = make_record(**_base_record(ctx='album'))
+        self.assertEqual(rec['ctx'], 'album')
+        keys = list(rec.keys())
+        self.assertEqual(keys.index('ctx'), keys.index('tr') + 1)
+
+    def test_artist_ctx_stored(self):
+        rec = make_record(**_base_record(ctx='artist'))
+        self.assertEqual(rec['ctx'], 'artist')
+
+    def test_unknown_ctx_raises(self):
+        with self.assertRaises(ValueError):
+            make_record(**_base_record(ctx='shuffle'))
+        with self.assertRaises(ValueError):
+            make_record(**_base_record(ctx=''))
+
+    def test_ctx_record_survives_append_and_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_path = os.path.join(tmp, 'listening.jsonl')
+            rec = make_record(**_base_record(ctx='album'))
+            append(log_path, rec)
+            records = read(log_path)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['ctx'], 'album')
+
+
 class AppendReadTests(unittest.TestCase):
     """append writes one JSON line per record; read returns them in order."""
 

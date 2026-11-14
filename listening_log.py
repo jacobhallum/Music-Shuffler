@@ -23,6 +23,9 @@ REASONS = ('natural_end', 'next', 'previous', 'select', 'stop', 'failure')
 # how the next track started after this one
 TRANSITIONS = ('cut', 'gapless', 'crossfade', 'smart')
 
+# what the song belongs to (which queue/list it came from)
+CONTEXTS = ('album', 'artist')
+
 
 def _seconds(x):
     """Round to 0.1 s; None, NaN, inf or a non-number become 0.0 so the line stays valid JSON."""
@@ -35,13 +38,15 @@ def _seconds(x):
 
 def make_record(*, started_at, ended_at, path, title, artist, album, genre,
                 duration_sec, audible_sec, reason, qualified, skip,
-                transition):
+                transition, ctx=None):
     """Build one log record dict with fixed keys and normalised values."""
     if reason not in REASONS:
         raise ValueError(f"unknown reason: {reason!r}")
     if transition not in TRANSITIONS:
         raise ValueError(f"unknown transition: {transition!r}")
-    return {
+    if ctx is not None and ctx not in CONTEXTS:
+        raise ValueError(f"unknown ctx: {ctx!r}")
+    record = {
         'v':      VERSION,
         'start':  int(started_at),
         'end':    int(ended_at),
@@ -57,6 +62,9 @@ def make_record(*, started_at, ended_at, path, title, artist, album, genre,
         'skip':   bool(skip),
         'tr':     transition,
     }
+    if ctx is not None:
+        record['ctx'] = ctx
+    return record
 
 
 def append(path, record):

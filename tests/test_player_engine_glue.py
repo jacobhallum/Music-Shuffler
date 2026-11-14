@@ -278,6 +278,8 @@ class LevelingGlueTests(unittest.TestCase):
 
         class P:
             _filters_for = MusicPlayerGUI._filters_for
+            _album_gain_for = MusicPlayerGUI._album_gain_for
+            _context_album_for = MusicPlayerGUI._context_album_for
 
         p = P()
         p.audio_settings = {'eq_enabled': False, 'eq_bands_db': [0.0] * 10, 'eq_preamp_db': 0.0,

@@ -202,6 +202,8 @@ class _FakeFeedbackPlayer:
     """Minimal surface for the Task 8 finalize/start helpers."""
     _start_playback_tracking = MusicPlayerGUI._start_playback_tracking
     _finalize_playback = MusicPlayerGUI._finalize_playback
+    _context_kind_for = MusicPlayerGUI._context_kind_for
+    _context_album_for = MusicPlayerGUI._context_album_for
 
     def __init__(self):
         self._pb_tracker = None
