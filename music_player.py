@@ -4888,9 +4888,12 @@ class MusicPlayerGUI:
             try:
                 if records is not None:
                     recs = records
-                else:   # a line with a nonsense start (Windows can't localize times near 1970) is skipped
+                else:   # a corrupt line (nonsense start or heard) is skipped instead of breaking the window
+                    latest = time.time() + 86400
                     recs = [r for r in listening_log.read(log_path)
-                            if isinstance(r.get('start'), (int, float)) and r['start'] >= STATS_MIN_START]
+                            if isinstance(r.get('start'), (int, float))
+                            and STATS_MIN_START <= r['start'] <= latest
+                            and isinstance(r.get('heard', 0), (int, float))]
                 result = self._stats_compute(recs, tracks, places, period, time.time())
             except Exception as e:
                 print(f"⚠ Listening stats failed: {e}")

@@ -211,7 +211,9 @@ class StatsGlueTests(unittest.TestCase):
         self.assertEqual(_Window.made[0].shown[0][0], 'January 2025')
 
     def test_a_log_line_with_a_bad_start_is_skipped(self):
-        listening_log.append(self.log, dict(listening_log.read(self.log)[0], start=5))
+        good = listening_log.read(self.log)[0]
+        for bad in (dict(good, start=5), dict(good, start=10 ** 12), dict(good, heard='lots')):
+            listening_log.append(self.log, bad)
         self.p.open_stats_window()
         self.p.run_posted()
         label, stats, months, *_ = _Window.made[0].shown[0]
