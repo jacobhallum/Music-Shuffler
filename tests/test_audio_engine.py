@@ -257,6 +257,24 @@ class AudioEngineTests(unittest.TestCase):
         self.assertEqual(r.eng.current().path, '/b')
         self.assertAlmostEqual(r.eng.position(), 0.5, places=6)
 
+    def test_visualizer_tap_does_not_change_engine_output(self):
+        def run(tap):
+            r = Rig({'/a': 200, '/b': 180})
+            r.eng.vis_tap = tap
+            r.eng.play(item('/a', 200))
+            r.eng.prepare_next(item('/b', 180), overlap(194.0, 6.0, end=200.0))
+            r.run_to(201.0)
+            return r.a.played, r.b.played, r.a.log, r.b.log, r.ev()
+
+        seen = []
+        self.assertEqual(run(None), run(seen.append))
+        self.assertTrue(seen)
+        self.assertTrue(all(isinstance(c, bytes) for c in seen))
+
+        def broken(chunk):
+            raise RuntimeError('vis bug')
+        self.assertEqual(run(None), run(broken))   # a failing visualizer never breaks playback
+
     def test_crossfade_ramps_and_finishes(self):
         r = Rig({'/a': 200, '/b': 180})
         r.eng.play(item('/a', 200))
