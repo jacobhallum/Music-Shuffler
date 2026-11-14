@@ -10,8 +10,8 @@ V2 CHANGES (2025-01):
 
 FEATURES:
 - Smart Shuffle v2 with novelty curve fix (0-play tracks = 0.5, not 1.0)
-- Background .m4a pre-conversion (iTunes Media folder)
-- Media keys: F9-F11 global (volume), F5-F8 + hardware dial foreground-only (via fnlock/WM_APPCOMMAND)
+- Sound engine: FFmpeg decodes every format; crossfade/smart transitions, 10-band EQ, loudness leveling, gapless
+- Media keys: F9-F11 global (volume); F5-F8 + hardware dial arrive as WM_APPCOMMAND from fnlock, even unfocused
 - Search & filter (8K+ library)
 - Up Next queue system
 - Album artwork display
@@ -27,6 +27,15 @@ from collections import deque
 from shuffle_core import CustomShuffleAlgorithm
 import playlist_queue
 import appcommand
+import audio_settings
+import listening_log
+import transitions
+from audio_engine import AudioEngine, PlayItem
+from audio_backend import FfmpegDecoder, PygameChannel
+from eq import BUILTIN_PRESETS, filter_chain, parse_eqf
+from sound_ui import EqualizerWindow, SoundDialog
+from loudness import leveling_gain_db
+from loudness_service import LoudnessService
 from icon_utils import make_icon_images
 from mutagen import File as MutagenFile
 from mutagen.mp3 import MP3
@@ -63,6 +72,7 @@ VOLUME_SYNC_INTERVAL_SEC = 2.0  # How often to sync volume slider with system
 METADATA_SAVE_DEBOUNCE_SEC = 0.1  # Debounce delay for metadata saves
 HISTORY_SAVE_DEBOUNCE_MS = 4000  # Debounce delay for listening-history saves
 SEARCH_DEBOUNCE_MS = 100  # Debounce delay for search filtering
+MAIN_CALLS_POLL_MS = 20  # How often the main thread runs callbacks posted by worker threads
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
 ICON_SIZES = (16, 32, 48, 64, 128, 256)  # Window/taskbar icon sizes to generate
 
@@ -642,6 +652,12 @@ class MusicPlayerGUI:
         # Favorites store: sibling of the cache dir, NOT inside it, so
         # "Clear Cache" cannot destroy the shuffle taste signal (Task 7c).
         self.preferences_file = cache_dir.parent / "shuffler_preferences.json"
+        # Sound engine: settings and the listening log sit beside the cache dir so Clear Cache keeps them;
+        # the loudness cache can be rebuilt, so it lives inside the cache dir.
+        self.audio_settings_file = cache_dir.parent / "audio_settings.json"
+        self.listening_log_file = cache_dir.parent / "listening_log.jsonl"
+        self.loudness_cache_file = cache_dir / "loudness_cache.json"
+        self.audio_settings = audio_settings.load(str(self.audio_settings_file))
         print(f"Cache directory: {cache_dir}")
 
         # Persisted ordered listening history (Task 3) - survives restarts so
@@ -671,7 +687,8 @@ class MusicPlayerGUI:
         # Convert cache directory
         self.convert_cache_dir = cache_dir / "convert_cache"
         try:
-            self.convert_cache_dir.mkdir(parents=True, exist_ok=True)
+            # The old M4A->MP3 cache is retired (the sound engine plays M4A directly); it is no longer
+            # created, only leftover temp files are cleaned up. Settings > Delete Old MP3 Cache removes it.
             
             # Cleanup orphaned temp files from crashed conversions
             # Format: {hash}.{pid}.{thread_id}.mp3
@@ -693,15 +710,6 @@ class MusicPlayerGUI:
         # Locate FFmpeg
         self.ffmpeg_path = self.locate_ffmpeg()
         
-        # Background pre-conversion (m4a -> mp3 cache)
-        self._preconv_q = queue.Queue()
-        self._preconv_stop = threading.Event()
-        self._preconv_thread = None
-        self._preconv_token = 0  # Token-based cancellation
-        self._preconv_total = 0
-        self._preconv_done = 0
-        self._preconv_failed = 0
-        
         # Metadata save worker (single background thread to avoid thread spam)
         self._metadata_save_queue = queue.Queue()
         self._metadata_save_stop = threading.Event()
@@ -716,13 +724,36 @@ class MusicPlayerGUI:
         self._pb_seq = 0
         self.audio_available = False
         
-        # Playback position tracking
-        self._seek_base_sec = 0.0
-        self._segment_start_mono = None
         
-        # Initialize pygame mixer for audio playback
+        # Sound engine: FFmpeg decodes every song into float32 48 kHz chunks that play on two reserved
+        # pygame channels (audio_engine.py). Transitions, EQ and leveling ride on this path.
+        self._engine = None
+        self._engine_item = None
+        self._engine_thread = None
+        self._engine_lock = threading.RLock()
+        self._engine_stop = threading.Event()
+        # Next-song preparation and crossfade bookkeeping (plan Task 10)
+        self._next_item = None       # PlayItem prepared to follow the current song
+        self._next_tr = 'cut'        # how it will follow: gapless | crossfade | smart
+        self._outgoing_item = None   # during an overlap: the song fading out
+        self._outgoing_tr = 'cut'
+        self._pb_outgoing = None     # (tracker, track) of the outgoing song until its audio stops
+        self._sound_apply_job = None  # debounce for Sound/Equalizer window changes
+        # Worker threads (sound engine, loudness) post zero-arg callables here; the main thread drains
+        # it. The engine thread emits while holding _engine_lock, so it must never wait on Tk.
+        self._main_calls = queue.SimpleQueue()
+        self._main_calls_job = None
+        self._play_token = 0          # bumped by every pick/Stop/Pause: a stale pending start is dropped
+        self._start_pending = False   # a picked song is waiting for its loudness before it starts
+        self._sound_dialog = None
+        self._eq_window = None
         try:
-            pygame.mixer.init()
+            pygame.mixer.init(frequency=48000, size=32, channels=2, buffer=2048)
+            pygame.mixer.set_reserved(2)
+            self._engine = AudioEngine(
+                time.monotonic,
+                (PygameChannel(pygame.mixer.Channel(0)), PygameChannel(pygame.mixer.Channel(1))),
+                self._open_decoder, self._engine_emit)
             self.audio_available = True
         except Exception as e:
             print(f"⚠ Audio initialization failed: {e}")
@@ -740,6 +771,11 @@ class MusicPlayerGUI:
         self.setup_keyboard_shortcuts()
         self._set_dark_title_bar()
         self.check_ffmpeg()
+        # Loudness analysis (leveling + smart transitions); its cache loads off the main thread.
+        self._loudness = LoudnessService(self.ffmpeg_path or "ffmpeg", str(self.loudness_cache_file)) \
+            if self._engine is not None else None
+        self._drain_main_calls()
+        self._start_engine_loop()
         
         # V2: Load unified player metadata
         self._load_player_metadata()
@@ -808,6 +844,8 @@ class MusicPlayerGUI:
         settings_menu.add_command(label="Library Info", command=self.show_library_info)
         settings_menu.add_separator()
         settings_menu.add_command(label="Shuffle Settings", command=self.edit_shuffle_settings)
+        settings_menu.add_command(label="Sound…", command=self.open_sound_dialog)
+        settings_menu.add_command(label="Equalizer…", command=self.open_equalizer)
         settings_menu.add_command(label="Import iTunes Ratings as Favorites…", command=self.migrate_ratings_to_favorites)
         settings_menu.add_separator()
         settings_menu.add_command(label="Toggle Dark/Light Mode", command=self.toggle_theme)
@@ -818,6 +856,7 @@ class MusicPlayerGUI:
         settings_menu.add_separator()
         settings_menu.add_command(label="Set FFmpeg Path", command=self.set_ffmpeg_path)
         settings_menu.add_command(label="Clear Cache", command=self.clear_cache)
+        settings_menu.add_command(label="Delete Old MP3 Cache…", command=self.delete_old_mp3_cache)
         settings_menu.add_command(label="Clear Metadata (Reset All)", command=self.clear_metadata)
         settings_menu.add_separator()
         settings_menu.add_command(label="Show Library Diagnostics", command=self.show_diagnostics)
@@ -945,14 +984,16 @@ class MusicPlayerGUI:
                                        orient=tk.HORIZONTAL, length=180,
                                        command=self.on_volume_change)
         self.volume_slider.grid(row=0, column=6, padx=5)
+        ttk.Button(self.transport_frame, text="EQ", width=4,
+                   command=self.open_equalizer).grid(row=0, column=7, padx=(0, 5))
         
         # Set initial volume
         if self.volume_interface:
             # System volume control available
             self.set_system_volume(current_volume)
-        elif self.audio_available:
-            # Fallback to pygame volume
-            pygame.mixer.music.set_volume(current_volume / 100.0)
+        elif self.audio_available and self._engine is not None:
+            # No Windows volume control: the engine's master volume is the fallback
+            self._engine.set_master_volume(current_volume / 100.0)
         
         self.transport_frame.place_forget()
         self._transport_hide_job = None
@@ -1839,39 +1880,21 @@ class MusicPlayerGUI:
     
     def toggle_play_pause(self):
         """Toggle between play and pause"""
-        if not self.audio_available:
+        if not self.audio_available or not self.current_playlist:
             return
-        
-        if not self.current_playlist:
-            return
-        
         if self.is_playing:
-            # Capture current position before pausing
-            if self._segment_start_mono is not None:
-                elapsed = time.monotonic() - self._segment_start_mono
-                self._seek_base_sec = self._seek_base_sec + elapsed
-            
-            pygame.mixer.music.pause()
-            self.is_playing = False
-            self._playback_state = 'paused'
-            if self._pb_tracker:
-                self._pb_tracker.pause(time.monotonic())
+            self.pause()
             print("Paused")
+            return
+        with self._engine_lock:
+            has_song = self._engine.current() is not None
+        if has_song:
+            self._resume_engine()
+            print("Unpaused")
         else:
-            # Reset segment start time when unpausing
-            self._segment_start_mono = time.monotonic()
+            self.play_track_at_index(self.current_index)
+            print("Started playing")
 
-            pygame.mixer.music.unpause()
-            if pygame.mixer.music.get_busy():
-                self.is_playing = True
-                self._playback_state = 'playing'
-                if self._pb_tracker:
-                    self._pb_tracker.resume(time.monotonic())
-                print("Unpaused")
-            else:
-                self.play_track_at_index(self.current_index)
-                print("Started playing")
-    
     def on_progress_click(self, event):
         """Handle click on progress bar to seek"""
         if not self.audio_available or not self.current_playlist or self.current_index < 0:
@@ -1895,33 +1918,9 @@ class MusicPlayerGUI:
             target_pos = (percentage / 100.0) * track.duration
             
             try:
-                # pygame.mixer.music.set_pos() is unreliable with MP3/FLAC/M4A
-                # Better approach: reload and play from position
                 was_playing = self.is_playing
-                
-                # Determine playback path (converted M4A or original)
-                playback_path = track.filepath
-                if track.filepath.lower().endswith('.m4a'):
-                    # Use converted cache path
-                    cache_path = self._get_cache_path(track.filepath)
-                    if cache_path.exists():
-                        playback_path = str(cache_path)
-                    else:
-                        # Can't seek to uncached M4A - would block UI during conversion
-                        self.status_label.config(text="⚠ Cannot seek during M4A conversion")
-                        return
-                
-                # Reload the track
-                pygame.mixer.music.load(str(playback_path))
-                
-                # Play from target position (start parameter is in seconds)
-                pygame.mixer.music.play(start=target_pos)
-                if not was_playing:
-                    pygame.mixer.music.pause()
-                
-                # Update position tracking
-                self._seek_base_sec = float(target_pos)
-                self._segment_start_mono = time.monotonic()
+                with self._engine_lock:
+                    self._engine.seek(float(target_pos))
                 # Task 8: a seek settles audible time - the jumped interval is
                 # never credited as listening.
                 if self._pb_tracker:
@@ -1965,10 +1964,11 @@ class MusicPlayerGUI:
             if self.volume_interface:
                 system_set = self.set_system_volume(volume_percent)
             
-            # Always set pygame volume as backup/fallback
-            # This ensures volume control works even if system control fails mid-session
-            if self.audio_available:
-                pygame.mixer.music.set_volume(volume_percent / 100.0)
+            # The engine's master volume is the fallback only when Windows volume control failed;
+            # applying both would attenuate twice.
+            if self.audio_available and self._engine is not None:
+                with self._engine_lock:
+                    self._engine.set_master_volume(1.0 if system_set else volume_percent / 100.0)
             
             # Save preference
             try:
@@ -2442,245 +2442,18 @@ class MusicPlayerGUI:
         
         messagebox.showwarning(
             "FFmpeg Not Found",
-            "FFmpeg is required to play .m4a files.\n\n"
+            "FFmpeg is required for playback (it decodes every song).\n\n"
             "To fix:\n"
             "• Use Settings > Set FFmpeg Path to locate it manually\n"
             "• Or install: winget install FFmpeg\n"
             "• Then restart this app\n\n"
-            ".m4a files will be skipped until FFmpeg is configured."
+            "Playback is disabled until FFmpeg is configured."
         )
         return False
-    
-    def _convert_m4a(self, original_path):
-        """Convert .m4a to .mp3 using FFmpeg, cache the result (atomic write)"""
-        if not self.ffmpeg_path:
-            return None
-        
-        output_path = self._get_cache_path(original_path)
-        
-        if output_path.exists():
-            try:
-                original_mtime = os.path.getmtime(original_path)
-                cache_mtime = os.path.getmtime(output_path)
-                cache_size = output_path.stat().st_size
-                if original_mtime <= cache_mtime and cache_size > MIN_VALID_CACHE_SIZE:
-                    return str(output_path)
-                else:
-                    output_path.unlink(missing_ok=True)
-            except (OSError, IOError, ValueError):
-                # If anything goes weird, fall through to reconvert
-                try:
-                    output_path.unlink(missing_ok=True)
-                except (OSError, IOError):
-                    pass
-        
-        # Compute hash for temp filename
-        import hashlib
-        hash_key = hashlib.md5(str(original_path).encode()).hexdigest()
-        
-        # Write to unique temp file, then atomically rename
-        # Include PID and thread ID to prevent collisions between background/foreground conversion
-        # IMPORTANT: Use .mp3 extension so FFmpeg correctly infers output format
-        tmp_name = f"{hash_key}.{os.getpid()}.{threading.get_ident()}.mp3"
-        tmp_path = self.convert_cache_dir / tmp_name
-        
-        try:
-            subprocess.run(
-                [self.ffmpeg_path, "-y", "-i", original_path, "-c:a", "libmp3lame", "-q:a", "2", str(tmp_path)],
-                capture_output=True,
-                text=True,
-                encoding='utf-8',
-                errors='ignore',
-                check=True,
-                timeout=30
-            )
-            
-            # Verify output before renaming
-            if tmp_path.exists() and tmp_path.stat().st_size > MIN_VALID_CACHE_SIZE:
-                tmp_path.replace(output_path)  # Atomic on Windows when same volume
-                return str(output_path)
-            
-            # FFmpeg "succeeded" but no valid output
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except:
-                pass
-            return None
-            
-        except subprocess.CalledProcessError as e:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except (OSError, IOError):
-                pass  # File already deleted or inaccessible
-            
-            # Concise error for corrupted/DRM files
-            error_text = (e.stderr or "").lower()
-            if any(x in error_text for x in ['invalid band type', 'reserved bit', 'drm', 'prediction']):
-                print(f"⚠ Skipping corrupted/DRM file: {Path(original_path).name}")
-            else:
-                print(f"⚠ FFmpeg failed: {Path(original_path).name}")
-            return None
-        except subprocess.TimeoutExpired:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except (OSError, IOError):
-                pass  # File already deleted or inaccessible
-            print(f"⚠ FFmpeg conversion timeout for {original_path}")
-            return None
-        except Exception as e:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except (OSError, IOError):
-                pass  # File already deleted or inaccessible
-            print(f"⚠ Unexpected error converting {original_path}: {e}")
-            return None
-    
-    # Background Pre-Conversion Methods
     
     def _norm_path(self, p):
         """Normalize path for cross-platform comparison"""
         return os.path.normcase(os.path.normpath(p or ""))
-    
-    def _get_cache_path(self, original_path):
-        """Get the cache path for a converted M4A file"""
-        import hashlib
-        hash_key = hashlib.md5(str(original_path).encode()).hexdigest()
-        return self.convert_cache_dir / f"{hash_key}.mp3"
-    
-    def start_background_preconversion(self):
-        """
-        V2: Start background pre-conversion of iTunes library .m4a files.
-        Converts .m4a files from iTunes Media folder (not M4P Downloads).
-        """
-        if not self.ffmpeg_path:
-            return
-        
-        if not getattr(self, 'all_tracks', None):
-            return
-        
-        # Check disk space before starting conversion
-        if not self._check_disk_space(MIN_DISK_SPACE_PRECONV_MB):
-            print("⚠ Skipping pre-conversion due to low disk space")
-            return
-        
-        # Stop any existing worker
-        self.stop_background_preconversion()
-        
-        # V2: Filter by path - iTunes Media folder .m4a files only
-        m4a_tracks = [
-            t for t in self.all_tracks
-            if (getattr(t, 'filepath', '') or '').lower().endswith('.m4a')
-            and "itunes/itunes media" in getattr(t, 'filepath', '').lower().replace('\\', '/')
-            and "m4p downloads" not in getattr(t, 'filepath', '').lower()
-        ]
-        
-        if not m4a_tracks:
-            return
-        
-        # Filter out already-converted files to avoid redundant work
-        files_needing_conversion = []
-        for track in m4a_tracks:
-            output_path = self._get_cache_path(track.filepath)
-            
-            # Only queue if not cached or cache is stale
-            if not output_path.exists():
-                files_needing_conversion.append(track.filepath)
-            else:
-                try:
-                    original_mtime = os.path.getmtime(track.filepath)
-                    cache_mtime = os.path.getmtime(output_path)
-                    cache_size = output_path.stat().st_size
-                    if original_mtime > cache_mtime or cache_size < MIN_VALID_CACHE_SIZE:
-                        files_needing_conversion.append(track.filepath)
-                except (OSError, IOError, AttributeError):
-                    files_needing_conversion.append(track.filepath)
-        
-        if not files_needing_conversion:
-            print(f"✓ All {len(m4a_tracks)} iTunes .m4a files already converted")
-            return
-        
-        # Increment token to cancel any previous runs
-        self._preconv_token = getattr(self, '_preconv_token', 0) + 1
-        
-        self._preconv_total = len(files_needing_conversion)
-        self._preconv_done = 0
-        self._preconv_failed = 0
-        self._preconv_stop.clear()
-        
-        # Enqueue only files needing conversion
-        for filepath in files_needing_conversion:
-            self._preconv_q.put(filepath)
-        
-        # Start worker thread
-        self._preconv_thread = threading.Thread(target=self._preconvert_worker, daemon=True)
-        self._preconv_thread.start()
-        
-        already_cached = len(m4a_tracks) - len(files_needing_conversion)
-        print(f"🔄 Pre-converting {self._preconv_total} new .m4a files ({already_cached} already cached)...")
-    
-    def stop_background_preconversion(self):
-        """Stop background conversion and clear queue"""
-        self._preconv_stop.set()
-        
-        # Increment token to signal cancellation
-        self._preconv_token = getattr(self, '_preconv_token', 0) + 1
-        
-        # Drain queue
-        try:
-            while True:
-                self._preconv_q.get_nowait()
-                self._preconv_q.task_done()
-        except queue.Empty:
-            pass
-        
-        # Wait for thread to finish (with timeout)
-        if self._preconv_thread and self._preconv_thread.is_alive():
-            self._preconv_thread.join(timeout=2.0)
-    
-    def _preconvert_worker(self):
-        """Background thread that converts queued .m4a files to mp3 cache"""
-        my_token = getattr(self, '_preconv_token', 0)
-        
-        while not self._preconv_stop.is_set():
-            # Check if we've been cancelled via token
-            if getattr(self, '_preconv_token', 0) != my_token:
-                print("⏹ Pre-conversion cancelled (new scan started)")
-                return
-            
-            try:
-                original_path = self._preconv_q.get(timeout=0.25)
-            except queue.Empty:
-                break
-            
-            try:
-                # Call _convert_m4a - it handles cache checking and atomic writes
-                result = self._convert_m4a(original_path)
-                if result is None:
-                    self._preconv_failed += 1
-            except Exception as e:
-                print(f"⚠ Pre-conversion error for {os.path.basename(original_path)}: {e}")
-                self._preconv_failed += 1
-            finally:
-                self._preconv_done += 1
-                self._preconv_q.task_done()
-                
-                # Small yield to keep UI responsive
-                time.sleep(0.05)
-        
-        # Final status update (wrapped to prevent crash if window closes)
-        try:
-            self.root.after(0, self._finish_preconv_status)
-        except (RuntimeError, tk.TclError):
-            pass
-    
-    def _finish_preconv_status(self):
-        """Show completion status for pre-conversion (console only)"""
-        if self._preconv_total > 0:
-            success = self._preconv_done - self._preconv_failed
-            if self._preconv_failed > 0:
-                print(f"✓ iTunes library pre-conversion complete: {success}/{self._preconv_total} cached, {self._preconv_failed} failed")
-            else:
-                print(f"✓ iTunes library pre-conversion complete: {self._preconv_done}/{self._preconv_total} files cached")
     
     def _on_close(self):
         """Graceful shutdown: stop background processes and close"""
@@ -2702,6 +2475,7 @@ class MusicPlayerGUI:
 
         # Close the current playback instance (not a dislike) then flush.
         try:
+            self._finalize_outgoing()
             self._finalize_playback('stop')
         except Exception:
             pass
@@ -2716,9 +2490,15 @@ class MusicPlayerGUI:
             print(f"⚠ Error saving listening history on close: {e}")
 
         try:
-            self.stop_background_preconversion()
-        except (RuntimeError, Exception) as e:
-            print(f"⚠ Error stopping preconversion: {e}")
+            self._shutdown_engine()
+        except Exception as e:
+            print(f"⚠ Error stopping the sound engine: {e}")
+        try:
+            if self._main_calls_job is not None:
+                self.root.after_cancel(self._main_calls_job)
+                self._main_calls_job = None
+        except Exception:
+            pass
 
         # Release COM volume interface
         try:
@@ -2767,7 +2547,6 @@ class MusicPlayerGUI:
             return
         
         # Stop any ongoing background conversion
-        self.stop_background_preconversion()
         
         self._scanning = True
         self.status_label.config(text="Starting library scan...")
@@ -2986,9 +2765,8 @@ class MusicPlayerGUI:
             # pick then reshuffle around it (Task 3).
             if self.all_tracks:
                 self.apply_shuffle(auto_play=bool(self.audio_available))
+            self._start_loudness_scan()
             
-            # Start background pre-conversion after small delay (avoid status overlap)
-            self.root.after(500, self.start_background_preconversion)
             
         finally:
             self._scanning = False
@@ -3078,7 +2856,6 @@ class MusicPlayerGUI:
     def force_rescan(self):
         """Force a full rescan of the library"""
         # Stop any ongoing background conversion
-        self.stop_background_preconversion()
         
         try:
             if self.cache_file.exists():
@@ -3088,6 +2865,36 @@ class MusicPlayerGUI:
         
         self.scan_library()
     
+    def _old_mp3_cache_size(self):
+        """(files, bytes) in the retired M4A->MP3 conversion cache."""
+        d = Path(self.convert_cache_dir)
+        if not d.is_dir():
+            return 0, 0
+        files = [f for f in d.iterdir() if f.is_file()]
+        return len(files), sum(f.stat().st_size for f in files)
+
+    def _delete_old_mp3_cache(self):
+        """Delete only the retired conversion cache folder; returns what was there."""
+        import shutil
+        n, size = self._old_mp3_cache_size()
+        shutil.rmtree(self.convert_cache_dir, ignore_errors=True)
+        return n, size
+
+    def delete_old_mp3_cache(self):
+        """Settings > Delete Old MP3 Cache: the sound engine plays M4A directly, so these copies are unused."""
+        n, size = self._old_mp3_cache_size()
+        if n == 0:
+            messagebox.showinfo("Old MP3 Cache", "There is no old MP3 cache to delete.")
+            return
+        if not messagebox.askyesno(
+                "Delete Old MP3 Cache",
+                f"Delete {n:,} converted MP3 files ({size / 1e9:.1f} GB)?\n\n"
+                "The sound engine plays M4A files directly, so these copies are no longer used.\n"
+                "Your music files, play counts and favorites are not touched."):
+            return
+        n, size = self._delete_old_mp3_cache()
+        self.status_label.config(text=f"Deleted {n:,} old MP3 files ({size / 1e9:.1f} GB)")
+
     def clear_cache(self):
         """Clear all cache files"""
         result = messagebox.askyesno(
@@ -3095,9 +2902,7 @@ class MusicPlayerGUI:
             "This will delete:\n"
             "• Library cache\n"
             "• M4P Downloads metadata\n"
-            "• All converted .mp3 files\n"
             "• Recent listening history (shuffle continuity)\n\n"
-            "Songs will need to be converted again when played.\n"
             "M4P metadata will start fresh.\n\n"
             "Continue?"
         )
@@ -4088,7 +3893,7 @@ class MusicPlayerGUI:
             self._pb_seq, duration=dur, now=time.monotonic())
         self._pb_track = track
 
-    def _finalize_playback(self, reason):
+    def _finalize_playback(self, reason, transition='cut'):
         """Close the current playback instance once and fold its outcome into
         the versioned counters.  Idempotent (safe to call from every path)."""
         tracker = self._pb_tracker
@@ -4117,6 +3922,18 @@ class MusicPlayerGUI:
             changed = True
         if changed:
             self._update_track_metadata(track)
+
+        # One line per finished playback for the future stats screen; never let it break playback.
+        try:
+            listening_log.append(str(self.listening_log_file), listening_log.make_record(
+                started_at=getattr(track, 'last_played', None) or time.time(), ended_at=time.time(),
+                path=track.filepath, title=track.title, artist=getattr(track, 'artist', ''),
+                album=getattr(track, 'album', ''), genre=getattr(track, 'genre', ''),
+                duration_sec=getattr(track, 'duration', 0) or 0, audible_sec=outcome.audible,
+                reason=outcome.reason, qualified=outcome.qualified_play, skip=outcome.manual_skip,
+                transition=transition if outcome.reason == 'natural_end' else 'cut'))
+        except Exception as e:
+            print(f"⚠ Could not write listening log: {e}")
 
     def _active_track(self):
         """The track the player is currently on - playing OR paused (not
@@ -4179,12 +3996,16 @@ class MusicPlayerGUI:
             self.status_label.config(text="Up Next queue already empty")
     
     def play_track_at_index(self, index):
-        """Play specific track"""
-        if not self.audio_available:
+        """Play a specific track: a manual pick or an internal advance. Always a cut, never a crossfade."""
+        if not self.audio_available or self._engine is None:
             messagebox.showwarning("Audio Unavailable", "Audio device not initialized. Cannot play music.")
             return
-        
+
         if not self.current_playlist or index >= len(self.current_playlist):
+            return
+
+        if not self.ffmpeg_path:
+            self.status_label.config(text="⚠ FFmpeg not found - Settings > Set FFmpeg Path")
             return
 
         # Close out the previous instance.  Callers that know a more specific
@@ -4194,162 +4015,482 @@ class MusicPlayerGUI:
 
         self.current_index = index
         track = self.current_playlist[index]
-
-        playback_path = track.filepath
-        
-        if track.filepath.lower().endswith('.m4a'):
-            # Stop current playback immediately for instant feedback
-            if self.is_playing:
-                try:
-                    pygame.mixer.music.stop()
-                    self.is_playing = False
-                except:
-                    pass
-            
-            self.now_playing_label.config(text=track.title)
-            self.now_playing_artist.config(text="Converting...")
-            self.root.update()
-            
-            # Capture current track info for validation
-            expected_filepath = track.filepath
-            expected_index = self.current_index
-            
-            # Convert in background thread to keep UI responsive
-            def convert_and_play():
-                converted_path = self._convert_m4a(track.filepath)
-                
-                def play_converted():
-                    # Validate this track is still current before playing
-                    if (self.current_index == expected_index and 
-                        0 <= self.current_index < len(self.current_playlist) and
-                        self.current_playlist[self.current_index].filepath == expected_filepath):
-                        
-                        if converted_path:
-                            self._play_track_direct(track, converted_path)
-                        else:
-                            print(f"⚠ Skipping unplayable file: {os.path.basename(track.filepath)}")
-                            self.next_track(_internal=True)
-                    else:
-                        print(f"⏭ Conversion completed but track was skipped")
-                
-                self.root.after(0, play_converted)
-            
-            threading.Thread(target=convert_and_play, daemon=True).start()
+        self._play_token = getattr(self, '_play_token', 0) + 1
+        if self._needs_analysis(track):
+            # Leveling needs this song's loudness first (~0.2 s, off the main thread)
+            token = self._play_token
+            self._start_pending = True
+            self._loudness.pause_background()
+            self._analyze_then([track], lambda: self._run_pending_start(token, track))
             return
-        
-        # Non-M4A files: play directly
-        self._play_track_direct(track, playback_path)
-    
-    def _play_track_direct(self, track, playback_path):
-        """Actually load and play a track (called after any conversion is done)"""
+        self._start_pending = False
+        self._start_item(track)
+
+    def _run_pending_start(self, token, track):
+        """Main thread: the picked song's loudness is in. Start it unless a pick, Stop or Pause came first."""
+        if token != getattr(self, '_play_token', 0):
+            return
+        self._start_pending = False
+        self._start_item(track)
+
+    def _cancel_pending_start(self):
+        """Stop/Pause while a picked song waits for its loudness: it must not start afterwards."""
+        if not getattr(self, '_start_pending', False):
+            return False
+        self._play_token = getattr(self, '_play_token', 0) + 1
+        self._start_pending = False
+        if getattr(self, '_loudness', None) is not None:
+            self._loudness.resume_background()   # it was paused for the start that won't happen
+        return True
+
+    def _start_item(self, track):
+        item = self._play_item_for(track)
+        self._engine_item = item
         try:
-            pygame.mixer.music.load(playback_path)
-            pygame.mixer.music.play()
-            self.is_playing = True
-            self._playback_state = 'playing'
-            self._start_playback_tracking(track)   # Task 8
-            # A track actually started - clear the cycle-wrap loop guard so it
-            # only trips when nothing plays between two wraps (Task 5).
-            self._last_wrap_mono = 0.0
+            with self._engine_lock:
+                self._engine.play(item)
+        except OSError as e:
+            # FFmpeg could not start at all: stop instead of racing through the playlist.
+            print(f"⚠ Could not start FFmpeg: {e}")
+            self._engine_item = None
+            self.is_playing = False
+            self._playback_state = 'stopped'
+            self.status_label.config(text="⚠ FFmpeg could not start - Settings > Set FFmpeg Path")
 
-            # Log what's playing with file extension
-            ext = os.path.splitext(track.filepath)[1]
-            
-            # V2: Increment play count for ALL tracks (defensive programming)
-            track.play_count = (track.play_count or 0) + 1
-            track.last_played = int(time.time())
+    def _begin_track_bookkeeping(self, track):
+        """A song started playing (engine 'started' event): play count, history, tracker, now-playing UI."""
+        self.is_playing = True
+        self._playback_state = 'playing'
+        self._start_playback_tracking(track)   # Task 8
+        if getattr(self, '_loudness', None) is not None:
+            self._loudness.resume_background()
+        # A track actually started - clear the cycle-wrap loop guard so it
+        # only trips when nothing plays between two wraps (Task 5).
+        self._last_wrap_mono = 0.0
 
-            # NOTE (Task 7a): do NOT stamp date_added on first playback - that
-            # made every old track look brand new to the shuffle's newness
-            # boost.  Unknown date stays None (scored neutral).
+        ext = os.path.splitext(track.filepath)[1]
+        # V2: Increment play count for ALL tracks (defensive programming)
+        track.play_count = (track.play_count or 0) + 1
+        track.last_played = int(time.time())
+        # NOTE (Task 7a): do NOT stamp date_added on first playback - that
+        # made every old track look brand new to the shuffle's newness
+        # boost.  Unknown date stays None (scored neutral).
+        self._update_track_metadata(track)
 
-            self._update_track_metadata(track)
+        # Record this start in the persisted listening history (Task 3).
+        self._record_history_start(track)
+        print(f"▶ Playing: {track.title}{ext} (plays: {track.play_count})")
 
-            # Record this start in the persisted listening history (Task 3).
-            self._record_history_start(track)
-            print(f"▶ Playing: {track.title}{ext} (plays: {track.play_count})")
-            
-            self._seek_base_sec = 0.0
-            self._segment_start_mono = time.monotonic()
-            
-            self._load_album_artwork(track)
-            
-            # Update love button visibility and state
-            self._update_love_button(track)
-            
-            self.now_playing_label.config(text=track.title)
-            artist_album = f"{track.artist} - {track.album}" if track.album else track.artist
-            self.now_playing_artist.config(text=artist_album)
-            
-            # Select the row in the CURRENT view (filtered or full), not by playlist index
-            try:
-                display_list = self.filtered_playlist if self.filtered_playlist else self.current_playlist
-                display_idx = display_list.index(track)  # track is self.current_playlist[index]
-                children = self.playlist_tree.get_children()
-                if 0 <= display_idx < len(children):
-                    item = children[display_idx]
-                    self.playlist_tree.selection_set(item)
-                    self.playlist_tree.see(item)
-            except:
-                pass
-        except pygame.error as e:
-            error_msg = str(e).lower()
-            filename = os.path.basename(playback_path)
-            
-            # Concise error for corrupted files
-            if any(x in error_msg for x in ['corrupt', 'bad stream', 'invalid', 'drflac']):
-                print(f"⚠ Skipping corrupted file: {filename}")
-            else:
-                print(f"⚠ Playback error: {filename} - {e}")
-            
-            # Delete corrupt cached conversion if applicable
-            if playback_path != track.filepath and os.path.exists(playback_path):
+        self._load_album_artwork(track)
+        self._update_love_button(track)
+
+        self.now_playing_label.config(text=track.title)
+        artist_album = f"{track.artist} - {track.album}" if track.album else track.artist
+        self.now_playing_artist.config(text=artist_album)
+
+        # Select the row in the CURRENT view (filtered or full), not by playlist index
+        try:
+            display_list = self.filtered_playlist if self.filtered_playlist else self.current_playlist
+            display_idx = display_list.index(track)
+            children = self.playlist_tree.get_children()
+            if 0 <= display_idx < len(children):
+                item = children[display_idx]
+                self.playlist_tree.selection_set(item)
+                self.playlist_tree.see(item)
+        except Exception:
+            pass
+
+    # ============================================================
+    # Sound engine glue
+    # ============================================================
+
+    def _open_decoder(self, path, start_sec, filters):
+        return FfmpegDecoder(self.ffmpeg_path or "ffmpeg", path, start_sec, filters)
+
+    def _filters_for(self, track):
+        s = self.audio_settings
+        gain = 0.0
+        if s['leveling_enabled']:
+            loud = self._loudness_for(track)
+            if loud is not None:
+                gain = leveling_gain_db(loud.integrated_lufs, loud.true_peak_dbtp)
+        return filter_chain(s['eq_bands_db'], s['eq_preamp_db'], gain, enabled=s['eq_enabled'])
+
+    def _needs_analysis(self, track):
+        svc = getattr(self, '_loudness', None)
+        return (svc is not None and self.audio_settings['leveling_enabled']
+                and svc.get(track.filepath) is None and not svc.known_bad(track.filepath))
+
+    def _analyze_then(self, tracks, callback):
+        """Analyse tracks on a worker thread, then always run callback on the main thread.
+
+        A song that is already being measured (next-song prep, then Next) isn't measured twice: the
+        loudness service makes the second caller wait for the first run, and both callbacks run.
+        """
+        paths = [t.filepath for t in tracks]
+
+        def work():
+            for p in paths:
                 try:
-                    os.remove(playback_path)
-                except (OSError, IOError) as err:
-                    print(f"  Could not delete corrupt cache: {err}")
-            
-            # Skip immediately to next track
+                    self._loudness.analyze_now(p)
+                except Exception as e:
+                    print(f"⚠ Loudness analysis failed: {e}")
+            self._post_to_main(callback)
+
+        threading.Thread(target=work, daemon=True, name='loudness-now').start()
+
+    def _apply_sound_settings(self, new):
+        """Sound/Equalizer window callback: validate now, save and apply after a short debounce."""
+        if self._sound_apply_job is None:
+            self._sound_before = self.audio_settings
+        else:
+            try:
+                self.root.after_cancel(self._sound_apply_job)
+            except Exception:
+                pass
+        self.audio_settings = audio_settings.normalize(new)
+        self._sound_apply_job = self.root.after(150, self._commit_sound_settings)
+
+    def _commit_sound_settings(self):
+        self._sound_apply_job = None
+        before, s = getattr(self, '_sound_before', self.audio_settings), self.audio_settings
+        try:
+            audio_settings.save(str(self.audio_settings_file), s)
+        except OSError as e:
+            print(f"⚠ Could not save sound settings: {e}")
+        filters_changed = any(s[k] != before[k] for k in ('eq_enabled', 'eq_bands_db', 'eq_preamp_db',
+                                                          'leveling_enabled'))
+        if filters_changed and self._engine is not None:
+            with self._engine_lock:
+                self._engine.refilter(lambda it: self._filters_for(it.key))
+        if filters_changed or any(s[k] != before[k] for k in ('transition_mode', 'transition_seconds')):
+            self._prepare_next()
+        if (s['leveling_enabled'] and not before['leveling_enabled']) or \
+                (s['transition_mode'] == 'smart' and before['transition_mode'] != 'smart'):
+            self._start_loudness_scan()
+
+    def _eq_presets(self):
+        presets = dict(BUILTIN_PRESETS)
+        for name, p in self.audio_settings['eq_user_presets'].items():
+            presets[name] = (list(p['bands_db']), p['preamp_db'])
+        return presets
+
+    def _refresh_eq_window(self):
+        try:
+            if self._eq_window is not None and self._eq_window.winfo_exists():
+                self._eq_window.refresh(self.audio_settings, self._eq_presets())
+        except tk.TclError:
+            pass
+
+    def _import_eqf_file(self, path):
+        """Add every preset in a Winamp .eqf file to the user presets. Raises OSError/ValueError."""
+        with open(path, 'rb') as fh:
+            presets = parse_eqf(fh.read())
+        s = dict(self.audio_settings)
+        user = dict(s['eq_user_presets'])
+        for name, bands, preamp in presets:
+            user[(name or '').strip()[:64] or 'Imported'] = {'bands_db': list(bands), 'preamp_db': preamp}
+        s['eq_user_presets'] = user
+        self._apply_sound_settings(s)
+        return len(presets)
+
+    def _import_eqf(self):
+        path = filedialog.askopenfilename(title="Import Winamp EQ presets",
+                                          filetypes=[("Winamp EQ", "*.eqf *.EQF"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            n = self._import_eqf_file(path)
+        except (OSError, ValueError):
+            messagebox.showerror("Import failed", "That isn't a Winamp EQ preset file (.eqf).")
+            return
+        self._refresh_eq_window()
+        self.status_label.config(text=f"Imported {n} EQ preset(s)")
+
+    def _save_eq_preset(self, name):
+        s = dict(self.audio_settings)
+        user = dict(s['eq_user_presets'])
+        user[name] = {'bands_db': list(s['eq_bands_db']), 'preamp_db': s['eq_preamp_db']}
+        s['eq_user_presets'] = user
+        s['eq_preset'] = name
+        self._apply_sound_settings(s)
+        self._refresh_eq_window()
+
+    def _loudness_status_text(self):
+        svc = getattr(self, '_loudness', None)
+        if svc is None:
+            return ''
+        done, total = svc.status()
+        if total == 0:
+            return 'The library is measured once leveling or Smart is on'
+        return f'Measured {done:,} of {total:,} songs' if done < total else f'All {total:,} songs measured'
+
+    def open_sound_dialog(self):
+        if self._sound_dialog is not None and self._sound_dialog.winfo_exists():
+            self._sound_dialog.lift()
+            return
+        self._sound_dialog = SoundDialog(self.root, self.audio_settings, self._apply_sound_settings,
+                                         self._loudness_status_text)
+
+    def open_equalizer(self):
+        if self._eq_window is not None and self._eq_window.winfo_exists():
+            self._eq_window.lift()
+            return
+        self._eq_window = EqualizerWindow(self.root, self.audio_settings, self._eq_presets(),
+                                          self._apply_sound_settings, self._save_eq_preset, self._import_eqf)
+
+    def _start_loudness_scan(self):
+        """Measure the whole library in the background once leveling or smart transitions need it."""
+        s = self.audio_settings
+        if getattr(self, '_loudness', None) is None or not (s['leveling_enabled'] or s['transition_mode'] == 'smart'):
+            return
+        tracks = getattr(self, 'library_tracks', None) or getattr(self, 'all_tracks', None) or []
+        self._loudness.start_background([t.filepath for t in tracks])
+
+    def _play_item_for(self, track):
+        return PlayItem(key=track, path=track.filepath,
+                        duration_sec=float(getattr(track, 'duration', 0) or 0),
+                        filters=self._filters_for(track))
+
+    def _engine_emit(self, name, **data):
+        """Runs on the engine thread under _engine_lock (or inside an engine call): queue it, never touch Tk.
+
+        root.after from a non-main thread blocks until the main thread services it, and the main thread
+        may be waiting for _engine_lock: that would deadlock.
+        """
+        self._post_to_main(lambda: self._on_engine_event(name, **data))
+
+    def _post_to_main(self, fn):
+        """Any thread: run fn (no arguments) on the main thread soon. Never calls Tk."""
+        self._main_calls.put(fn)
+
+    def _drain_main_calls(self):
+        """Main thread, every MAIN_CALLS_POLL_MS: run what worker threads posted, in order."""
+        for _ in range(self._main_calls.qsize()):
+            try:
+                fn = self._main_calls.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        try:
+            self._main_calls_job = self.root.after(MAIN_CALLS_POLL_MS, self._drain_main_calls)
+        except (RuntimeError, tk.TclError):
+            self._main_calls_job = None   # window closing
+
+    def _on_engine_event(self, name, **data):
+        """Main thread: react to sound-engine events."""
+        item = data.get('item')
+        if name == 'error':
+            fname = os.path.basename(item.path) if item is not None else '?'
+            print(f"⚠ Skipping unplayable file: {fname} - {str(data.get('message', '')).strip()[-200:]}")
+            return
+        if item is None:
+            return
+        if name == 'started':
+            how = data.get('how')
+            if how == 'cut':
+                if item is self._engine_item:
+                    self._begin_track_bookkeeping(item.key)
+                    self._prepare_next()
+            elif item is self._next_item:
+                self._on_transition_started(item, how)
+            return
+        if name != 'finished':
+            return
+        reason = data.get('reason')
+        if item is self._outgoing_item:
+            self._finalize_outgoing()
+            return
+        if item is not self._engine_item or reason == 'cut':
+            return  # stale, or a manual action already finalized it
+        if data.get('continued'):
+            # gapless: the prepared song starts right now on the same channel
+            self._finalize_playback('natural_end', self._next_tr)
+            return
+        if reason == 'failure':
+            self.is_playing = False
             self._playback_state = 'stopped'
+            self._finalize_playback('failure')
             self.next_track(_internal=True)
+        else:
+            self._handle_track_end()
+
+    def _on_transition_started(self, item, how):
+        """The prepared song started on its own (gapless or overlap): make it current without a cut."""
+        if how == 'overlap' and self._pb_tracker is not None:
+            # the outgoing song is still audible: its tracker runs until its audio stops
+            self._pb_outgoing = (self._pb_tracker, self._pb_track)
+            self._pb_tracker = self._pb_track = None
+            self._outgoing_item = self._engine_item
+            self._outgoing_tr = self._next_tr
+        smart = getattr(self, '_active_algo', 'Smart Shuffle') == 'Smart Shuffle'
+        action, new_index, new_q, new_temp = playlist_queue.advance(
+            self.current_index, len(self.current_playlist), self.queued_count, self.is_temp_view,
+            reshuffle_on_wrap=smart)
+        if action == 'play' and 0 <= new_index < len(self.current_playlist) \
+                and self.current_playlist[new_index] is item.key:
+            self.current_index, self.queued_count, self.is_temp_view = new_index, new_q, new_temp
+        else:
+            # the playlist changed after the song was prepared: follow the song itself
+            try:
+                self.current_index = self.current_playlist.index(item.key)
+            except ValueError:
+                pass
+        self._engine_item = item
+        self._next_item = None
+        self._begin_track_bookkeeping(item.key)
+        self._prepare_next()
+
+    def _finalize_outgoing(self):
+        """The outgoing song of a crossfade stopped: close its playback instance as a natural end."""
+        pending = self._pb_outgoing
+        self._pb_outgoing = None
+        self._outgoing_item = None
+        if pending is None:
+            return
+        saved = (self._pb_tracker, self._pb_track)
+        self._pb_tracker, self._pb_track = pending
+        try:
+            self._finalize_playback('natural_end', self._outgoing_tr)
+        finally:
+            self._pb_tracker, self._pb_track = saved
+
+    def _loudness_for(self, track):
+        """Cached loudness analysis for a track, or None (filled in by the loudness service)."""
+        svc = getattr(self, '_loudness', None)
+        return svc.get(track.filepath) if svc is not None else None
+
+    def _prepare_next(self, analyse=True):
+        """Tell the engine which song follows the current one, and how (Up Next and shuffle rules apply).
+
+        Songs without loudness are measured in the background, then the next song is prepared again once
+        with analyse=False, so a song that can't be measured isn't retried forever.
+        """
+        if self._engine is None or self._engine_item is None:
+            return
+        smart = getattr(self, '_active_algo', 'Smart Shuffle') == 'Smart Shuffle'
+        idx = playlist_queue.peek_next_index(self.current_index, len(self.current_playlist),
+                                             self.queued_count, self.is_temp_view, reshuffle_on_wrap=smart)
+        if idx is None:
+            self._next_item, self._next_tr = None, 'cut'
+            with self._engine_lock:
+                self._engine.prepare_next(None, None)
+            return
+        out_track, in_track = self._engine_item.key, self.current_playlist[idx]
+        s = self.audio_settings
+        svc = getattr(self, '_loudness', None)
+        if svc is not None and (s['leveling_enabled'] or s['transition_mode'] == 'smart'):
+            missing = [tr for tr in (out_track, in_track)
+                       if svc.get(tr.filepath) is None and not svc.known_bad(tr.filepath)]
+            if missing and analyse:
+                self._analyze_then(missing, lambda: self._prepare_next(analyse=False))
+        out_l, in_l = self._loudness_for(out_track), self._loudness_for(in_track)
+        out_dur = out_l.duration_sec if out_l else float(getattr(out_track, 'duration', 0) or 0)
+        in_dur = in_l.duration_sec if in_l else float(getattr(in_track, 'duration', 0) or 0)
+        consecutive = transitions.is_consecutive_album_track(
+            out_track.filepath, getattr(out_track, 'track_number', None),
+            in_track.filepath, getattr(in_track, 'track_number', None))
+        plan = transitions.plan_transition(s['transition_mode'], s['transition_seconds'], out_dur, in_dur,
+                                           consecutive_album=consecutive, out_loudness=out_l, in_loudness=in_l)
+        item = self._play_item_for(in_track)
+        self._next_item = item
+        if plan.kind == 'gapless':
+            self._next_tr = 'gapless'
+        else:
+            self._next_tr = 'smart' if s['transition_mode'] == 'smart' else 'crossfade'
+        with self._engine_lock:
+            self._engine.prepare_next(item, plan)
+
+    def _check_next_prepared(self):
+        """Every second: if Up Next, a search takeover or a reshuffle changed what follows, re-prepare."""
+        try:
+            if self._engine is not None and self._engine_item is not None and self.current_playlist:
+                smart = getattr(self, '_active_algo', 'Smart Shuffle') == 'Smart Shuffle'
+                idx = playlist_queue.peek_next_index(self.current_index, len(self.current_playlist),
+                                                     self.queued_count, self.is_temp_view,
+                                                     reshuffle_on_wrap=smart)
+                want = self.current_playlist[idx] if idx is not None else None
+                have = self._next_item.key if self._next_item is not None else None
+                if want is not have:
+                    self._prepare_next()
         except Exception as e:
-            print(f"⚠ Unexpected playback error: {os.path.basename(playback_path)} - {e}")
-            import traceback
-            traceback.print_exc()  # Print full traceback for debugging
-            self._playback_state = 'stopped'
-            self.next_track(_internal=True)
-    
+            print(f"⚠ Next-song check failed: {e}")
+        try:
+            self.root.after(1000, self._check_next_prepared)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def _engine_loop(self):
+        while not self._engine_stop.is_set():
+            try:
+                with self._engine_lock:
+                    self._engine.tick()
+            except Exception as e:
+                print(f"⚠ Sound engine error: {e}")
+                self._engine_stop.wait(0.5)
+            self._engine_stop.wait(0.02)
+
+    def _start_engine_loop(self):
+        if self._engine is None or self._engine_thread is not None:
+            return
+        self._engine_thread = threading.Thread(target=self._engine_loop, daemon=True, name='sound-engine')
+        self._engine_thread.start()
+        self.root.after(1000, self._check_next_prepared)
+
+    def _shutdown_engine(self):
+        self._engine_stop.set()
+        if self._engine_thread is not None and self._engine_thread.is_alive():
+            self._engine_thread.join(timeout=1.0)
+        if self._engine is not None:
+            with self._engine_lock:
+                self._engine.stop()
+        if getattr(self, '_loudness', None) is not None:
+            self._loudness.stop()
+        try:
+            pygame.mixer.quit()
+        except pygame.error:
+            pass
+
+    def _resume_engine(self):
+        with self._engine_lock:
+            self._engine.resume()
+        self.is_playing = True
+        self._playback_state = 'playing'
+        if self._pb_tracker:
+            self._pb_tracker.resume(time.monotonic())
+
     def play(self):
         """Play or resume"""
         if not self.audio_available:
             return
-        
+
         if not self.current_playlist:
             messagebox.showwarning("Warning", "No playlist loaded")
             return
-        
-        if not pygame.mixer.music.get_busy():
+
+        with self._engine_lock:
+            has_song = self._engine.current() is not None
+        if not has_song:
             self.play_track_at_index(self.current_index)
         else:
-            # Reset segment start time when unpausing
-            self._segment_start_mono = time.monotonic()
-            pygame.mixer.music.unpause()
-            self.is_playing = True
-            self._playback_state = 'playing'
-            if self._pb_tracker:
-                self._pb_tracker.resume(time.monotonic())
-    
+            self._resume_engine()
+
     def pause(self):
         """Pause playback"""
         if not self.audio_available:
             return
-        
-        # Capture current position before pausing
-        if self.is_playing and self._segment_start_mono is not None:
-            elapsed = time.monotonic() - self._segment_start_mono
-            self._seek_base_sec = self._seek_base_sec + elapsed
-        
-        pygame.mixer.music.pause()
+        if self._cancel_pending_start():
+            # The picked song hasn't started yet: cut the old one, so Play starts the picked song.
+            self._engine_item = None
+            with self._engine_lock:
+                self._engine.stop()
+        else:
+            with self._engine_lock:
+                self._engine.pause()
         self.is_playing = False
         self._playback_state = 'paused'
         if self._pb_tracker:
@@ -4361,7 +4502,10 @@ class MusicPlayerGUI:
             return
 
         self._finalize_playback('stop')   # Task 8: stop is not a dislike
-        pygame.mixer.music.stop()
+        self._cancel_pending_start()
+        self._engine_item = None
+        with self._engine_lock:
+            self._engine.stop()
         self.is_playing = False
         self._playback_state = 'stopped'
         self.now_playing_label.config(text="Not Playing")
@@ -4450,8 +4594,6 @@ class MusicPlayerGUI:
             _tick = 0.1  # seconds per loop iteration
             _volume_sync_ticks = round(VOLUME_SYNC_INTERVAL_SEC / _tick)
 
-            last_pos = 0
-            end_detected = False
             volume_sync_counter = 0
 
             while True:
@@ -4461,82 +4603,19 @@ class MusicPlayerGUI:
                     volume_sync_counter = 0
                     safe_ui_call(self._sync_volume_slider)
                 
-                if self.audio_available and self.is_playing:
+                if self.audio_available and self.is_playing and self._engine is not None:
                     try:
-                        if self.current_playlist and pygame.mixer.music.get_busy():
-                            track = self.current_playlist[self.current_index]
-                            
-                            if self._segment_start_mono is None:
-                                self._segment_start_mono = time.monotonic()
-                            
-                            pos = self._seek_base_sec + (time.monotonic() - self._segment_start_mono)
-                            
-                            if pos < 0:
-                                pos = 0.0
-                            
-                            # Reset end detection if position is clearly not at end
-                            if pos > 0.2:
-                                end_detected = False
-                            
-                            if pos < last_pos - 1.0:
-                                end_detected = False
-                            last_pos = pos
-                            
-                            duration = self._get_safe_duration(track)
+                        with self._engine_lock:
+                            item = self._engine.current()
+                            pos = self._engine.position()
+                        if item is not None:
+                            duration = self._get_safe_duration(item.key)
                             if duration > 0.01:
-                                # Calculate progress - allow slightly over 100% but clamp for display
-                                progress = (pos / duration) * 100
-                                
-                                # For time display, clamp position to duration to prevent showing "3:45 / 3:30"
+                                progress = min((pos / duration) * 100, 100)
                                 display_pos = min(pos, duration)
-                                pos_min = int(display_pos // 60)
-                                pos_sec = int(display_pos % 60)
-                                dur_min = int(duration // 60)
-                                dur_sec = int(duration % 60)
-                                time_text = f"{pos_min}:{pos_sec:02d} / {dur_min}:{dur_sec:02d}"
-                                
-                                # Cap progress bar but allow it to reach 100% when track actually ends
-                                # Don't cap at 99.5% - this was causing confusion
-                                if progress > 100:
-                                    progress = 100
-                                
+                                time_text = (f"{int(display_pos // 60)}:{int(display_pos % 60):02d} / "
+                                             f"{int(duration // 60)}:{int(duration % 60):02d}")
                                 safe_ui_call(self._update_progress_ui, progress, time_text)
-                        
-                        elif not pygame.mixer.music.get_busy() and not end_detected:
-                            # Verify track actually ended (not just a momentary glitch)
-                            # Check if position is actually near the end
-                            if self.current_playlist and self.current_index >= 0:
-                                track = self.current_playlist[self.current_index]
-                                
-                                # Skip if timestamp tracking not initialized
-                                if self._segment_start_mono is None:
-                                    # Track never started properly, trust get_busy()
-                                    end_detected = True
-                                    last_pos = 0
-                                    safe_ui_call(self._handle_track_end)
-                                    continue
-                                
-                                pos = self._seek_base_sec + (time.monotonic() - self._segment_start_mono)
-                                
-                                # Only trigger end if we're actually near the end of the track
-                                # Dynamic buffer: 10% of track or 2 seconds, whichever is less
-                                # This prevents short tracks (<2s) from never ending
-                                if track.duration > 0:
-                                    buffer = min(track.duration * 0.1, END_DETECTION_BUFFER_SEC)
-                                    if pos >= (track.duration - buffer):
-                                        end_detected = True
-                                        last_pos = 0
-                                        safe_ui_call(self._handle_track_end)
-                                elif track.duration <= 0:
-                                    # Unknown duration - trust get_busy()
-                                    end_detected = True
-                                    last_pos = 0
-                                    safe_ui_call(self._handle_track_end)
-                                # else: not at end yet, might be buffering, keep playing
-                    
-                    except pygame.error:
-                        # pygame errors are common during track transitions
-                        pass
                     except Exception as e:
                         # Log unexpected errors but don't crash the thread
                         print(f"⚠ Progress update error: {e}")
@@ -4556,17 +4635,13 @@ class MusicPlayerGUI:
             pass
     
     def _handle_track_end(self):
-        """Handle track ending"""
-        if self.is_playing and not pygame.mixer.music.get_busy():
-            # V2: Track completed naturally (ALL tracks)
-            if 0 <= self.current_index < len(self.current_playlist):
-                track = self.current_playlist[self.current_index]
-                print(f"✓ Completed: {track.title}")
-            
-            self.is_playing = False
-            self._playback_state = 'stopped'  # until the next track starts
-            self._finalize_playback('natural_end')  # Task 8
-            self.next_track(_internal=True)  # Allow auto-advance even during shuffle
+        """A song ended on its own with nothing prepared after it: count it, then advance."""
+        if 0 <= self.current_index < len(self.current_playlist):
+            print(f"✓ Completed: {self.current_playlist[self.current_index].title}")
+        self.is_playing = False
+        self._playback_state = 'stopped'  # until the next track starts
+        self._finalize_playback('natural_end')  # Task 8
+        self.next_track(_internal=True)  # Allow auto-advance even during shuffle
 
 
 def main():

@@ -39,3 +39,7 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 utlities/library_manager - Shortcut.lnk
+
+# Sound engine: personal settings and listening history
+audio_settings.json
+listening_log.jsonl
