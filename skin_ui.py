@@ -94,7 +94,7 @@ class SkinWindow(tk.Toplevel):
         self.focused = False
         self._photos = []
         self._tag_photos = {}
-        self._rims = None               # (skin, its rim layer), built once per skin
+        self._rims = None               # (key, rim layer, its PhotoImage): rebuilt only when skin/size/focus change
         self.canvas = tk.Canvas(self, width=width * scale, height=height * scale,
                                 highlightthickness=0, bd=0)
         self.canvas.pack()
@@ -119,10 +119,18 @@ class SkinWindow(tk.Toplevel):
         self._tag_photos.clear()
         self.draw()
 
-    def _blit_rims(self, layout, names, background):
-        if self._rims is None or self._rims[0] is not self.skin:
-            self._rims = (self.skin, rim_overlay(self.skin.sprite(background), layout, names))
-        self.blit(self._rims[1], 0, 0, tag='rims')
+    def _blit_rims(self, layout, names, under):
+        """Draw the soft contrast rim layer on top. under: the (sprite, x, y) pieces drawn below the buttons
+        (background, title bar, ...), composited to read what the skin really shows around each button."""
+        key = (self.skin, self.scale, self.focused)
+        if self._rims is None or self._rims[0] != key:
+            base = Image.new('RGBA', (self.width, self.height), (0, 0, 0, 255))
+            for name, x, y in under:
+                base.alpha_composite(self.skin.sprite(name).convert('RGBA'), (x, y))
+            layer = rim_overlay(base, layout, names)
+            photo = ImageTk.PhotoImage(self.skin.scaled(layer, self.scale), master=self.canvas)
+            self._rims = (key, layer, photo)
+        self.canvas.create_image(0, 0, anchor='nw', image=self._rims[2], tags=('rims',))
 
     def _redraw_tag(self, tag, blit_fn):
         self.canvas.delete(tag)
@@ -147,6 +155,7 @@ class SkinWindow(tk.Toplevel):
         # thread, and freeing a PhotoImage calls into Tk.
         self._photos.clear()
         self._tag_photos.clear()
+        self._rims = None
         super().destroy()
 
     def _on_focus_in(self, event=None):
@@ -347,7 +356,9 @@ class SkinMainWindow(SkinWindow):
             self.blit(S(name), x, y)
 
         self.blit(self._vis_image(), 24, 43, tag='vis')
-        self._blit_rims(MAIN_LAYOUT, RIM_MAIN, 'MAIN_WINDOW_BACKGROUND')
+        self._blit_rims(MAIN_LAYOUT, RIM_MAIN, (
+            ('MAIN_WINDOW_BACKGROUND', 0, 0), ('MAIN_TITLE_BAR_SELECTED' if self.focused else 'MAIN_TITLE_BAR', 0, 0),
+            ('MAIN_CLUTTER_BAR_BACKGROUND', 10, 22)))
 
     def _drag_is(self, kind):
         return self.drag is not None and self.drag[0] == kind
@@ -497,7 +508,8 @@ class SkinEqWindow(SkinWindow):
                       x, y)
             thumb = 'EQ_SLIDER_THUMB_SELECTED' if self.drag == key else 'EQ_SLIDER_THUMB'
             self.blit(S(thumb), x + 1, y + eq_thumb_y(db))
-        self._blit_rims(EQ_LAYOUT, RIM_EQ, 'EQ_WINDOW_BACKGROUND')
+        self._blit_rims(EQ_LAYOUT, RIM_EQ, (
+            ('EQ_WINDOW_BACKGROUND', 0, 0), ('EQ_TITLE_BAR_SELECTED' if self.focused else 'EQ_TITLE_BAR', 0, 0)))
 
     def _apply_slider(self, key, event):
         y = EQ_LAYOUT[key][1]
