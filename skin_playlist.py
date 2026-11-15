@@ -9,6 +9,8 @@ Tk list. It imports no player code: set_rows() fills it and the callbacks dict r
   'search_enter'()       Enter in the search box
   'menu'(x_root, y_root, index)   right-click (index None outside rows)
   'close'()  'moved'(x, y)
+  'drag'(x, y)          optional: the title bar is dragged so the window would sit at (x, y); when given, the
+                        window doesn't move itself (it is part of the controller's stack)
 """
 
 import tkinter as tk
@@ -184,7 +186,11 @@ class SkinPlaylistWindow(tk.Toplevel):
         if not self._drag:
             return
         if self._drag[0] == 'move':
-            self.geometry(f'+{event.x_root - self._drag[1]}+{event.y_root - self._drag[2]}')
+            x, y = event.x_root - self._drag[1], event.y_root - self._drag[2]
+            if 'drag' in self.callbacks:          # part of a stack: the controller moves the whole stack
+                self.callbacks['drag'](x, y)
+            else:
+                self.geometry(f'+{x}+{y}')
         elif self._drag[0] == 'resize':
             self.set_height(self._drag[2] + (event.y_root - self._drag[1]) / self.scale)
 

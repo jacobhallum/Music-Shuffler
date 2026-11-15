@@ -498,8 +498,11 @@ class SkinEqWindow(SkinWindow):
 
     def _on_motion(self, event):
         if self._win_drag is not None:
-            self.geometry('+%d+%d' % (event.x_root - self._win_drag[0],
-                                      event.y_root - self._win_drag[1]))
+            x, y = event.x_root - self._win_drag[0], event.y_root - self._win_drag[1]
+            if 'drag' in self.callbacks:          # part of a stack: the controller moves the whole stack
+                self.callbacks['drag'](x, y)
+            else:
+                self.geometry('+%d+%d' % (x, y))
             return
         if self.drag is not None:
             self._apply_slider(self.drag, event)

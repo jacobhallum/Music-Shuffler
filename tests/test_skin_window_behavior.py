@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 import unittest.mock
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
@@ -99,12 +100,14 @@ class SkinWindowBehaviorTests(unittest.TestCase):
         self.assertFalse(self.c.settings['eq_open'])
         self.assertTrue(self.c.active)
 
-    def test_alt_f4_on_playlist_closes_it_like_its_close_button(self):
+    def test_alt_f4_on_the_playlist_leaves_it_open(self):
         self.open_skin()
-        ctypes.windll.user32.PostMessageW(hwnd(self.c.pl), WM_CLOSE, 0, 0)
+        pl = self.c.pl
+        ctypes.windll.user32.PostMessageW(hwnd(pl), WM_CLOSE, 0, 0)
         pump(200)
-        self.assertIsNone(self.c.pl)
-        self.assertFalse(self.c.settings['pl_open'])
+        self.assertIs(self.c.pl, pl)
+        self.assertTrue(pl.winfo_exists())
+        self.assertTrue(self.c.settings['pl_open'])
 
     def test_alt_f4_on_main_exits_like_its_close_button(self):
         self.open_skin()
@@ -198,9 +201,10 @@ class SkinWindowBehaviorTests(unittest.TestCase):
         with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: areas):
             self.open_skin()
             pump(skin_mode.KEEP_MS + 200)
-            for w in self.c._windows():
-                x, y, ww, hh = rect(w)
-                self.assertEqual(reachable((x, y, ww, hh), areas), (x, y))
+            x, y, ww, hh = rect(self.c.main)
+            self.assertEqual(reachable((x, y, ww, hh), areas), (x, y))
+            self.assertEqual(rect(self.c.eq)[:2], (x, y + 116))          # still one flush stack
+            self.assertEqual(rect(self.c.pl)[:2], (x, y + 232))
             self.assertEqual(self.c._main_pos, (self.c.main.winfo_x(), self.c.main.winfo_y()))
 
     def test_eq_destroyed_from_outside_is_remembered_as_closed(self):
@@ -253,6 +257,147 @@ class SkinWindowBehaviorTests(unittest.TestCase):
         self.addCleanup(d.destroy)
         self.c.own_dialog(d)
         self.assertEqual(d.transient(), '')
+
+
+@unittest.skipIf(_root is None or not WIN, "needs Windows and a display")
+class SkinStackTests(unittest.TestCase):
+    """While skinned the player is one block: main, EQ under it when open, the playlist (always open) at the bottom."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        os.makedirs(os.path.join(self.tmp.name, 'skins'))
+        self.skin = _skin(self.tmp.name)
+        os.replace(os.path.join(self.tmp.name, 'syn.wsz'), os.path.join(self.tmp.name, 'skins', 'syn.wsz'))
+        self.p = _player(self.tmp.name)
+        self.addCleanup(self.p.root.destroy)
+        self.c = skin_mode.SkinController(self.p)
+        self.addCleanup(self.c._close_windows)
+        self.c.settings['positions'] = {'main': [300, 200]}
+
+    def open_skin(self):
+        self.c.pick('syn.wsz')
+        pump(300)
+
+    def assert_stacked(self):
+        s = self.c.scale()
+        mx, my = self.c.main.winfo_x(), self.c.main.winfo_y()
+        y = my + 116 * s
+        if self.c.eq is not None:
+            self.assertEqual((self.c.eq.winfo_x(), self.c.eq.winfo_y()), (mx, y))
+            y += 116 * s
+        self.assertEqual((self.c.pl.winfo_x(), self.c.pl.winfo_y()), (mx, y))
+
+    def test_playlist_opens_with_every_skin_even_if_saved_closed(self):
+        self.c.settings['pl_open'] = False
+        self.open_skin()
+        self.assertTrue(self.c.pl is not None and self.c.pl.winfo_exists())
+        self.assert_stacked()
+
+    def test_playlist_cannot_be_closed(self):
+        self.open_skin()
+        pl = self.c.pl
+        self.c.toggle_pl()
+        pl.callbacks['close']()
+        ctypes.windll.user32.PostMessageW(hwnd(pl), WM_CLOSE, 0, 0)
+        pump(200)
+        self.assertIs(self.c.pl, pl)
+        self.assertTrue(pl.winfo_exists())
+
+    def test_stack_ignores_saved_eq_and_playlist_spots(self):
+        self.c.settings['positions'] = {'main': [300, 200], 'eq': [900, 900], 'pl': [50, 50]}
+        self.open_skin()
+        self.assertEqual(rect(self.c.eq)[:2], (300, 316))
+        self.assertEqual(rect(self.c.pl)[:2], (300, 432))
+
+    def test_closing_eq_moves_the_playlist_up_and_opening_moves_it_down(self):
+        self.open_skin()
+        self.c.toggle_eq()
+        pump(200)
+        self.assertIsNone(self.c.eq)
+        self.assertEqual(rect(self.c.pl)[:2], (300, 316))
+        self.c.toggle_eq()
+        pump(200)
+        self.assertEqual(rect(self.c.pl)[:2], (300, 432))
+        self.assert_stacked()
+
+    def test_moving_main_moves_the_stack(self):
+        self.open_skin()
+        self.c.main.geometry('+500+300')
+        pump(200)
+        self.assertEqual(rect(self.c.eq)[:2], (500, 416))
+        self.assertEqual(rect(self.c.pl)[:2], (500, 532))
+
+    def test_double_size_keeps_the_stack_flush(self):
+        self.open_skin()
+        self.c.toggle_double()
+        pump(300)
+        self.assertEqual(self.c.scale(), 2)
+        self.assert_stacked()
+
+    def test_dragging_the_playlist_title_moves_the_whole_stack(self):
+        self.open_skin()
+        self.c.pl.callbacks['drag'](600, 500)
+        pump(200)
+        self.assertEqual(rect(self.c.main)[:2], (600, 268))
+        self.assert_stacked()
+        self.c.pl.callbacks['moved'](0, 0)
+        pump(300)
+        self.assert_stacked()
+
+    def test_dragging_the_eq_title_moves_the_whole_stack(self):
+        self.open_skin()
+        self.c.eq.callbacks['drag'](700, 400)
+        pump(200)
+        self.assertEqual(rect(self.c.main)[:2], (700, 284))
+        self.assert_stacked()
+
+    def test_playlist_window_hands_a_title_drag_to_the_drag_callback(self):
+        got = []
+        import skin_playlist
+        w = skin_playlist.SkinPlaylistWindow(_root, self.skin, 1, {'drag': lambda x, y: got.append((x, y))})
+        self.addCleanup(w.destroy)
+        w.geometry('+300+432')
+        pump(100)
+        ev = lambda xr, yr: SimpleNamespace(x=50, y=5, x_root=xr, y_root=yr)  # noqa: E731
+        w._on_press(ev(350, 437))
+        w._on_motion(ev(650, 505))
+        pump(100)
+        self.assertEqual(got, [(600, 500)])
+        self.assertEqual((w.winfo_x(), w.winfo_y()), (300, 432))
+
+    def test_eq_window_hands_a_title_drag_to_the_drag_callback(self):
+        got = []
+        from skin_ui import SkinEqWindow
+        w = SkinEqWindow(_root, self.skin, 1, {'drag': lambda x, y: got.append((x, y))})
+        self.addCleanup(w.destroy)
+        w.geometry('+300+316')
+        pump(100)
+        ev = lambda xr, yr: SimpleNamespace(x=50, y=5, x_root=xr, y_root=yr)  # noqa: E731
+        w._on_press(ev(350, 321))
+        w._on_motion(ev(650, 421))
+        pump(100)
+        self.assertEqual(got, [(600, 416)])
+        self.assertEqual((w.winfo_x(), w.winfo_y()), (300, 316))
+
+    def test_albums_docked_beside_the_playlist_follows_the_stack(self):
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        px, py = self.c.pl.winfo_x(), self.c.pl.winfo_y()
+        self.c.albums.geometry(f'+{px + 275}+{py}')
+        pump(200)
+        self.c.main.geometry('+340+230')
+        pump(300)
+        self.assertEqual(rect(self.c.albums)[:2], (px + 275 + 40, py + 30))
+        self.assert_stacked()
+
+    def test_playlist_destroyed_from_outside_comes_back(self):
+        self.open_skin()
+        self.c.pl.destroy()
+        pump(skin_mode.REFRESH_MS + 200)
+        self.assertTrue(self.c.pl is not None and self.c.pl.winfo_exists())
+        self.assert_stacked()
 
 
 if __name__ == '__main__':
