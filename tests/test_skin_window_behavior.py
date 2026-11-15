@@ -192,6 +192,25 @@ class SkinWindowBehaviorTests(unittest.TestCase):
                 x, y, ww, hh = rect(w)
                 self.assertEqual(reachable((x, y, ww, hh), [(0, 0, 1000, 700)], grip=28), (x, y))
 
+    def test_a_stack_taller_than_the_screen_keeps_the_main_window_reachable(self):
+        self.c.settings['positions'] = {'main': [100, 300], 'eq': [100, 416], 'pl': [100, 532]}
+        areas = [(0, 0, 1000, 400)]
+        with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: areas):
+            self.open_skin()
+            pump(skin_mode.KEEP_MS + 200)
+            for w in self.c._windows():
+                x, y, ww, hh = rect(w)
+                self.assertEqual(reachable((x, y, ww, hh), areas), (x, y))
+            self.assertEqual(self.c._main_pos, (self.c.main.winfo_x(), self.c.main.winfo_y()))
+
+    def test_eq_destroyed_from_outside_is_remembered_as_closed(self):
+        self.open_skin()
+        self.c.eq.destroy()
+        pump(skin_mode.REFRESH_MS + 200)
+        self.assertIsNone(self.c.eq)
+        self.assertFalse(self.c.settings['eq_open'])
+        self.assertTrue(self.c.active)
+
     def test_saved_spot_off_every_monitor_opens_on_screen(self):
         self.c.settings['positions'] = {'main': [5000, 3000]}
         with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: [(0, 0, 1920, 1040)]):

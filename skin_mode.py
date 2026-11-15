@@ -357,6 +357,8 @@ class SkinController:
         for name in ('eq', 'pl', 'albums'):
             if getattr(self, name) is not None and not self._alive(getattr(self, name)):
                 setattr(self, name, None)
+                if name + '_open' in self.settings:
+                    self.settings[name + '_open'] = False
         return True
 
     def _skin_toplevel(self, win, on_close):
@@ -364,6 +366,8 @@ class SkinController:
         (minimize), and Alt+F4 / the taskbar's Close does what its own close button does."""
         win.transient(self.main)
         win.protocol('WM_DELETE_WINDOW', on_close)
+        # FocusIn also fires as focus moves between the window's own widgets; the extra lift is harmless, and
+        # activating the playlist can hand focus straight to its search box
         win.bind('<FocusIn>', lambda e: self._raise_group(win), add='+')
 
     def _raise_group(self, focused):
@@ -914,6 +918,11 @@ class SkinController:
                 dx = nx - rects[i][0]
             if abs(ny - rects[i][1]) > abs(dy):
                 dy = ny - rects[i][1]
+        main = [rects[0][0] + dx, rects[0][1] + dy, rects[0][2], rects[0][3]]
+        if tuple(pull(main)) != (main[0], main[1]):
+            # a stack taller than the screen: the main window wins, the rest are pulled in one by one below
+            nx, ny = pull(rects[0])
+            dx, dy = nx - rects[0][0], ny - rects[0][1]
         for i in group:
             rects[i][0] += dx
             rects[i][1] += dy
@@ -927,6 +936,8 @@ class SkinController:
                 self.settings['positions'][name] = [r[0], r[1]]
                 changed = True
         if changed:
+            self.main.update_idletasks()
+            self._main_pos = (self.main.winfo_x(), self.main.winfo_y())   # where it really is, moved or not
             self.save()
 
     def _on_main_configure(self, event):
