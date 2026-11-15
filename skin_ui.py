@@ -10,6 +10,8 @@ import tkinter as tk
 
 from PIL import Image, ImageDraw, ImageTk
 
+from skin_hover import EQ_LABELS, MAIN_LABELS, HoverLabel, watch
+
 from skin_layout import (MAIN_LAYOUT, EQ_LAYOUT, hit_test, slider_value, slider_thumb_x,
                          volume_frame, balance_frame, eq_frame, eq_thumb_y, time_digits,
                          text_cells, marquee_slice, TIME_DIGIT_X, MINUS_SIGN)
@@ -82,6 +84,11 @@ def rim_overlay(background, layout, names, band=3):
     return out
 
 
+def _labelled(key, table):
+    """(key, its hover label) for a control that has one, else None."""
+    return (key, table[key]) if key in table else None
+
+
 class SkinWindow(tk.Toplevel):
     def __init__(self, master, skin, scale, width, height, callbacks):
         super().__init__(master)
@@ -101,6 +108,7 @@ class SkinWindow(tk.Toplevel):
         self.bind('<FocusIn>', self._on_focus_in)
         self.bind('<FocusOut>', self._on_focus_out)
         self.bind('<Button-3>', self._on_right_click)
+        self.hover = HoverLabel(self, skin.pledit)     # what a control does, after the mouse rests on it
 
     def blit(self, img, x, y, tag=None):
         photo = ImageTk.PhotoImage(self.skin.scaled(img, self.scale), master=self.canvas)
@@ -142,6 +150,7 @@ class SkinWindow(tk.Toplevel):
     def set_skin(self, skin, scale):
         self.skin = skin
         self.scale = scale
+        self.hover.colors = skin.pledit
         self.canvas.config(width=self.width * scale, height=self.height * scale)
         self.redraw()
 
@@ -156,6 +165,7 @@ class SkinWindow(tk.Toplevel):
         self._photos.clear()
         self._tag_photos.clear()
         self._rims = None
+        self.hover.destroy()
         super().destroy()
 
     def _on_focus_in(self, event=None):
@@ -194,6 +204,8 @@ class SkinMainWindow(SkinWindow):
         self.canvas.bind('<ButtonPress-1>', self._on_press)
         self.canvas.bind('<B1-Motion>', self._on_motion)
         self.canvas.bind('<ButtonRelease-1>', self._on_release)
+        watch(self.hover, self.canvas,
+              lambda e: _labelled(hit_test(MAIN_LAYOUT, e.x, e.y, self.scale), MAIN_LABELS))
         self._marquee_id = self.after(MARQUEE_MS, self._tick_marquee)
         self.redraw()
 
@@ -455,6 +467,8 @@ class SkinEqWindow(SkinWindow):
         self.canvas.bind('<ButtonPress-1>', self._on_press)
         self.canvas.bind('<B1-Motion>', self._on_motion)
         self.canvas.bind('<ButtonRelease-1>', self._on_release)
+        watch(self.hover, self.canvas,
+              lambda e: _labelled(hit_test(EQ_LAYOUT, e.x, e.y, self.scale), EQ_LABELS))
         self.redraw()
 
     def update_state(self, **kw):

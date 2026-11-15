@@ -182,6 +182,8 @@ def minimize_window(win):
 class SkinFrameWindow(SkinPlaylistWindow):
     """A window in the skin's playlist frame with arbitrary Tk content in self.body (used for Albums)."""
 
+    HOVER_LABELS = {}              # its close button really closes it: no playlist labels
+
     def __init__(self, master, skin, scale, callbacks, height=290):
         self.body = None
         super().__init__(master, skin, scale, callbacks, height=height)

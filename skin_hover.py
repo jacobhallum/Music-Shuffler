@@ -155,4 +155,7 @@ def watch(hover, widget, key_at):
 
     widget.bind('<Motion>', on_motion, add='+')
     widget.bind('<Leave>', lambda event: hover.point(None, None, 0, 0), add='+')
-    widget.bind('<ButtonPress>', lambda event: hover.press(), add='+')
+    # one binding per button: Tk runs only the most specific match, so a window's own <ButtonPress-1> handler
+    # would shadow a generic <ButtonPress>
+    for n in (1, 2, 3):
+        widget.bind(f'<ButtonPress-{n}>', lambda event: hover.press(), add='+')
