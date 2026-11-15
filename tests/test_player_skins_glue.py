@@ -161,10 +161,17 @@ class SkinControllerTests(unittest.TestCase):
             json.dump({'pl_height': 99999}, f)
         self.assertEqual(skin_mode.load_settings(self.c.settings_path)['pl_height'], 2000)
 
-    def test_offscreen_positions_start_from_the_default_spot(self):
+    def test_offscreen_positions_come_back_fully_on_screen(self):
+        areas = [(0, 0, 1920, 1040)]
         self.c.settings['positions'] = {'main': [-99999, 50], 'eq': [300, 300]}
-        self.c.pick('syn.wsz')
-        self.assertNotIn('main', self.c.settings['positions'])
+        with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: areas):
+            self.c.pick('syn.wsz')
+            done = []
+            _root.after(skin_mode.KEEP_MS + 150, lambda: done.append(1))
+            while not done:
+                _root.update()
+        x, y = self.c.settings['positions']['main']
+        self.assertTrue(0 <= x <= 1920 - 275 and 0 <= y <= 1040 - 116, (x, y))
         self.assertEqual(self.c.settings['positions'].get('eq'), [300, 300])
 
     def test_a_skin_that_fails_to_show_brings_back_the_default_view(self):

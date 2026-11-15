@@ -50,6 +50,25 @@ def snap(rect, others, screen):
     return (int(x), int(y))
 
 
+def reachable(rect, areas, grip=14, keep=100):
+    """The (x, y) to move `rect` to so its title strip (the top `grip` px) shows at least `keep` px wide (all of it
+    when narrower) inside one of `areas` (monitor work areas, (x, y, w, h)). Unchanged when it already does; else
+    the smallest move into the nearest area. No areas: unchanged."""
+    x, y, w, h = rect
+    keep = min(keep, w)
+    for ax, ay, aw, ah in areas:
+        if min(x + w, ax + aw) - max(x, ax) >= keep and ay <= y <= ay + ah - grip:
+            return (x, y)
+    best = None
+    for ax, ay, aw, ah in areas:
+        nx = min(max(x, ax - w + keep), ax + aw - keep)
+        ny = min(max(y, ay), ay + ah - grip)
+        d = abs(nx - x) + abs(ny - y)
+        if best is None or d < best[0]:
+            best = (d, nx, ny)
+    return (x, y) if best is None else (best[1], best[2])
+
+
 def docked(a, b):
     """True when rects a and b touch edge to edge and overlap along that edge."""
     ax, ay, aw, ah = a
