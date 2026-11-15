@@ -121,6 +121,21 @@ class HoverLabelTests(unittest.TestCase):
             self.assertGreaterEqual(t.winfo_x(), 0)
             self.assertGreaterEqual(t.winfo_y(), 0)
 
+    def test_label_is_placed_before_it_is_shown(self):
+        """No flash at the screen's corner: the label is hidden while it is measured and moved into place."""
+        seen = []
+        real = tk.Toplevel.geometry
+
+        def spy(win, *a):
+            if a and a[0].startswith('+'):
+                seen.append(bool(win.winfo_viewable()))
+            return real(win, *a)
+        with unittest.mock.patch.object(tk.Toplevel, 'geometry', spy):
+            self.h.point('play', 'Play', 400, 350)
+            pump(600)
+        self.assertEqual(seen, [False])
+        self.assertTrue(self.h.tip.winfo_viewable())
+
     def test_label_uses_the_skin_colours_and_a_fixed_small_font(self):
         self.h.point('play', 'Play', 400, 350)
         pump(600)
@@ -148,6 +163,73 @@ class HoverLabelTests(unittest.TestCase):
         canvas.event_generate('<Motion>', x=12, y=10)
         canvas.event_generate('<Leave>')
         self.assertIsNone(tip_text(self.h))
+
+
+@unittest.skipIf(_root is None, "no display")
+class WindowHoverTests(unittest.TestCase):
+    """The skinned windows feed their own hit test to the label."""
+
+    def setUp(self):
+        import tempfile
+        from tests.test_skin_ui import _skin
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.skin = _skin(self.tmp.name)
+
+    def show(self, w):
+        self.addCleanup(lambda: w.winfo_exists() and w.destroy())
+        w.geometry('+300+300')
+        pump(100)
+        return w
+
+    def hover_at(self, w, widget, x, y):
+        widget.event_generate('<Motion>', x=x, y=y)
+        pump(600)
+        return tip_text(w.hover)
+
+    def test_main_window_labels_the_control_under_the_pointer(self):
+        w = self.show(skin_ui.SkinMainWindow(_root, self.skin, 1, {}))
+        self.assertEqual(self.hover_at(w, w.canvas, 39 + 11, 88 + 9), 'Play')
+        w.canvas.event_generate('<Leave>')
+        self.assertIsNone(tip_text(w.hover))
+        self.assertEqual(self.hover_at(w, w.canvas, 10 + 4, 47 + 4), 'Size: 1x / 2x / 3x')
+        self.assertIsNone(self.hover_at(w, w.canvas, 150, 5))          # plain title bar: no label
+
+    def test_main_window_at_3x_labels_the_right_control(self):
+        w = self.show(skin_ui.SkinMainWindow(_root, self.skin, 3, {}))
+        self.assertEqual(self.hover_at(w, w.canvas, (39 + 11) * 3, (88 + 9) * 3), 'Play')
+
+    def test_pressing_hides_the_label(self):
+        w = self.show(skin_ui.SkinMainWindow(_root, self.skin, 1, {}))
+        self.assertEqual(self.hover_at(w, w.canvas, 85 + 11, 88 + 9), 'Stop')
+        w.canvas.event_generate('<ButtonPress-1>', x=85 + 11, y=88 + 9)
+        w.canvas.event_generate('<ButtonRelease-1>', x=85 + 11, y=88 + 9)
+        self.assertIsNone(tip_text(w.hover))
+
+    def test_eq_window_labels_bands(self):
+        w = self.show(skin_ui.SkinEqWindow(_root, self.skin, 1, {}))
+        self.assertEqual(self.hover_at(w, w.canvas, 78 + 7, 38 + 30), '60 Hz')
+        self.assertEqual(self.hover_at(w, w.canvas, 14 + 13, 18 + 6), 'Equalizer on/off')
+
+    def test_playlist_labels_grip_close_and_search(self):
+        import skin_playlist
+        w = self.show(skin_playlist.SkinPlaylistWindow(_root, self.skin, 1, {}))
+        self.assertEqual(self.hover_at(w, w.canvas, 265, w.height - 10), 'Drag to resize')
+        self.assertEqual(self.hover_at(w, w.canvas, 270, 5), 'Playlist stays open')
+        self.assertEqual(self.hover_at(w, w.entry, 5, 5), 'Search (Enter plays the first match)')
+
+    def test_albums_frame_window_has_no_playlist_labels(self):
+        import skin_mode
+        w = self.show(skin_mode.SkinFrameWindow(_root, self.skin, 1, {}))
+        self.assertIsNone(self.hover_at(w, w.canvas, 270, 5))
+
+    def test_closing_a_window_takes_its_label(self):
+        w = self.show(skin_ui.SkinMainWindow(_root, self.skin, 1, {}))
+        self.assertEqual(self.hover_at(w, w.canvas, 39 + 11, 88 + 9), 'Play')
+        h = w.hover
+        w.destroy()
+        pump(100)
+        self.assertIsNone(h.tip)
 
 
 @unittest.skipIf(_root is None, "no display")
