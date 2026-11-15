@@ -169,6 +169,35 @@ class SkinWindowTests(unittest.TestCase):
         w.withdraw()
         self.assertEqual((int(w.canvas.cget('width')), int(w.canvas.cget('height'))), (825, 348))
 
+    # ---- the soft contrast rim (Jacob 2026-11-15: buttons always visible, not super bright) ----
+
+    def test_rim_is_light_on_a_dark_skin_and_dark_on_a_light_one(self):
+        layout = {'play': (39, 88, 23, 18), 'other': (100, 50, 10, 10)}
+        dark = skin_ui.rim_overlay(Image.new('RGB', (275, 116), (20, 20, 20)), layout, ('play', 'missing'))
+        light = skin_ui.rim_overlay(Image.new('RGB', (275, 116), (230, 230, 230)), layout, ('play',))
+        self.assertEqual((dark.mode, dark.size), ('RGBA', (275, 116)))
+        self.assertEqual(dark.getpixel((39, 88)), (255, 255, 255, 110))          # top-left corner of the rect
+        self.assertEqual(dark.getpixel((39 + 22, 88 + 17)), (255, 255, 255, 110))  # bottom-right corner
+        self.assertEqual(dark.getpixel((50, 95))[3], 0)                         # inside: untouched
+        self.assertEqual(dark.getpixel((100, 50))[3], 0)                        # not in names: no rim
+        self.assertEqual(light.getpixel((39, 88)), (0, 0, 0, 120))
+
+    def test_main_and_eq_windows_draw_one_rim_layer(self):
+        for w in (skin_ui.SkinMainWindow(_root, self.skin, 1, {}), skin_ui.SkinEqWindow(_root, self.skin, 2, {})):
+            self.addCleanup(w.destroy)
+            w.withdraw()
+            w.redraw()
+            self.assertEqual(len(w.canvas.find_withtag('rims')), 1, type(w).__name__)
+
+    def test_rim_is_built_once_per_skin(self):
+        w = skin_ui.SkinMainWindow(_root, self.skin, 1, {})
+        self.addCleanup(w.destroy)
+        w.withdraw()
+        w.redraw()
+        first = w._rims[1]
+        w.update_state(volume=10)
+        self.assertIs(w._rims[1], first)
+
 
 if __name__ == '__main__':
     unittest.main()
