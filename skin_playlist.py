@@ -17,12 +17,16 @@ import tkinter as tk
 
 from PIL import ImageTk
 
+from skin_hover import PL_LABELS, HoverLabel, watch
+
 WIDTH = 275
 MIN_HEIGHT = 116
 STEP_H = 29          # Winamp resizes the playlist in 29 px steps
 
 
 class SkinPlaylistWindow(tk.Toplevel):
+    HOVER_LABELS = PL_LABELS       # subclasses with other content (Albums) override
+
     def __init__(self, master, skin, scale, callbacks, height=232):
         super().__init__(master)
         self.overrideredirect(True)
@@ -51,7 +55,13 @@ class SkinPlaylistWindow(tk.Toplevel):
         self.canvas.bind('<ButtonRelease-1>', self._on_release)
         self.bind('<FocusIn>', lambda e: self._set_focus(True))
         self.bind('<FocusOut>', lambda e: self._set_focus(False))
+        self.hover = HoverLabel(self, skin.pledit)
+        watch(self.hover, self.canvas, lambda e: self._hover_key(self._hit(e)))
+        watch(self.hover, self.entry, lambda e: self._hover_key('search'))
         self.redraw()
+
+    def _hover_key(self, key):
+        return (key, self.HOVER_LABELS[key]) if key in self.HOVER_LABELS else None
 
     # ---- drawing -----------------------------------------------------------------
 
@@ -69,6 +79,7 @@ class SkinPlaylistWindow(tk.Toplevel):
         # Drop the images on the Tk thread; freed later by the garbage collector on another thread they would
         # call into Tk from there.
         self._photos.clear()
+        self.hover.destroy()
         super().destroy()
 
     def _blit(self, img, x, y):
@@ -78,6 +89,7 @@ class SkinPlaylistWindow(tk.Toplevel):
 
     def set_skin(self, skin, scale):
         self.skin, self.scale = skin, scale
+        self.hover.colors = skin.pledit
         self.redraw()
 
     def set_height(self, height):
