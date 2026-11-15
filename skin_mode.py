@@ -32,7 +32,8 @@ VIS_MS = 33
 KEEP_MS = 60          # after a move: let docked windows follow before pulling title bars back on screen
 VIS_MODES = ('spectrum', 'scope', 'off')
 SAMPLE_RATE = 48000          # the engine's output format: 48 kHz stereo float32
-DEFAULTS = {'skin': None, 'double_size': False, 'always_on_top': False, 'vis_mode': 'spectrum',
+SIZES = (1, 2, 3)     # whole-number scales only: nearest-neighbour pixels stay crisp
+DEFAULTS = {'skin': None, 'size': 1, 'always_on_top': False, 'vis_mode': 'spectrum',
             'eq_open': True, 'pl_open': True, 'positions': {}, 'pl_height': 232}
 
 
@@ -66,9 +67,13 @@ def load_settings(path):
     if isinstance(name, str) and name.lower().endswith('.wsz') and os.path.basename(name) == name \
             and '/' not in name and '\\' not in name:
         out['skin'] = name
-    for k in ('double_size', 'always_on_top', 'eq_open', 'pl_open'):
+    for k in ('always_on_top', 'eq_open', 'pl_open'):
         if isinstance(data.get(k), bool):
             out[k] = data[k]
+    if _is_int(data.get('size')) and data['size'] in SIZES:
+        out['size'] = data['size']
+    elif 'size' not in data and data.get('double_size') is True:     # settings saved before sizes existed
+        out['size'] = 2
     if data.get('vis_mode') in VIS_MODES:
         out['vis_mode'] = data['vis_mode']
     if _is_int(data.get('pl_height')):
@@ -238,7 +243,7 @@ class SkinController:
         return self.main is not None
 
     def scale(self):
-        return 2 if self.settings['double_size'] else 1
+        return self.settings['size']
 
     def available(self):
         return skin_lib.list_skins(self.skins_dir)
@@ -540,7 +545,7 @@ class SkinController:
             'repeat': lambda: self.main.flash("REPEAT ISN'T AVAILABLE"),
             'eq': self.toggle_eq, 'pl': self.toggle_pl, 'seek': self._seek, 'volume': self._volume,
             'close': p._on_close, 'minimize': lambda: minimize_window(self.main), 'menu': self.show_menu,
-            'heart': p.toggle_loved, 'clutter_a': self.toggle_topmost, 'clutter_d': self.toggle_double,
+            'heart': p.toggle_loved, 'clutter_a': self.toggle_topmost, 'clutter_d': self.cycle_size,
             'clutter_i': self.song_info, 'clutter_v': self.cycle_vis, 'vis_mode': self.cycle_vis,
             'moved': lambda x, y: self._snap(self.main, 'main'),
         }
@@ -627,9 +632,15 @@ class SkinController:
             if w is not None:
                 w.attributes('-topmost', on)
 
-    def toggle_double(self):
+    def cycle_size(self):
+        """The D button: 1x -> 2x -> 3x -> 1x."""
+        self.set_size(SIZES[(SIZES.index(self.scale()) + 1) % len(SIZES)])
+
+    def set_size(self, size):
+        if size not in SIZES:
+            return
         self._remember_positions()
-        self.settings['double_size'] = not self.settings['double_size']
+        self.settings['size'] = size
         s = self.scale()
         for w in (self.main, self.eq, self.pl, self.albums):
             if w is not None:
@@ -683,8 +694,13 @@ class SkinController:
         menu.add_separator()
         menu.add_checkbutton(label="Always on top", command=self.toggle_topmost,
                              variable=tk.BooleanVar(menu, value=self.settings['always_on_top']))
-        menu.add_checkbutton(label="Double size", command=self.toggle_double,
-                             variable=tk.BooleanVar(menu, value=self.settings['double_size']))
+        sizes = tk.Menu(menu, tearoff=0)
+        size_var = tk.IntVar(menu, value=self.scale())
+        menu._size_var = size_var            # keep the variable alive while the menu is up
+        for n in SIZES:
+            sizes.add_radiobutton(label=f"{n}×", value=n, variable=size_var,
+                                  command=lambda n=n: self.set_size(n))
+        menu.add_cascade(label="Size", menu=sizes)
         menu.add_separator()
         menu.add_command(label="Exit", command=p._on_close)
         try:
@@ -820,7 +836,7 @@ class SkinController:
             volume=float(p.volume_var.get()), position=(elapsed / duration) if duration else 0.0,
             shuffle=not p.is_temp_view, eq_open=self.eq is not None, pl_open=self.pl is not None,
             favorite=bool(getattr(track, 'loved', False)), always_on_top=self.settings['always_on_top'],
-            double_size=self.settings['double_size'])
+            double_size=self.scale() > 1)     # the D button is lit above 1x
         status = p.status_label.cget('text')
         if status != self._last_status:
             if self._last_status is not None and status:

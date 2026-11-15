@@ -129,10 +129,28 @@ class SkinControllerTests(unittest.TestCase):
         self.c.pick('syn.wsz')
         self.c.toggle_eq()
         self.c.toggle_topmost()
-        self.c.toggle_double()
+        self.c.cycle_size()
         s = self.settings_file()
-        self.assertEqual((s['eq_open'], s['always_on_top'], s['double_size']), (False, True, True))
+        self.assertEqual((s['eq_open'], s['always_on_top'], s['size']), (False, True, 2))
+        self.assertNotIn('double_size', s)
         self.assertEqual(self.c.main.scale, 2)
+
+    def test_size_cycles_one_two_three_and_is_saved(self):
+        self.c.pick('syn.wsz')
+        for want in (2, 3, 1):
+            self.c.cycle_size()
+            self.assertEqual(self.c.scale(), want)
+            self.assertEqual(self.settings_file()['size'], want)
+            self.assertEqual(self.c.main.scale, want)
+        self.c.set_size(3)
+        self.assertEqual((self.c.scale(), self.c.pl.scale, self.c.eq.scale), (3, 3, 3))
+
+    def test_old_double_size_setting_reads_as_2x(self):
+        for text, want in (('{"double_size": true}', 2), ('{"double_size": false}', 1), ('{"size": 7}', 1),
+                           ('{"size": "3"}', 1), ('{"size": true}', 1), ('{"size": 3, "double_size": true}', 3)):
+            with open(self.c.settings_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            self.assertEqual(skin_mode.load_settings(self.c.settings_path)['size'], want, text)
 
     def test_eq_window_change_goes_to_the_player(self):
         self.c.pick('syn.wsz')
@@ -150,7 +168,7 @@ class SkinControllerTests(unittest.TestCase):
         with open(self.c.settings_path, 'w', encoding='utf-8') as f:
             f.write('{"skin": 5, "double_size": "yes", "vis_mode": "laser"}')
         s = skin_mode.load_settings(self.c.settings_path)
-        self.assertEqual((s['skin'], s['double_size'], s['vis_mode']), (None, False, 'spectrum'))
+        self.assertEqual((s['skin'], s['size'], s['vis_mode']), (None, 1, 'spectrum'))
         bad = {'skin': '..\\..\\evil.wsz', 'pl_height': True,
                'positions': {'main': [1, 2], 'eq': 'x', 'pl': [1, 2, 3], 'albums': [True, 4]}}
         with open(self.c.settings_path, 'w', encoding='utf-8') as f:

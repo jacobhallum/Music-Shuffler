@@ -189,7 +189,7 @@ class SkinWindowBehaviorTests(unittest.TestCase):
         self.c.settings['positions'] = {'main': [600, 300], 'eq': [600, 416], 'pl': [600, 532]}
         self.open_skin()
         with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: [(0, 0, 1000, 700)]):
-            self.c.toggle_double()
+            self.c.cycle_size()
             pump(400)
             for w in self.c._windows():
                 x, y, ww, hh = rect(w)
@@ -330,10 +330,20 @@ class SkinStackTests(unittest.TestCase):
 
     def test_double_size_keeps_the_stack_flush(self):
         self.open_skin()
-        self.c.toggle_double()
+        self.c.cycle_size()
         pump(300)
         self.assertEqual(self.c.scale(), 2)
         self.assert_stacked()
+
+    def test_3x_stack_is_flush_and_three_times_as_big(self):
+        self.open_skin()
+        with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: [(0, 0, 4000, 3000)]):
+            self.c.set_size(3)
+            pump(400)
+        self.assertEqual(rect(self.c.main)[2:], (825, 348))
+        self.assertEqual(rect(self.c.eq)[:2], (300, 200 + 348))
+        self.assertEqual(rect(self.c.pl)[:2], (300, 200 + 696))
+        self.assertEqual(rect(self.c.pl)[3], 232 * 3)
 
     def test_dragging_the_playlist_title_moves_the_whole_stack(self):
         self.open_skin()

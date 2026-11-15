@@ -163,6 +163,12 @@ class SkinWindowTests(unittest.TestCase):
         w.set_skin(self.skin, 2)
         self.assertEqual((int(w.canvas.cget('width')), int(w.canvas.cget('height'))), (550, 232))
 
+    def test_triple_size_scales_canvas(self):
+        w = skin_ui.SkinMainWindow(_root, self.skin, 3, {})
+        self.addCleanup(w.destroy)
+        w.withdraw()
+        self.assertEqual((int(w.canvas.cget('width')), int(w.canvas.cget('height'))), (825, 348))
+
 
 if __name__ == '__main__':
     unittest.main()
