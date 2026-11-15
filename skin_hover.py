@@ -73,6 +73,9 @@ class HoverLabel:
         self._text = None
         self._pos = (0, 0)
         self._blocked = None
+        # minimized, Win+D or another app focused: never leave a label floating over the desktop
+        owner.bind('<Unmap>', lambda e: e.widget is owner and self.hide(), add='+')
+        owner.bind('<FocusOut>', lambda e: self.hide(), add='+')
 
     def point(self, key, text, x_root, y_root):
         if key is None or text is None:
@@ -118,7 +121,7 @@ class HoverLabel:
     def _show(self):
         self._job = None
         try:
-            if not self.owner.winfo_exists():
+            if not self.owner.winfo_exists() or not self.owner.winfo_viewable():
                 return
             tip = tk.Toplevel(self.owner, bg=self.colors['current'])
             tip.withdraw()                 # measured and placed while hidden: no flash at the screen's corner

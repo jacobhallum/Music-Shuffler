@@ -172,9 +172,13 @@ def set_app_window(win):
 
 
 def minimize_window(win):
+    """Minimize a borderless window (Tk's iconify() refuses override-redirect windows). Posted, not ShowWindow():
+    ShowWindow minimizes inside the ctypes call, which runs Tk event bindings (Python) while ctypes has released the
+    GIL: a fatal "GIL is released" crash."""
+    WM_SYSCOMMAND, SC_MINIMIZE = 0x0112, 0xF020
     try:
         hwnd = ctypes.windll.user32.GetParent(win.winfo_id()) or win.winfo_id()
-        ctypes.windll.user32.ShowWindow(hwnd, 6)   # SW_MINIMIZE
+        ctypes.windll.user32.PostMessageW(hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0)
     except AttributeError:
         win.withdraw()
 

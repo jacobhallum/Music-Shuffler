@@ -121,6 +121,28 @@ class HoverLabelTests(unittest.TestCase):
             self.assertGreaterEqual(t.winfo_x(), 0)
             self.assertGreaterEqual(t.winfo_y(), 0)
 
+    def test_no_label_when_the_window_was_hidden_before_the_wait_ended(self):
+        self.h.point('play', 'Play', 400, 350)
+        pump(200)
+        self.owner.withdraw()                             # minimized / Win+D while the mouse rests
+        pump(500)
+        self.assertIsNone(tip_text(self.h))
+
+    def test_a_showing_label_goes_when_its_window_is_hidden_or_loses_focus(self):
+        self.h.point('play', 'Play', 400, 350)
+        pump(600)
+        self.owner.withdraw()
+        pump(100)
+        self.assertIsNone(tip_text(self.h))               # no label floating alone over the desktop
+        self.owner.deiconify()
+        pump(100)
+        self.h.point('stop', 'Stop', 400, 350)
+        pump(600)
+        self.assertEqual(tip_text(self.h), 'Stop')
+        self.owner.event_generate('<FocusOut>')           # Alt+Tab to another app
+        pump(50)
+        self.assertIsNone(tip_text(self.h))
+
     def test_label_is_placed_before_it_is_shown(self):
         """No flash at the screen's corner: the label is hidden while it is measured and moved into place."""
         seen = []
