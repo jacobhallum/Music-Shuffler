@@ -7,7 +7,7 @@ Tk list. It imports no player code: set_rows() fills it and the callbacks dict r
   'play'(index)          double-click or Enter on a row
   'search'(text)         the search text changed
   'search_enter'()       Enter in the search box
-  'menu'(x_root, y_root, index)   right-click (index None outside rows)
+  'menu'(x_root, y_root, index)   right-click (index None off the songs: frame, below the last song, empty list)
   'close'()  'moved'(x, y)
   'drag'(x, y)          optional: the title bar is dragged so the window would sit at (x, y); when given, the
                         window doesn't move itself (it is part of the controller's stack)
@@ -156,11 +156,15 @@ class SkinPlaylistWindow(tk.Toplevel):
         return 'break'
 
     def _on_menu(self, event):
+        """On a song: the song's menu (index). Below the last song or on an empty list: index None."""
         i = self.listbox.nearest(event.y)
-        if 0 <= i < self.listbox.size():
+        box = self.listbox.bbox(i) if 0 <= i < self.listbox.size() else None
+        if box is not None and box[1] <= event.y < box[1] + box[3]:
             self.listbox.selection_clear(0, tk.END)
             self.listbox.selection_set(i)
             self._fire('menu', event.x_root, event.y_root, i)
+        else:
+            self._fire('menu', event.x_root, event.y_root, None)
         return 'break'
 
     # ---- moving, closing, resizing ---------------------------------------------------

@@ -694,7 +694,10 @@ class SkinController:
 
     def _pl_menu(self, x_root, y_root, index):
         p = self.p
-        if index is None or not (0 <= index < len(self._pl_tracks())):
+        if index is None:                  # off the songs: the main menu (Settings, Skins, ...)
+            self.show_menu(x_root, y_root)
+            return
+        if not (0 <= index < len(self._pl_tracks())):
             return
         track = self._pl_tracks()[index]
         album = p.library_index.album_of(track) if p.library_index is not None else None

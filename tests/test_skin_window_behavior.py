@@ -392,6 +392,39 @@ class SkinStackTests(unittest.TestCase):
         self.assertEqual(rect(self.c.albums)[:2], (px + 275 + 40, py + 30))
         self.assert_stacked()
 
+    # ---- right-click on the playlist ----------------------------------------------------------
+
+    def right_click(self, y):
+        return SimpleNamespace(x=5, y=y, x_root=10, y_root=20)
+
+    def test_right_click_below_the_songs_opens_the_main_menu(self):
+        self.open_skin()
+        self.c.pl.set_rows(['a', 'b'])
+        pump(100)
+        bx, by, bw, bh = self.c.pl.listbox.bbox(1)
+        with unittest.mock.patch.object(self.c, 'show_menu') as menu:
+            self.c.pl._on_menu(self.right_click(by + bh + 10))
+        menu.assert_called_once_with(10, 20)
+        self.assertEqual(self.c.pl.listbox.curselection(), ())
+
+    def test_right_click_on_an_empty_playlist_opens_the_main_menu(self):
+        self.open_skin()
+        self.c.pl.set_rows([])
+        pump(100)
+        with unittest.mock.patch.object(self.c, 'show_menu') as menu:
+            self.c.pl._on_menu(self.right_click(10))
+        menu.assert_called_once_with(10, 20)
+
+    def test_right_click_on_a_song_still_gives_the_song_menu(self):
+        self.open_skin()
+        self.c.pl.set_rows(['a', 'b'])
+        pump(100)
+        got = []
+        self.c.pl.callbacks['menu'] = lambda *a: got.append(a)
+        bx, by, bw, bh = self.c.pl.listbox.bbox(0)
+        self.c.pl._on_menu(self.right_click(by + bh // 2))
+        self.assertEqual(got, [(10, 20, 0)])
+
     def test_playlist_destroyed_from_outside_comes_back(self):
         self.open_skin()
         self.c.pl.destroy()
