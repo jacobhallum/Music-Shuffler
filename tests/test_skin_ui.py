@@ -163,6 +163,66 @@ class SkinWindowTests(unittest.TestCase):
         w.set_skin(self.skin, 2)
         self.assertEqual((int(w.canvas.cget('width')), int(w.canvas.cget('height'))), (550, 232))
 
+    def test_triple_size_scales_canvas(self):
+        w = skin_ui.SkinMainWindow(_root, self.skin, 3, {})
+        self.addCleanup(w.destroy)
+        w.withdraw()
+        self.assertEqual((int(w.canvas.cget('width')), int(w.canvas.cget('height'))), (825, 348))
+
+    # ---- the soft contrast rim (Jacob 2026-11-15: buttons always visible, not super bright) ----
+
+    def test_rim_is_light_on_a_dark_skin_and_dark_on_a_light_one(self):
+        layout = {'play': (39, 88, 23, 18), 'other': (100, 50, 10, 10)}
+        dark = skin_ui.rim_overlay(Image.new('RGB', (275, 116), (20, 20, 20)), layout, ('play', 'missing'))
+        light = skin_ui.rim_overlay(Image.new('RGB', (275, 116), (230, 230, 230)), layout, ('play',))
+        self.assertEqual((dark.mode, dark.size), ('RGBA', (275, 116)))
+        self.assertEqual(dark.getpixel((39, 88)), (255, 255, 255, 110))          # top-left corner of the rect
+        self.assertEqual(dark.getpixel((39 + 22, 88 + 17)), (255, 255, 255, 110))  # bottom-right corner
+        self.assertEqual(dark.getpixel((50, 95))[3], 0)                         # inside: untouched
+        self.assertEqual(dark.getpixel((100, 50))[3], 0)                        # not in names: no rim
+        self.assertEqual(light.getpixel((39, 88)), (0, 0, 0, 120))
+
+    def test_main_and_eq_windows_draw_one_rim_layer(self):
+        for w in (skin_ui.SkinMainWindow(_root, self.skin, 1, {}), skin_ui.SkinEqWindow(_root, self.skin, 2, {})):
+            self.addCleanup(w.destroy)
+            w.withdraw()
+            w.redraw()
+            self.assertEqual(len(w.canvas.find_withtag('rims')), 1, type(w).__name__)
+
+    def test_rim_is_built_once_per_skin(self):
+        w = skin_ui.SkinMainWindow(_root, self.skin, 1, {})
+        self.addCleanup(w.destroy)
+        w.withdraw()
+        w.redraw()
+        first = w._rims[1]
+        w.update_state(volume=10)
+        self.assertIs(w._rims[1], first)
+
+    def test_rim_photo_is_reused_between_redraws_and_dropped_on_destroy(self):
+        w = skin_ui.SkinMainWindow(_root, self.skin, 3, {})
+        w.withdraw()
+        w.redraw()
+        photo = w._rims[2]
+        w.update_state(volume=10)
+        self.assertIs(w._rims[2], photo)            # no rescale / new PhotoImage every 250 ms refresh
+        w.destroy()
+        self.assertIsNone(w._rims)                  # freed on the Tk thread, not later by the GC
+
+    def test_rim_colour_comes_from_what_is_drawn_under_the_button(self):
+        path = os.path.join(self.tmp.name, 'lighttitle.wsz')
+        with zipfile.ZipFile(path, 'w') as z:
+            z.writestr('main.bmp', _bmp((275, 116), (10, 10, 10)))          # dark window background
+            z.writestr('titlebar.bmp', _bmp((344, 87), (230, 230, 230)))    # light title bar drawn over it
+        light_title = skin.load_skin(path)
+        w = skin_ui.SkinMainWindow(_root, light_title, 1, {})
+        self.addCleanup(w.destroy)
+        w.withdraw()
+        w.redraw()
+        x, y, _w, _h = skin_ui.MAIN_LAYOUT['close']
+        self.assertEqual(w._rims[1].getpixel((x, y)), skin_ui.RIM_DARK)     # dark rim on the light title bar
+        x, y, _w, _h = skin_ui.MAIN_LAYOUT['play']
+        self.assertEqual(w._rims[1].getpixel((x, y)), skin_ui.RIM_LIGHT)    # light rim on the dark body
+
 
 if __name__ == '__main__':
     unittest.main()

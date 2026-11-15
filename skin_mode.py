@@ -13,6 +13,7 @@ It talks to the player only through MusicPlayerGUI's existing methods and state.
 import array
 import collections
 import ctypes
+import ctypes.wintypes as wt
 import json
 import os
 import tkinter as tk
@@ -28,9 +29,11 @@ from skin_ui import SkinEqWindow, SkinMainWindow
 
 REFRESH_MS = 250
 VIS_MS = 33
+KEEP_MS = 60          # after a move: let docked windows follow before pulling title bars back on screen
 VIS_MODES = ('spectrum', 'scope', 'off')
 SAMPLE_RATE = 48000          # the engine's output format: 48 kHz stereo float32
-DEFAULTS = {'skin': None, 'double_size': False, 'always_on_top': False, 'vis_mode': 'spectrum',
+SIZES = (1, 2, 3)     # whole-number scales only: nearest-neighbour pixels stay crisp
+DEFAULTS = {'skin': None, 'size': 1, 'always_on_top': False, 'vis_mode': 'spectrum',
             'eq_open': True, 'pl_open': True, 'positions': {}, 'pl_height': 232}
 
 
@@ -64,9 +67,13 @@ def load_settings(path):
     if isinstance(name, str) and name.lower().endswith('.wsz') and os.path.basename(name) == name \
             and '/' not in name and '\\' not in name:
         out['skin'] = name
-    for k in ('double_size', 'always_on_top', 'eq_open', 'pl_open'):
+    for k in ('always_on_top', 'eq_open', 'pl_open'):
         if isinstance(data.get(k), bool):
             out[k] = data[k]
+    if _is_int(data.get('size')) and data['size'] in SIZES:
+        out['size'] = data['size']
+    elif 'size' not in data and data.get('double_size') is True:     # settings saved before sizes existed
+        out['size'] = 2
     if data.get('vis_mode') in VIS_MODES:
         out['vis_mode'] = data['vis_mode']
     if _is_int(data.get('pl_height')):
@@ -92,11 +99,48 @@ def virtual_screen(win):
     return 0, 0, win.winfo_screenwidth(), win.winfo_screenheight()
 
 
-def on_screen(pos, screen, margin=40):
-    """True when a saved top-left corner still leaves the window reachable on the desktop."""
-    x, y = pos
-    sx, sy, sw, sh = screen
-    return sx - 200 <= x <= sx + sw - margin and sy <= y <= sy + sh - margin
+def work_areas(win):
+    """(x, y, w, h) of every monitor's work area (the desktop minus the taskbar) on Windows, else the whole screen."""
+    try:
+        user32 = ctypes.WinDLL('user32')
+    except (AttributeError, OSError):
+        return [(0, 0, win.winfo_screenwidth(), win.winfo_screenheight())]
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [('cbSize', wt.DWORD), ('rcMonitor', wt.RECT), ('rcWork', wt.RECT), ('dwFlags', wt.DWORD)]
+
+    user32.GetMonitorInfoW.argtypes = [wt.HMONITOR, ctypes.POINTER(MONITORINFO)]
+    areas = []
+
+    def one(hmon, _hdc, _rect, _data):
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            r = mi.rcWork
+            if r.right > r.left and r.bottom > r.top:
+                areas.append((r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return 1
+
+    proc = ctypes.WINFUNCTYPE(ctypes.c_int, wt.HMONITOR, wt.HDC, ctypes.POINTER(wt.RECT), wt.LPARAM)(one)
+    try:
+        user32.EnumDisplayMonitors(None, None, proc, 0)
+    except Exception as e:
+        _log(f"⚠ Could not list the monitors: {e!r}")
+    return areas or [virtual_screen(win)]
+
+
+def _overlap(rect, area):
+    """Pixels of rect inside area (0 when area is None)."""
+    if area is None:
+        return 0
+    x, y, w, h = rect
+    ax, ay, aw, ah = area
+    return max(0, min(x + w, ax + aw) - max(x, ax)) * max(0, min(y + h, ay + ah) - max(y, ay))
+
+
+def _area_of(rect, areas):
+    """The work area that holds most of rect (the first one when it is on none)."""
+    return max(areas, key=lambda a: _overlap(rect, a)) if areas else None
 
 
 def save_settings(path, settings):
@@ -114,7 +158,11 @@ def set_app_window(win):
         return
     GWL_EXSTYLE, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW = -20, 0x00040000, 0x00000080
     try:
-        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        win.update_idletasks()     # Tk builds the window's outer frame when it first maps it; until then there is none
+        hwnd = user32.GetParent(win.winfo_id())
+        if not hwnd:
+            _log("⚠ Could not give the skinned window a taskbar button: it has no frame yet")
+            return
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, (style & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW)
         win.withdraw()
@@ -195,7 +243,7 @@ class SkinController:
         return self.main is not None
 
     def scale(self):
-        return 2 if self.settings['double_size'] else 1
+        return self.settings['size']
 
     def available(self):
         return skin_lib.list_skins(self.skins_dir)
@@ -228,7 +276,7 @@ class SkinController:
         try:
             loaded = skin_lib.load_skin(os.path.join(self.skins_dir, name))
         except skin_lib.SkinError as e:
-            messagebox.showwarning("Skin", f"Couldn't load {name}: {e}")
+            messagebox.showwarning("Skin", f"Couldn't load {name}: {e}", parent=self.dialog_parent())
             return
         old = self.skin if self.active else None
         if old is not None:
@@ -239,7 +287,7 @@ class SkinController:
             self.settings['skin'] = name
             self.save()
             return
-        messagebox.showwarning("Skin", f"Couldn't show {name}: {error}")
+        messagebox.showwarning("Skin", f"Couldn't show {name}: {error}", parent=self.dialog_parent())
         if old is not None and not self.enter(old):
             return                                   # back on the previous skin, its name still saved
         self.settings['skin'] = None
@@ -250,7 +298,7 @@ class SkinController:
         try:
             os.startfile(self.skins_dir)
         except (AttributeError, OSError) as e:
-            messagebox.showinfo("Skins", f"Put .wsz skins in:\n{self.skins_dir}\n\n({e})")
+            messagebox.showinfo("Skins", f"Put .wsz skins in:\n{self.skins_dir}\n\n({e})", parent=self.dialog_parent())
 
     def fill_skins_menu(self, menu):
         """(Re)build a Skins menu: every .wsz, No skin, Open skins folder."""
@@ -276,36 +324,105 @@ class SkinController:
             return None
         except Exception as e:
             _log(f"⚠ Could not show skin {getattr(loaded, 'name', '?')}: {e!r}")
-            self._close_windows()
-            self.skin = None
-            p = self.p
-            if p._engine is not None:
-                p._engine.vis_tap = None
-            try:
-                p.apply_theme()
-            except Exception:
-                pass
-            p.root.deiconify()
+            self._back_to_default()
             return f"{e.__class__.__name__}: {e}"
+
+    def _back_to_default(self, status=None):
+        """Close whatever skinned windows are left and show the default view (the saved skin choice is kept)."""
+        self._close_windows()
+        self.skin = None
+        p = self.p
+        if p._engine is not None:
+            p._engine.vis_tap = None
+        try:
+            p.apply_theme()
+        except Exception:
+            pass
+        p.root.deiconify()
+        p.root.lift()
+        if status:
+            p.status_label.config(text=status)
+
+    def _alive(self, w):
+        try:
+            return w is not None and bool(w.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _main_alive(self):
+        return self._alive(self.main)
+
+    def _check_windows(self):
+        """A skinned window destroyed behind our back: forget a lost EQ/playlist/Albums; a lost main window brings
+        the default view back. Returns False when skin mode ended."""
+        if not self._main_alive():
+            _log("⚠ The skin's main window was closed from outside - back to the default view")
+            self._back_to_default("The skin window was closed - default view")
+            return False
+        lost = False
+        for name in ('eq', 'pl', 'albums'):
+            if getattr(self, name) is not None and not self._alive(getattr(self, name)):
+                setattr(self, name, None)
+                lost = True
+                if name == 'eq':
+                    self.settings['eq_open'] = False
+        if self.pl is None:              # the playlist is always open: bring it back
+            self._open_pl()
+            self._apply_topmost()
+        elif lost:
+            self._layout_stack()
+        return True
+
+    def _skin_toplevel(self, win, on_close):
+        """Common setup of every skinned window but the main one: it hides and returns with the main window
+        (minimize), and Alt+F4 / the taskbar's Close does what its own close button does."""
+        win.transient(self.main)
+        win.protocol('WM_DELETE_WINDOW', on_close)
+        # FocusIn also fires as focus moves between the window's own widgets; the extra lift is harmless, and
+        # activating the playlist can hand focus straight to its search box
+        win.bind('<FocusIn>', lambda e: self._raise_group(win), add='+')
+
+    def _raise_group(self, focused):
+        """Clicking any skinned window brings all of them forward together, like Winamp."""
+        for w in self._windows():
+            if w is not focused:
+                try:
+                    w.lift()
+                except tk.TclError:
+                    pass
+        try:
+            focused.lift()
+        except tk.TclError:
+            pass
+
+    # ---- dialogs ---------------------------------------------------------------------------
+
+    def dialog_parent(self):
+        """The window a dialog should sit on: the skin's main window while skinned (so the dialog opens above an
+        always-on-top skin), else the default view."""
+        return self.main if self._main_alive() else self.p.root
+
+    def own_dialog(self, win):
+        """Tie a dialog Toplevel to the skin's main window while skinned: it shows (the default view is hidden),
+        stays above the skin and minimizes with it. Does nothing in the default view."""
+        if self._main_alive():
+            win.transient(self.main)
 
     def _enter(self, loaded):
         self.skin = loaded
         p, s = self.p, self.scale()
         self._apply_ttk_colors()
-        screen = virtual_screen(p.root)
         pos = self.settings['positions']
-        for k in list(pos):
-            if not on_screen(pos[k], screen):    # e.g. a monitor that is gone: start from the default spot
-                del pos[k]
         mx, my = pos.get('main', (200, 200))
         self.main = SkinMainWindow(p.root, loaded, s, self._main_callbacks())
         self.main.title("Music Player V2 (skin)")
         self.main.geometry(f'+{mx}+{my}')
         self.main.bind('<Configure>', self._on_main_configure, add='+')
+        self.main.protocol('WM_DELETE_WINDOW', p._on_close)     # Alt+F4 / taskbar Close = the close button
+        self.main.bind('<FocusIn>', lambda e: self._raise_group(self.main), add='+')
         if self.settings['eq_open']:
             self._open_eq()
-        if self.settings['pl_open']:
-            self._open_pl()
+        self._open_pl()                  # always open while skinned
         self._apply_topmost()
         p.root.withdraw()
         if self._map_bind is None:
@@ -317,6 +434,7 @@ class SkinController:
         self._schedule(REFRESH_MS, self._refresh)
         self._schedule(VIS_MS, self._vis_tick)
         self._refresh()
+        self._later_keep_reachable()
 
     def leave(self):
         if not self.active:
@@ -383,7 +501,7 @@ class SkinController:
             self.p.root.after(1, self._raise_skin)
 
     def _raise_skin(self):
-        if not self.active:
+        if not self.active or not self._check_windows():
             return
         self.p.root.withdraw()
         self.main.deiconify()
@@ -395,7 +513,7 @@ class SkinController:
         name = fn.__name__
 
         def run():
-            if not self.active:
+            if not self.active or not self._check_windows():
                 return
             try:
                 fn()
@@ -427,59 +545,48 @@ class SkinController:
             'repeat': lambda: self.main.flash("REPEAT ISN'T AVAILABLE"),
             'eq': self.toggle_eq, 'pl': self.toggle_pl, 'seek': self._seek, 'volume': self._volume,
             'close': p._on_close, 'minimize': lambda: minimize_window(self.main), 'menu': self.show_menu,
-            'heart': p.toggle_loved, 'clutter_a': self.toggle_topmost, 'clutter_d': self.toggle_double,
+            'heart': p.toggle_loved, 'clutter_a': self.toggle_topmost, 'clutter_d': self.cycle_size,
             'clutter_i': self.song_info, 'clutter_v': self.cycle_vis, 'vis_mode': self.cycle_vis,
             'moved': lambda x, y: self._snap(self.main, 'main'),
         }
 
     def _open_eq(self):
         s = self.scale()
-        x, y = self._place('eq', 116 * s)
         self.eq = SkinEqWindow(self.p.root, self.skin, s, {
             'change': self._eq_change, 'presets': self._eq_presets, 'close': self.toggle_eq,
-            'menu': self.show_menu, 'moved': lambda x, y: self._snap(self.eq, 'eq')})
-        self.eq.geometry(f'+{x}+{y}')
+            'menu': self.show_menu, 'drag': lambda x, y: self._drag_stack(self.eq, x, y),
+            'moved': lambda x, y: self._snap(self.main, 'main')})
+        self._skin_toplevel(self.eq, self.toggle_eq)
+        self._layout_stack()
         self._sync_eq()
 
     def _open_pl(self):
+        """The playlist is always open while skinned (Jacob 2026-11-14): nothing closes it."""
         s = self.scale()
-        below = 116 * s * (2 if self.eq is not None else 1)
-        x, y = self._place('pl', below)
         self.pl = SkinPlaylistWindow(self.p.root, self.skin, s, {
             'play': self._pl_play, 'search': self._pl_search, 'search_enter': self._pl_enter,
-            'menu': self._pl_menu, 'close': self.toggle_pl, 'moved': lambda x, y: self._snap(self.pl, 'pl'),
+            'menu': self._pl_menu, 'close': lambda: None, 'drag': lambda x, y: self._drag_stack(self.pl, x, y),
+            'moved': lambda x, y: self._snap(self.main, 'main'),
             'resized': lambda h: self.settings.__setitem__('pl_height', h)}, height=self.settings['pl_height'])
-        self.pl.geometry(f'+{x}+{y}')
+        self._skin_toplevel(self.pl, lambda: None)
+        self.settings['pl_open'] = True
+        self._layout_stack()
         self._last_rows = None
-
-    def _place(self, name, below):
-        pos = self.settings['positions'].get(name)
-        if pos:
-            return pos
-        self.main.update_idletasks()
-        return self.main.winfo_x(), self.main.winfo_y() + below
 
     def toggle_eq(self):
         if self.eq is not None:
-            self.settings['positions']['eq'] = [self.eq.winfo_x(), self.eq.winfo_y()]
             self.eq.destroy()
             self.eq = None
+            self._layout_stack()
         else:
             self._open_eq()
             self._apply_topmost()
+            self._later_keep_reachable()
         self.settings['eq_open'] = self.eq is not None
         self.save()
 
     def toggle_pl(self):
-        if self.pl is not None:
-            self.settings['positions']['pl'] = [self.pl.winfo_x(), self.pl.winfo_y()]
-            self.pl.destroy()
-            self.pl = None
-        else:
-            self._open_pl()
-            self._apply_topmost()
-        self.settings['pl_open'] = self.pl is not None
-        self.save()
+        """The playlist is always open while skinned: the main window's PL button and old callers do nothing."""
 
     def toggle_albums(self):
         if self.albums is not None:
@@ -497,6 +604,7 @@ class SkinController:
             self.main.update_idletasks()
             pos = (self.main.winfo_x() + 275 * s, self.main.winfo_y())
         win.geometry(f'+{pos[0]}+{pos[1]}')
+        self._skin_toplevel(win, self.toggle_albums)
         c = self.skin.pledit
         query = tk.StringVar()
         entry = tk.Entry(win.body, textvariable=query, relief=tk.FLAT, bg=c['normalbg'], fg=c['normal'],
@@ -511,6 +619,7 @@ class SkinController:
         self.p._album_browsers.append(browser)
         self.albums = win
         self._apply_topmost()
+        self._later_keep_reachable()
 
     def toggle_topmost(self):
         self.settings['always_on_top'] = not self.settings['always_on_top']
@@ -523,23 +632,23 @@ class SkinController:
             if w is not None:
                 w.attributes('-topmost', on)
 
-    def toggle_double(self):
+    def cycle_size(self):
+        """The D button: 1x -> 2x -> 3x -> 1x."""
+        self.set_size(SIZES[(SIZES.index(self.scale()) + 1) % len(SIZES)])
+
+    def set_size(self, size):
+        if size not in SIZES:
+            return
         self._remember_positions()
-        self.settings['double_size'] = not self.settings['double_size']
+        self.settings['size'] = size
         s = self.scale()
-        old = 1 if s == 2 else 2
-        mx, my = self.main.winfo_x(), self.main.winfo_y()
-        for w in (self.main, self.eq, self.pl):
+        for w in (self.main, self.eq, self.pl, self.albums):
             if w is not None:
-                docked_below = w is not self.main and w.winfo_x() == mx
                 w.set_skin(self.skin, s)
-                if docked_below:   # keep a stack under the main window a stack
-                    rel = (w.winfo_y() - my) // old
-                    w.geometry(f'+{mx}+{my + rel * s}')
-        if self.albums is not None:
-            self.albums.set_skin(self.skin, s)
+        self._layout_stack()
         self.save()
         self._refresh()
+        self._later_keep_reachable()
 
     def cycle_vis(self):
         i = VIS_MODES.index(self.settings['vis_mode'])
@@ -569,8 +678,6 @@ class SkinController:
         menu.add_command(label="Listening Stats…", command=p.open_stats_window)
         menu.add_checkbutton(label="Equalizer", command=self.toggle_eq,
                              variable=tk.BooleanVar(menu, value=self.eq is not None))
-        menu.add_checkbutton(label="Playlist", command=self.toggle_pl,
-                             variable=tk.BooleanVar(menu, value=self.pl is not None))
         menu.add_separator()
         skins = tk.Menu(menu, tearoff=0)
         self.fill_skins_menu(skins)
@@ -587,8 +694,13 @@ class SkinController:
         menu.add_separator()
         menu.add_checkbutton(label="Always on top", command=self.toggle_topmost,
                              variable=tk.BooleanVar(menu, value=self.settings['always_on_top']))
-        menu.add_checkbutton(label="Double size", command=self.toggle_double,
-                             variable=tk.BooleanVar(menu, value=self.settings['double_size']))
+        sizes = tk.Menu(menu, tearoff=0)
+        size_var = tk.IntVar(menu, value=self.scale())
+        menu._size_var = size_var            # keep the variable alive while the menu is up
+        for n in SIZES:
+            sizes.add_radiobutton(label=f"{n}×", value=n, variable=size_var,
+                                  command=lambda n=n: self.set_size(n))
+        menu.add_cascade(label="Size", menu=sizes)
         menu.add_separator()
         menu.add_command(label="Exit", command=p._on_close)
         try:
@@ -598,7 +710,10 @@ class SkinController:
 
     def _pl_menu(self, x_root, y_root, index):
         p = self.p
-        if index is None or not (0 <= index < len(self._pl_tracks())):
+        if index is None:                  # off the songs: the main menu (Settings, Skins, ...)
+            self.show_menu(x_root, y_root)
+            return
+        if not (0 <= index < len(self._pl_tracks())):
             return
         track = self._pl_tracks()[index]
         album = p.library_index.album_of(track) if p.library_index is not None else None
@@ -721,7 +836,7 @@ class SkinController:
             volume=float(p.volume_var.get()), position=(elapsed / duration) if duration else 0.0,
             shuffle=not p.is_temp_view, eq_open=self.eq is not None, pl_open=self.pl is not None,
             favorite=bool(getattr(track, 'loved', False)), always_on_top=self.settings['always_on_top'],
-            double_size=self.settings['double_size'])
+            double_size=self.scale() > 1)     # the D button is lit above 1x
         status = p.status_label.cget('text')
         if status != self._last_status:
             if self._last_status is not None and status:
@@ -767,26 +882,118 @@ class SkinController:
 
     def _snap(self, win, name):
         others = [self._rect(w) for w in self._windows() if w is not win]
-        screen = (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
-        x, y = skin_math.snap(self._rect(win), others, screen)
+        r = self._rect(win)
+        screen = _area_of(r, work_areas(win)) or (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
+        x, y = skin_math.snap(r, others, screen)
         win.geometry(f'+{x}+{y}')     # for the main window, <Configure> then moves the docked ones too
         self.settings['positions'][name] = [x, y]
         self.save()
+        self._later_keep_reachable()  # once the docked windows have followed
+
+    def _later_keep_reachable(self):
+        self.p.root.after(KEEP_MS, self._keep_reachable)
+
+    # ---- the stack: main on top, EQ under it when open, the playlist at the bottom ----------
+
+    def _stack_offsets(self):
+        """(window, y offset under the main window's top, height) for EQ (when open) and the playlist, in order."""
+        s = self.scale()
+        out, y = [], 116 * s
+        for w in (self.eq, self.pl):
+            if self._alive(w):
+                h = (116 if w is self.eq else w.height) * s
+                out.append((w, y, h))
+                y += h
+        return out
+
+    def _stack_rects(self, origin):
+        x, y = origin
+        s = self.scale()
+        return [(x, y, 275 * s, 116 * s)] + [(x, y + off, 275 * s, h) for _w, off, h in self._stack_offsets()]
+
+    def _layout_stack(self, origin=None):
+        """Put EQ and the playlist flush under the main window (same left edge). origin: the main window's
+        top-left when it was just moved and Tk doesn't report the new spot yet."""
+        if not self._main_alive():
+            return
+        if origin is None:
+            self.main.update_idletasks()
+            origin = (self.main.winfo_x(), self.main.winfo_y())
+        mx, my = origin
+        for w, off, _h in self._stack_offsets():
+            if (w.winfo_x(), w.winfo_y()) != (mx, my + off):
+                w.geometry(f'+{mx}+{my + off}')
+
+    def _drag_stack(self, win, x, y):
+        """EQ's or the playlist's title bar dragged so the window would sit at (x, y): move the whole stack."""
+        off = next((o for w, o, _h in self._stack_offsets() if w is win), None)
+        if off is not None and self._main_alive():
+            self.main.geometry(f'+{x}+{y - off}')
+
+    def _albums_docked(self, stack_rects):
+        if not self._alive(self.albums):
+            return False
+        rects = list(stack_rects) + [self._rect(self.albums)]
+        return len(rects) - 1 in skin_math.dock_group(0, rects)
+
+    def _keep_reachable(self):
+        """Pull title bars back where the mouse can grab them (off an edge, under the taskbar, on a monitor that is
+        gone). The stack moves as one and always ends with the main window reachable; Albums moves with it when
+        docked, else on its own."""
+        if not self._main_alive():
+            return
+        self.main.update_idletasks()
+        areas = work_areas(self.main)
+        grip = 14 * self.scale()
+
+        def pull(r):
+            """Partly on a monitor: just enough to grab the title bar. On none at all (a monitor that is gone,
+            a stack slid under the taskbar): the whole window back on screen."""
+            if _overlap(r, _area_of(r, areas)) > 0:
+                return skin_math.reachable(tuple(r), areas, grip)
+            return skin_math.reachable(tuple(r), areas, grip=r[3], keep=r[2])
+
+        mx, my, mw, mh = self._rect(self.main)
+        stack = self._stack_rects((mx, my))
+        docked = self._albums_docked(stack)
+        albums = self._rect(self.albums) if self._alive(self.albums) else None
+        dx = dy = 0
+        for r in stack + ([albums] if docked else []):    # the stack moves by the biggest pull any part needs
+            nx, ny = pull(r)
+            if abs(nx - r[0]) > abs(dx):
+                dx = nx - r[0]
+            if abs(ny - r[1]) > abs(dy):
+                dy = ny - r[1]
+        # ... but the main window must end up reachable (a stack taller than the screen keeps its top on screen)
+        nx, ny = pull((mx + dx, my + dy, mw, mh))
+        dx, dy = nx - mx, ny - my
+        changed = False
+        if (dx, dy) != (0, 0):
+            self._main_pos = (nx, ny)      # moved here with its stack: <Configure> must not move Albums again
+            self.main.geometry(f'+{nx}+{ny}')
+            self.settings['positions']['main'] = [nx, ny]
+            changed = True
+        self._layout_stack((nx, ny))
+        if albums is not None:
+            ax, ay = pull((albums[0] + (dx if docked else 0), albums[1] + (dy if docked else 0),
+                           albums[2], albums[3]))
+            if (ax, ay) != albums[:2]:
+                self.albums.geometry(f'+{ax}+{ay}')
+                self.settings['positions']['albums'] = [ax, ay]
+                changed = True
+        if changed:
+            self.main.update_idletasks()
+            self._main_pos = (self.main.winfo_x(), self.main.winfo_y())   # where it really is, moved or not
+            self.save()
 
     def _on_main_configure(self, event):
-        """Windows docked to the main window move with it."""
+        """The stack follows the main window (and its size); a docked Albums window moves with it too."""
         if event.widget is not self.main:
             return
         new = (self.main.winfo_x(), self.main.winfo_y())
         old = self._main_pos
         self._main_pos = new
-        if old is None or old == new:
-            return
-        dx, dy = new[0] - old[0], new[1] - old[1]
-        rects = [(old[0], old[1], self.main.winfo_width(), self.main.winfo_height())]
-        others = [w for w in self._windows() if w is not self.main]
-        rects += [self._rect(w) for w in others]
-        group = skin_math.dock_group(0, rects)
-        for i, w in enumerate(others, start=1):
-            if i in group:
-                w.geometry(f'+{w.winfo_x() + dx}+{w.winfo_y() + dy}')
+        if old is not None and old != new and self._albums_docked(self._stack_rects(old)):
+            ax, ay = self.albums.winfo_x(), self.albums.winfo_y()
+            self.albums.geometry(f'+{ax + new[0] - old[0]}+{ay + new[1] - old[1]}')
+        self._layout_stack(new)

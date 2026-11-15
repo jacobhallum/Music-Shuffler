@@ -129,10 +129,28 @@ class SkinControllerTests(unittest.TestCase):
         self.c.pick('syn.wsz')
         self.c.toggle_eq()
         self.c.toggle_topmost()
-        self.c.toggle_double()
+        self.c.cycle_size()
         s = self.settings_file()
-        self.assertEqual((s['eq_open'], s['always_on_top'], s['double_size']), (False, True, True))
+        self.assertEqual((s['eq_open'], s['always_on_top'], s['size']), (False, True, 2))
+        self.assertNotIn('double_size', s)
         self.assertEqual(self.c.main.scale, 2)
+
+    def test_size_cycles_one_two_three_and_is_saved(self):
+        self.c.pick('syn.wsz')
+        for want in (2, 3, 1):
+            self.c.cycle_size()
+            self.assertEqual(self.c.scale(), want)
+            self.assertEqual(self.settings_file()['size'], want)
+            self.assertEqual(self.c.main.scale, want)
+        self.c.set_size(3)
+        self.assertEqual((self.c.scale(), self.c.pl.scale, self.c.eq.scale), (3, 3, 3))
+
+    def test_old_double_size_setting_reads_as_2x(self):
+        for text, want in (('{"double_size": true}', 2), ('{"double_size": false}', 1), ('{"size": 7}', 1),
+                           ('{"size": "3"}', 1), ('{"size": true}', 1), ('{"size": 3, "double_size": true}', 3)):
+            with open(self.c.settings_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            self.assertEqual(skin_mode.load_settings(self.c.settings_path)['size'], want, text)
 
     def test_eq_window_change_goes_to_the_player(self):
         self.c.pick('syn.wsz')
@@ -150,7 +168,7 @@ class SkinControllerTests(unittest.TestCase):
         with open(self.c.settings_path, 'w', encoding='utf-8') as f:
             f.write('{"skin": 5, "double_size": "yes", "vis_mode": "laser"}')
         s = skin_mode.load_settings(self.c.settings_path)
-        self.assertEqual((s['skin'], s['double_size'], s['vis_mode']), (None, False, 'spectrum'))
+        self.assertEqual((s['skin'], s['size'], s['vis_mode']), (None, 1, 'spectrum'))
         bad = {'skin': '..\\..\\evil.wsz', 'pl_height': True,
                'positions': {'main': [1, 2], 'eq': 'x', 'pl': [1, 2, 3], 'albums': [True, 4]}}
         with open(self.c.settings_path, 'w', encoding='utf-8') as f:
@@ -161,10 +179,17 @@ class SkinControllerTests(unittest.TestCase):
             json.dump({'pl_height': 99999}, f)
         self.assertEqual(skin_mode.load_settings(self.c.settings_path)['pl_height'], 2000)
 
-    def test_offscreen_positions_start_from_the_default_spot(self):
+    def test_offscreen_positions_come_back_fully_on_screen(self):
+        areas = [(0, 0, 1920, 1040)]
         self.c.settings['positions'] = {'main': [-99999, 50], 'eq': [300, 300]}
-        self.c.pick('syn.wsz')
-        self.assertNotIn('main', self.c.settings['positions'])
+        with unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: areas):
+            self.c.pick('syn.wsz')
+            done = []
+            _root.after(skin_mode.KEEP_MS + 150, lambda: done.append(1))
+            while not done:
+                _root.update()
+        x, y = self.c.settings['positions']['main']
+        self.assertTrue(0 <= x <= 1920 - 275 and 0 <= y <= 1040 - 116, (x, y))
         self.assertEqual(self.c.settings['positions'].get('eq'), [300, 300])
 
     def test_a_skin_that_fails_to_show_brings_back_the_default_view(self):

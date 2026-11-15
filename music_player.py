@@ -726,7 +726,7 @@ class MusicPlayerGUI:
                         f"The application cannot run without a cache directory.\n"
                         f"Please check your file system permissions."
                     )
-                    messagebox.showerror("Fatal Error", error_msg)
+                    messagebox.showerror("Fatal Error", error_msg, parent=self._dialog_parent())
                     sys.exit(1)
         
         self.cache_file = cache_dir / "library_cache.json"
@@ -853,7 +853,8 @@ class MusicPlayerGUI:
                 "Common causes:\n"
                 "• No audio device available\n"
                 "• Audio device in exclusive mode\n"
-                "• Running over Remote Desktop"
+                "• Running over Remote Desktop",
+                parent=self._dialog_parent(),
             )
         
         self.setup_ui()
@@ -1312,11 +1313,12 @@ class MusicPlayerGUI:
     def edit_shuffle_settings(self):
         """Edit shuffle algorithm parameters"""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Shuffle Settings")
         dialog.geometry("550x650")
         dialog.resizable(False, False)
         
-        dialog.transient(self.root)
+        dialog.transient(self._dialog_parent())
         dialog.grab_set()
         
         main_frame = ttk.Frame(dialog, padding="20")
@@ -1452,7 +1454,7 @@ class MusicPlayerGUI:
             self.shuffle_config = normalize_shuffle_config(candidate)
 
             if self._save_shuffle_config():
-                messagebox.showinfo("Saved", "Shuffle settings saved successfully!")
+                messagebox.showinfo("Saved", "Shuffle settings saved successfully!", parent=dialog)
                 dialog.destroy()
                 # Apply immediately so the change is audible next shuffle.
                 try:
@@ -1461,11 +1463,11 @@ class MusicPlayerGUI:
                 except Exception as e:
                     print(f"⚠ Could not re-apply shuffle after settings change: {e}")
             else:
-                messagebox.showerror("Error", "Failed to save shuffle settings")
+                messagebox.showerror("Error", "Failed to save shuffle settings", parent=dialog)
 
         def reset_defaults():
             result = messagebox.askyesno("Reset to Defaults",
-                                        "Reset all shuffle parameters to default values?")
+                                        "Reset all shuffle parameters to default values?", parent=dialog)
             if result:
                 from shuffle_core import DEFAULT_SHUFFLE_CONFIG
                 for param, var in vars_dict.items():
@@ -1955,20 +1957,21 @@ class MusicPlayerGUI:
 
         if not candidates:
             messagebox.showinfo("Import Ratings",
-                                "No un-favorited tracks rated 4+ stars were found.")
+                                "No un-favorited tracks rated 4+ stars were found.", parent=self._dialog_parent())
             return
         if not messagebox.askyesno(
                 "Import Ratings as Favorites",
                 f"Mark {len(candidates)} track(s) rated 4+ stars as favorites?\n\n"
                 "This only affects tracks you haven't favorited or un-favorited "
                 "yourself, and is recorded as 'migrated' so you can tell them "
-                "apart later."):
+                "apart later.", parent=self._dialog_parent()):
             return
 
         try:
             import preferences as _pf
         except Exception as e:
-            messagebox.showerror("Import Ratings", f"Could not load favorites store:\n{e}")
+            messagebox.showerror("Import Ratings", f"Could not load favorites store:\n{e}",
+                                 parent=self._dialog_parent())
             return
         favs = getattr(self, '_favorites', {})
         for t in candidates:
@@ -1985,7 +1988,7 @@ class MusicPlayerGUI:
         if self._validate_playlist_index():
             self._update_love_button(self.current_playlist[self.current_index])
         messagebox.showinfo("Import Ratings",
-                            f"Marked {len(candidates)} track(s) as favorites.")
+                            f"Marked {len(candidates)} track(s) as favorites.", parent=self._dialog_parent())
 
     def _update_love_button(self, track):
         """V2: Update love button state (always visible)"""
@@ -2545,7 +2548,8 @@ class MusicPlayerGUI:
                     "FFmpeg Detection Issue",
                     "FFmpeg appears to be installed but wasn't auto-detected.\n\n"
                     "Would you like to use the 'ffmpeg' command?\n\n"
-                    "Click Yes to use it, or No to manually set the path."
+                    "Click Yes to use it, or No to manually set the path.",
+                    parent=self._dialog_parent(),
                 )
                 if response:
                     self.ffmpeg_path = "ffmpeg"
@@ -2564,7 +2568,8 @@ class MusicPlayerGUI:
             "• Use Settings > Set FFmpeg Path to locate it manually\n"
             "• Or install: winget install FFmpeg\n"
             "• Then restart this app\n\n"
-            "Playback is disabled until FFmpeg is configured."
+            "Playback is disabled until FFmpeg is configured.",
+            parent=self._dialog_parent(),
         )
         return False
     
@@ -2668,7 +2673,7 @@ class MusicPlayerGUI:
     def scan_library(self):
         """Scan music directories for tracks with caching"""
         if hasattr(self, '_scanning') and self._scanning:
-            messagebox.showinfo("Scanning", "A scan is already in progress")
+            messagebox.showinfo("Scanning", "A scan is already in progress", parent=self._dialog_parent())
             return
         
         # Stop any ongoing background conversion
@@ -3016,13 +3021,13 @@ class MusicPlayerGUI:
         """Settings > Delete Old MP3 Cache: the sound engine plays M4A directly, so these copies are unused."""
         n, size = self._old_mp3_cache_size()
         if n == 0:
-            messagebox.showinfo("Old MP3 Cache", "There is no old MP3 cache to delete.")
+            messagebox.showinfo("Old MP3 Cache", "There is no old MP3 cache to delete.", parent=self._dialog_parent())
             return
         if not messagebox.askyesno(
                 "Delete Old MP3 Cache",
                 f"Delete {n:,} converted MP3 files ({size / 1e9:.1f} GB)?\n\n"
                 "The sound engine plays M4A files directly, so these copies are no longer used.\n"
-                "Your music files, play counts and favorites are not touched."):
+                "Your music files, play counts and favorites are not touched.", parent=self._dialog_parent()):
             return
         n, size = self._delete_old_mp3_cache()
         self.status_label.config(text=f"Deleted {n:,} old MP3 files ({size / 1e9:.1f} GB)")
@@ -3036,7 +3041,8 @@ class MusicPlayerGUI:
             "• M4P Downloads metadata\n"
             "• Recent listening history (shuffle continuity)\n\n"
             "M4P metadata will start fresh.\n\n"
-            "Continue?"
+            "Continue?",
+            parent=self._dialog_parent(),
         )
         
         if not result:
@@ -3077,11 +3083,12 @@ class MusicPlayerGUI:
                 "Cache Cleared",
                 f"Deleted {deleted_count} files\n"
                 f"Freed {deleted_mb:.1f} MB\n\n"
-                "Library will rescan on next startup."
+                "Library will rescan on next startup.",
+                parent=self._dialog_parent(),
             )
             
         except Exception as e:
-            messagebox.showerror("Error", f"Error clearing cache:\n{e}")
+            messagebox.showerror("Error", f"Error clearing cache:\n{e}", parent=self._dialog_parent())
     
     def clear_metadata(self):
         """Clear all player metadata (play counts, loved status, etc.) with double confirmation"""
@@ -3096,7 +3103,8 @@ class MusicPlayerGUI:
             "• All ratings\n\n"
             f"This affects {len(self.player_metadata)} tracks.\n\n"
             "Are you sure you want to continue?",
-            icon='warning'
+            icon='warning',
+            parent=self._dialog_parent(),
         )
         
         if not result1:
@@ -3110,7 +3118,8 @@ class MusicPlayerGUI:
             "All metadata will be permanently deleted.\n"
             "You will start completely fresh.\n\n"
             "Are you absolutely sure?",
-            icon='warning'
+            icon='warning',
+            parent=self._dialog_parent(),
         )
         
         if not result2:
@@ -3163,20 +3172,22 @@ class MusicPlayerGUI:
                 "• Loved status: none\n"
                 "• Skip counts: 0\n"
                 "• Ratings: 0\n\n"
-                "Metadata will rebuild as you listen."
+                "Metadata will rebuild as you listen.",
+                parent=self._dialog_parent(),
             )
             
         except Exception as e:
-            messagebox.showerror("Error", f"Error clearing metadata:\n{e}")
+            messagebox.showerror("Error", f"Error clearing metadata:\n{e}", parent=self._dialog_parent())
     
     def show_shortcuts(self):
         """Show keyboard shortcuts dialog"""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Keyboard Shortcuts")
         dialog.geometry("380x320")
         dialog.resizable(False, False)
         
-        dialog.transient(self.root)
+        dialog.transient(self._dialog_parent())
         dialog.grab_set()
         
         frame = ttk.Frame(dialog, padding="20")
@@ -3206,6 +3217,7 @@ class MusicPlayerGUI:
     def test_hotkeys(self):
         """Test if keyboard hotkeys are working"""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Test Hotkeys")
         dialog.geometry("500x400")
         
@@ -3272,12 +3284,14 @@ class MusicPlayerGUI:
             "• Metadata reading and display\n"
             "• Keyboard shortcuts (media keys)\n\n"
             "Cache location:\n"
-            f"{self.cache_file.parent}"
+            f"{self.cache_file.parent}",
+            parent=self._dialog_parent(),
         )
     
     def show_diagnostics(self):
         """Show library diagnostics"""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Library Diagnostics")
         dialog.geometry("700x600")
         
@@ -3420,12 +3434,14 @@ class MusicPlayerGUI:
             "Metadata Displayed",
             f"Metadata for {len(self.player_metadata)} tracks\n"
             "has been printed to the console.\n\n"
-            "Check the console window for full details."
+            "Check the console window for full details.",
+            parent=self._dialog_parent(),
         )
     
     def check_file_path(self):
         """Check if a specific file path exists and is in the library"""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Check File Path")
         dialog.geometry("700x400")
         
@@ -3527,12 +3543,14 @@ class MusicPlayerGUI:
             "Library Information",
             f"Total Tracks: {self.total_tracks}\n"
             f"Artists: {self.total_artists}\n"
-            f"Albums: {self.total_albums}"
+            f"Albums: {self.total_albums}",
+            parent=self._dialog_parent(),
         )
     
     def change_folders(self):
         """Change music folder locations"""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Music Folders")
         dialog.geometry("600x300")
         
@@ -3567,14 +3585,16 @@ class MusicPlayerGUI:
             "Set FFmpeg Path",
             f"Current FFmpeg: {current}{suggestion}\n\n"
             "Do you want to browse for ffmpeg.exe?\n\n"
-            "Or click No to use 'ffmpeg' command directly."
+            "Or click No to use 'ffmpeg' command directly.",
+            parent=self._dialog_parent(),
         )
         
         if result:
             filepath = filedialog.askopenfilename(
                 title="Select ffmpeg.exe",
                 initialdir=str(Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Links"),
-                filetypes=[("FFmpeg executable", "ffmpeg.exe"), ("All files", "*.*")]
+                filetypes=[("FFmpeg executable", "ffmpeg.exe"), ("All files", "*.*")],
+                parent=self._dialog_parent(),
             )
             
             if filepath:
@@ -3584,11 +3604,13 @@ class MusicPlayerGUI:
                     if result.returncode == 0 and "ffmpeg" in result.stdout.lower():
                         self.ffmpeg_path = filepath
                         self._ffmpeg_path_changed()
-                        messagebox.showinfo("Success", f"FFmpeg path set to:\n{filepath}\n\nSongs play through it right away.")
+                        messagebox.showinfo("Success", f"FFmpeg path set to:\n{filepath}\n\nSongs play through it right away.",
+                                            parent=self._dialog_parent())
                     else:
-                        messagebox.showerror("Error", "This doesn't appear to be a valid FFmpeg executable.")
+                        messagebox.showerror("Error", "This doesn't appear to be a valid FFmpeg executable.",
+                                             parent=self._dialog_parent())
                 except Exception as e:
-                    messagebox.showerror("Error", f"Failed to verify FFmpeg:\n{e}")
+                    messagebox.showerror("Error", f"Failed to verify FFmpeg:\n{e}", parent=self._dialog_parent())
         else:
             try:
                 result = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True,
@@ -3596,15 +3618,19 @@ class MusicPlayerGUI:
                 if result.returncode == 0:
                     self.ffmpeg_path = "ffmpeg"
                     self._ffmpeg_path_changed()
-                    messagebox.showinfo("Success", "Using ffmpeg from PATH. Songs play through it right away.")
+                    messagebox.showinfo("Success", "Using ffmpeg from PATH. Songs play through it right away.",
+                                        parent=self._dialog_parent())
                 else:
-                    messagebox.showerror("Error", "'ffmpeg' command doesn't work. Try browsing for ffmpeg.exe instead.")
+                    messagebox.showerror("Error", "'ffmpeg' command doesn't work. Try browsing for ffmpeg.exe instead.",
+                                         parent=self._dialog_parent())
             except:
-                messagebox.showerror("Error", "'ffmpeg' command not found. Try browsing for ffmpeg.exe instead.")
+                messagebox.showerror("Error", "'ffmpeg' command not found. Try browsing for ffmpeg.exe instead.",
+                                     parent=self._dialog_parent())
     
     def filter_library(self):
         """Filter library by artist, album, genre, etc."""
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Filter Library")
         dialog.geometry("500x400")
         
@@ -3653,7 +3679,8 @@ class MusicPlayerGUI:
                 self.update_library_stats()
                 self.apply_shuffle()
                 dialog.destroy()
-                messagebox.showinfo("Filter Applied", f"Filtered to {len(filtered)} tracks")
+                messagebox.showinfo("Filter Applied", f"Filtered to {len(filtered)} tracks",
+                                    parent=self._dialog_parent())
             else:
                 result_label.config(text="No tracks match these filters!")
 
@@ -3676,7 +3703,7 @@ class MusicPlayerGUI:
     def apply_shuffle(self, algo=None, auto_play=False):
         """Apply selected shuffle algorithm"""
         if not self.all_tracks:
-            messagebox.showwarning("Warning", "No tracks loaded")
+            messagebox.showwarning("Warning", "No tracks loaded", parent=self._dialog_parent())
             return
         
         if algo is None:
@@ -4288,6 +4315,7 @@ class MusicPlayerGUI:
         queued = self._get_queued_tracks()
 
         dialog = tk.Toplevel(self.root)
+        self._own_dialog(dialog)
         dialog.title("Up Next Queue")
         dialog.geometry("500x400")
 
@@ -4338,7 +4366,8 @@ class MusicPlayerGUI:
     def play_track_at_index(self, index):
         """Play a specific track: a manual pick or an internal advance. Always a cut, never a crossfade."""
         if not self.audio_available or self._engine is None:
-            messagebox.showwarning("Audio Unavailable", "Audio device not initialized. Cannot play music.")
+            messagebox.showwarning("Audio Unavailable", "Audio device not initialized. Cannot play music.",
+                                   parent=self._dialog_parent())
             return
 
         if not self.current_playlist or index >= len(self.current_playlist):
@@ -4582,13 +4611,15 @@ class MusicPlayerGUI:
 
     def _import_eqf(self):
         path = filedialog.askopenfilename(title="Import Winamp EQ presets",
-                                          filetypes=[("Winamp EQ", "*.eqf *.EQF"), ("All files", "*.*")])
+                                          filetypes=[("Winamp EQ", "*.eqf *.EQF"), ("All files", "*.*")],
+                                          parent=self._dialog_parent())
         if not path:
             return
         try:
             n = self._import_eqf_file(path)
         except (OSError, ValueError):
-            messagebox.showerror("Import failed", "That isn't a Winamp EQ preset file (.eqf).")
+            messagebox.showerror("Import failed", "That isn't a Winamp EQ preset file (.eqf).",
+                                 parent=self._dialog_parent())
             return
         self._refresh_eq_window()
         self.status_label.config(text=f"Imported {n} EQ preset(s)")
@@ -4629,12 +4660,26 @@ class MusicPlayerGUI:
 
     # ---- Listening Stats window ----------------------------------------------
 
+    def _dialog_parent(self):
+        """The window dialogs sit on: the skin's main window while skinned (a dialog on the hidden default view
+        would open behind an always-on-top skin), else the default view."""
+        skins = getattr(self, 'skins', None)
+        return skins.dialog_parent() if skins is not None else self.root
+
+    def _own_dialog(self, win):
+        """While skinned, tie a dialog window to the skin: it shows (the default view is hidden) and stays above
+        the skin."""
+        skins = getattr(self, 'skins', None)
+        if skins is not None:
+            skins.own_dialog(win)
+
     def open_stats_window(self):
         if self._stats_window is not None and self._stats_window.winfo_exists():
             self._stats_window.lift()
             return
         theme = self.themes['dark'] if self.dark_mode else self.themes['light']
         self._stats_window = StatsWindow(self.root, self._stats_period, self._stats_menu_items, theme)
+        self._own_dialog(self._stats_window)
         self._stats_data = self._stats_snapshot()
         self._stats_records = None
         self._stats_period('week')
@@ -4993,7 +5038,7 @@ class MusicPlayerGUI:
             return
 
         if not self.current_playlist:
-            messagebox.showwarning("Warning", "No playlist loaded")
+            messagebox.showwarning("Warning", "No playlist loaded", parent=self._dialog_parent())
             return
 
         with self._engine_lock:

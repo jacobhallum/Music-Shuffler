@@ -120,6 +120,7 @@ class _Fake:
         self.calls.append(('queue_album', key))
 
     open_stats_window = MusicPlayerGUI.open_stats_window
+    _own_dialog = MusicPlayerGUI._own_dialog
     _stats_snapshot = MusicPlayerGUI._stats_snapshot
     _stats_compute = staticmethod(MusicPlayerGUI._stats_compute)
     _stats_period = MusicPlayerGUI._stats_period

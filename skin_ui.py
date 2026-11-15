@@ -23,6 +23,10 @@ MAIN_BUTTONS = ('menu', 'minimize', 'shade', 'close', 'previous', 'play', 'pause
 MAIN_CLICKS = ('time', 'heart', 'visualizer', 'clutter_o', 'clutter_a', 'clutter_i',
                'clutter_d', 'clutter_v')
 EQ_SLIDERS = ('preamp',) + tuple('band%d' % i for i in range(10))
+# A soft rim keeps every button visible on any skin (Jacob 2026-11-15: "not super bright but enough to see them")
+RIM_MAIN = MAIN_BUTTONS + ('clutter_o', 'clutter_a', 'clutter_i', 'clutter_d', 'clutter_v')
+RIM_EQ = ('on', 'auto', 'presets', 'close', 'shade')
+RIM_LIGHT, RIM_DARK = (255, 255, 255, 110), (0, 0, 0, 120)
 HEART_POINTS = ((4, 7), (0, 3), (0, 1), (1, 0), (3, 0), (4, 1),
                 (5, 0), (7, 0), (8, 1), (8, 3))
 
@@ -59,6 +63,25 @@ def heart_image(color_hex, filled):
     return img
 
 
+def rim_overlay(background, layout, names, band=3):
+    """An RGBA layer the size of `background` with a 1 px outline on the edge of each named element's rect: light
+    where the skin around it (a `band` px ring in `background`) is dark, dark where it is light."""
+    gray = background.convert('L')
+    width, height = gray.size
+    out = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(out)
+    for name in names:
+        if name not in layout:
+            continue
+        x, y, w, h = layout[name]
+        outer = gray.crop((max(0, x - band), max(0, y - band), min(width, x + w + band), min(height, y + h + band)))
+        inner = gray.crop((x, y, min(width, x + w), min(height, y + h)))
+        ring_px = outer.width * outer.height - inner.width * inner.height
+        ring = (sum(outer.getdata()) - sum(inner.getdata())) / max(1, ring_px)
+        draw.rectangle((x, y, x + w - 1, y + h - 1), outline=RIM_LIGHT if ring < 128 else RIM_DARK)
+    return out
+
+
 class SkinWindow(tk.Toplevel):
     def __init__(self, master, skin, scale, width, height, callbacks):
         super().__init__(master)
@@ -71,6 +94,7 @@ class SkinWindow(tk.Toplevel):
         self.focused = False
         self._photos = []
         self._tag_photos = {}
+        self._rims = None               # (key, rim layer, its PhotoImage): rebuilt only when skin/size/focus change
         self.canvas = tk.Canvas(self, width=width * scale, height=height * scale,
                                 highlightthickness=0, bd=0)
         self.canvas.pack()
@@ -95,6 +119,19 @@ class SkinWindow(tk.Toplevel):
         self._tag_photos.clear()
         self.draw()
 
+    def _blit_rims(self, layout, names, under):
+        """Draw the soft contrast rim layer on top. under: the (sprite, x, y) pieces drawn below the buttons
+        (background, title bar, ...), composited to read what the skin really shows around each button."""
+        key = (self.skin, self.scale, self.focused)
+        if self._rims is None or self._rims[0] != key:
+            base = Image.new('RGBA', (self.width, self.height), (0, 0, 0, 255))
+            for name, x, y in under:
+                base.alpha_composite(self.skin.sprite(name).convert('RGBA'), (x, y))
+            layer = rim_overlay(base, layout, names)
+            photo = ImageTk.PhotoImage(self.skin.scaled(layer, self.scale), master=self.canvas)
+            self._rims = (key, layer, photo)
+        self.canvas.create_image(0, 0, anchor='nw', image=self._rims[2], tags=('rims',))
+
     def _redraw_tag(self, tag, blit_fn):
         self.canvas.delete(tag)
         stale = self._tag_photos.pop(tag, [])
@@ -118,6 +155,7 @@ class SkinWindow(tk.Toplevel):
         # thread, and freeing a PhotoImage calls into Tk.
         self._photos.clear()
         self._tag_photos.clear()
+        self._rims = None
         super().destroy()
 
     def _on_focus_in(self, event=None):
@@ -318,6 +356,9 @@ class SkinMainWindow(SkinWindow):
             self.blit(S(name), x, y)
 
         self.blit(self._vis_image(), 24, 43, tag='vis')
+        self._blit_rims(MAIN_LAYOUT, RIM_MAIN, (
+            ('MAIN_WINDOW_BACKGROUND', 0, 0), ('MAIN_TITLE_BAR_SELECTED' if self.focused else 'MAIN_TITLE_BAR', 0, 0),
+            ('MAIN_CLUTTER_BAR_BACKGROUND', 10, 22)))
 
     def _drag_is(self, kind):
         return self.drag is not None and self.drag[0] == kind
@@ -467,6 +508,8 @@ class SkinEqWindow(SkinWindow):
                       x, y)
             thumb = 'EQ_SLIDER_THUMB_SELECTED' if self.drag == key else 'EQ_SLIDER_THUMB'
             self.blit(S(thumb), x + 1, y + eq_thumb_y(db))
+        self._blit_rims(EQ_LAYOUT, RIM_EQ, (
+            ('EQ_WINDOW_BACKGROUND', 0, 0), ('EQ_TITLE_BAR_SELECTED' if self.focused else 'EQ_TITLE_BAR', 0, 0)))
 
     def _apply_slider(self, key, event):
         y = EQ_LAYOUT[key][1]
@@ -498,8 +541,11 @@ class SkinEqWindow(SkinWindow):
 
     def _on_motion(self, event):
         if self._win_drag is not None:
-            self.geometry('+%d+%d' % (event.x_root - self._win_drag[0],
-                                      event.y_root - self._win_drag[1]))
+            x, y = event.x_root - self._win_drag[0], event.y_root - self._win_drag[1]
+            if 'drag' in self.callbacks:          # part of a stack: the controller moves the whole stack
+                self.callbacks['drag'](x, y)
+            else:
+                self.geometry('+%d+%d' % (x, y))
             return
         if self.drag is not None:
             self._apply_slider(self.drag, event)
