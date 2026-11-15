@@ -43,6 +43,7 @@ utlities/library_manager - Shortcut.lnk
 # Sound engine: personal settings and listening history
 audio_settings.json
 listening_log.jsonl
+ui_settings.json
 
 # Winamp skins: the folder is tracked, the skin files are not (they belong to their authors)
 skins/*
