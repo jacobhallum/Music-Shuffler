@@ -108,6 +108,9 @@ class AudioEngine:
         self._open_decoder = open_decoder
         self._emit_cb = emit
         self._bps = float(bytes_per_sec)
+        # Read-only listener for the visualizer: called with each PCM chunk as it is queued. It must not block
+        # or change anything; playback is the same with or without it.
+        self.vis_tap = None
         self._frame = int(frame_bytes)
         frames = max(1, int(SILENCE_SEC * self._bps) // self._frame)
         self._silence = bytes(frames * self._frame)
@@ -311,6 +314,12 @@ class AudioEngine:
                     elif s is self._cur or s is self._out:
                         self._on_drained(s)
                 continue
+            tap = self.vis_tap
+            if tap is not None:
+                try:
+                    tap(chunk)
+                except Exception:
+                    pass   # the visualizer never gets to break playback
             seg = _Seg(s, s.start + s.fed, len(chunk) / self._bps)
             s.fed += seg.length
             s.queued += 1
