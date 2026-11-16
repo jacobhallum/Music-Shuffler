@@ -665,6 +665,119 @@ class SkinCoverTests(unittest.TestCase):
         pump(200)
         self.assertEqual(self.center(), RED)
 
+    # ---- which side, snapping, Albums ------------------------------------------------------------------
+
+    def areas(self, areas):
+        patcher = unittest.mock.patch.object(skin_mode, 'work_areas', lambda win: areas)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def release_main_at(self, x, y):
+        self.c.main.geometry(f'+{x}+{y}')
+        pump(100)
+        self.c.main.callbacks['moved'](0, 0)
+        pump(300)
+
+    def test_cover_flips_left_near_right_edge(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['positions'] = {'main': [1500, 100]}
+        self.open_skin()
+        self.c._keep_reachable()
+        pump(100)
+        self.assertEqual(rect(self.c.cover)[:2], (rect(self.c.main)[0] - 275, 100))
+
+    def test_cover_slides_stack_when_neither_side_fits(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['size'] = 3
+        self.c.settings['positions'] = {'main': [500, 100]}
+        self.open_skin()
+        self.assertEqual(rect(self.c.main)[0], 270)
+        self.assertEqual(rect(self.c.cover)[0], 1095)
+        self.assertEqual(self.c.settings['positions']['main'][0], 270)
+
+    def test_side_kept_during_drag(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['positions'] = {'main': [1500, 100]}
+        self.open_skin()
+        self.assertEqual(self.c._cover_side, 'left')
+        cx, cy = rect(self.c.cover)[:2]
+        ev = lambda xr, yr: SimpleNamespace(x=50, y=5, x_root=xr, y_root=yr)  # noqa: E731
+        self.c.cover._on_press(ev(cx + 50, cy + 5))
+        self.c.cover._on_motion(ev(cx - 1050, cy + 105))      # main would now fit a right cover
+        pump(200)
+        self.assertEqual(self.c._cover_side, 'left')
+        self.assertEqual(rect(self.c.main)[:2], (400, 200))
+        self.assertEqual(rect(self.c.cover)[:2], (125, 200))
+
+    def test_side_follows_monitor_after_release(self):
+        self.areas([(-1920, 0, 1920, 1040), (0, 0, 2560, 1400)])
+        self.c.settings['size'] = 2
+        self.c.settings['positions'] = {'main': [2300, 100]}
+        self.open_skin()
+        self.assertEqual((self.c._cover_side, rect(self.c.cover)[0]), ('left', 1750))
+        self.release_main_at(-700, 100)                        # a right cover would cross into the other monitor
+        self.assertEqual((self.c._cover_side, rect(self.c.cover)[0]), ('left', -1250))
+        self.release_main_at(100, 100)
+        self.assertEqual((self.c._cover_side, rect(self.c.cover)[0]), ('right', 650))
+
+    def test_snap_ignores_own_stack(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.c.albums.geometry('+1200+600')                    # Albums on its own
+        pump(100)
+        got = []
+        with unittest.mock.patch.object(skin_mode.skin_math, 'snap',
+                                        lambda r, others, screen: (got.append(list(others)), r[:2])[1]):
+            self.c._snap(self.c.main, 'main')
+        self.assertEqual(got, [[rect(self.c.albums)]])
+
+    def test_albums_default_right_of_cover(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[:2], (rect(self.c.cover)[0] + 275, rect(self.c.main)[1]))
+
+    def test_albums_default_right_of_main_when_cover_is_left(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['positions'] = {'main': [1500, 100]}
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[:2], (1775, 100))
+
+    def test_albums_docked_to_cover_follows(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        (ax, ay), (mx, my) = rect(self.c.albums)[:2], rect(self.c.main)[:2]
+        self.c.main.geometry(f'+{mx + 40}+{my + 30}')
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[:2], (ax + 40, ay + 30))
+
+    def test_albums_moves_aside_when_cover_appears(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['cover_open'] = False
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.main)[0] + 275)     # hidden cover: right of main
+        self.c.toggle_cover()
+        pump(300)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 275)
+
+    def test_albums_moves_aside_when_cover_grows(self):
+        self.areas([(0, 0, 4000, 2000)])
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.c.set_size(3)                    # Albums (850) now inside the cover (1125..1950), touching nothing
+        pump(300)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 825)
+
 
 if __name__ == '__main__':
     unittest.main()

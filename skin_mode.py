@@ -617,7 +617,9 @@ class SkinController:
             self.cover = None
             self._cover_key = self._cover_src = None
         else:
+            docked = self._albums_docked(self._stack_rects(self._main_origin()))
             self._open_cover()
+            self._place_cover(docked)
             self._apply_topmost()
             self._later_keep_reachable()
         self.settings['cover_open'] = self.cover is not None
@@ -669,9 +671,9 @@ class SkinController:
         win = SkinFrameWindow(self.p.root, self.skin, s, {'close': self.toggle_albums, 'menu': self._menu_adapter},
                               height=290)
         pos = self.settings['positions'].get('albums')
-        if pos is None:
-            self.main.update_idletasks()
-            pos = (self.main.winfo_x() + 275 * s, self.main.winfo_y())
+        if pos is None:                  # right of the whole stack: of the cover when it's on the right, else of main
+            origin = self._main_origin()
+            pos = (max(x + w for x, _y, w, _h in self._stack_rects(origin)), origin[1])
         win.geometry(f'+{pos[0]}+{pos[1]}')
         self._skin_toplevel(win, self.toggle_albums)
         c = self.skin.pledit
@@ -708,11 +710,13 @@ class SkinController:
         if size not in SIZES:
             return
         self._remember_positions()
+        docked = self._albums_docked(self._stack_rects(self._main_origin())) if self._main_alive() else False
         self.settings['size'] = size
         s = self.scale()
         for w in self._windows():
             w.set_skin(self.skin, s)
         self._layout_stack()
+        self._place_cover(docked)
         self.save()
         self._refresh()
         self._later_keep_reachable()
@@ -956,7 +960,8 @@ class SkinController:
         return (w.winfo_x(), w.winfo_y(), w.winfo_width(), w.winfo_height())
 
     def _snap(self, win, name):
-        others = [self._rect(w) for w in self._windows() if w is not win]
+        own = [m[0] for m in self._stack_members()] if win is self.main else []    # never snap to its own stack
+        others = [self._rect(w) for w in self._windows() if w is not win and not any(w is o for o in own)]
         r = self._rect(win)
         screen = _area_of(r, work_areas(win)) or (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
         x, y = skin_math.snap(r, others, screen)
@@ -1009,6 +1014,40 @@ class SkinController:
         if off is not None and self._main_alive():
             self.main.geometry(f'+{x - off[0]}+{y - off[1]}')
 
+    def _main_origin(self):
+        self.main.update_idletasks()
+        return (self.main.winfo_x(), self.main.winfo_y())
+
+    def _place_cover(self, albums_docked=None):
+        """Pick the cover's side for where the main window is now: right when it fits on main's monitor, else left,
+        else slide the stack sideways until a right cover fits. A docked Albums window follows a slide and moves
+        sideways just past the cover when it would overlap it. albums_docked: whether Albums was docked before the
+        caller changed any geometry (worked out here when None). Runs when a move ends, never during a drag."""
+        if not (self._main_alive() and self._alive(self.cover)):
+            return
+        s = self.scale()
+        origin = self._main_origin()
+        if albums_docked is None:
+            albums_docked = self._albums_docked(self._stack_rects(origin))
+        main_rect = (origin[0], origin[1], 275 * s, 116 * s)
+        self._cover_side, dx = skin_math.cover_spot(main_rect, 275 * s, work_areas(self.main))
+        if dx:
+            origin = (origin[0] + dx, origin[1])
+            self._main_pos = origin          # moved here with its stack: <Configure> must not move Albums again
+            self.main.geometry(f'+{origin[0]}+{origin[1]}')
+            self.settings['positions']['main'] = list(origin)
+        self._layout_stack(origin)
+        if albums_docked and self._alive(self.albums):
+            ax, ay, aw, ah = self._rect(self.albums)
+            ax += dx
+            cx = origin[0] + (275 * s if self._cover_side == 'right' else -275 * s)
+            cover = (cx, origin[1], 275 * s, COVER_HEIGHT * s)
+            if _overlap((ax, ay, aw, ah), cover) > 0:
+                ax = cx + 275 * s if self._cover_side == 'right' else cx - aw
+            if (ax, ay) != (self.albums.winfo_x(), self.albums.winfo_y()):
+                self.albums.geometry(f'+{ax}+{ay}')
+                self.settings['positions']['albums'] = [ax, ay]
+
     def _albums_docked(self, stack_rects):
         if not self._alive(self.albums):
             return False
@@ -1021,6 +1060,7 @@ class SkinController:
         docked, else on its own."""
         if not self._main_alive():
             return
+        self._place_cover()
         self.main.update_idletasks()
         areas = work_areas(self.main)
         grip = 14 * self.scale()
