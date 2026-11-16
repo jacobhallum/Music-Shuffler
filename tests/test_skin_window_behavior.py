@@ -769,6 +769,39 @@ class SkinCoverTests(unittest.TestCase):
         pump(300)
         self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 275)
 
+    def test_albums_stays_docked_through_cover_flip(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)                                         # right of the right-hand cover
+        self.release_main_at(1500, 100)                   # Albums follows to 2050, then the cover flips left
+        self.assertEqual(self.c._cover_side, 'left')
+        self.assertEqual(rect(self.c.albums)[:2], (1775, 100))
+        self.c.main.geometry('+1540+130')
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[:2], (1815, 130))
+
+    def test_albums_stays_docked_when_cover_shrinks(self):
+        self.areas([(0, 0, 4000, 2000)])
+        self.c.settings['size'] = 3
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[0], 1950)
+        self.c.set_size(1)
+        pump(300)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 275)
+
+    def test_side_redecided_after_reachability_pull(self):
+        areas = [(0, 0, 1920, 1040), (1920, 500, 1920, 1040)]
+        self.areas(areas)
+        self.c.settings['size'] = 3
+        self.open_skin()
+        self.release_main_at(1200, 1000)
+        for w in self.c._windows():
+            x, y, ww, hh = rect(w)
+            self.assertEqual(reachable((x, y, ww, hh), areas, grip=42), (x, y), w)
+
     def test_albums_moves_aside_when_cover_grows(self):
         self.areas([(0, 0, 4000, 2000)])
         self.open_skin()

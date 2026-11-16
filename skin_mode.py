@@ -35,6 +35,7 @@ REFRESH_MS = 250
 VIS_MS = 33
 KEEP_MS = 60          # after a move: let docked windows follow before pulling title bars back on screen
 VIS_MODES = ('spectrum', 'scope', 'off')
+_ASK = object()               # _place_cover: work out the Albums snapshot itself
 SAMPLE_RATE = 48000          # the engine's output format: 48 kHz stereo float32
 SIZES = (1, 2, 3)     # whole-number scales only: nearest-neighbour pixels stay crisp
 DEFAULTS = {'skin': None, 'size': 1, 'always_on_top': False, 'vis_mode': 'spectrum',
@@ -617,9 +618,9 @@ class SkinController:
             self.cover = None
             self._cover_key = self._cover_src = None
         else:
-            docked = self._albums_docked(self._stack_rects(self._main_origin()))
+            hold = self._albums_hold()
             self._open_cover()
-            self._place_cover(docked)
+            self._place_cover(hold)
             self._apply_topmost()
             self._later_keep_reachable()
         self.settings['cover_open'] = self.cover is not None
@@ -710,13 +711,13 @@ class SkinController:
         if size not in SIZES:
             return
         self._remember_positions()
-        docked = self._albums_docked(self._stack_rects(self._main_origin())) if self._main_alive() else False
+        hold = self._albums_hold()
         self.settings['size'] = size
         s = self.scale()
         for w in self._windows():
             w.set_skin(self.skin, s)
         self._layout_stack()
-        self._place_cover(docked)
+        self._place_cover(hold)
         self.save()
         self._refresh()
         self._later_keep_reachable()
@@ -1018,35 +1019,67 @@ class SkinController:
         self.main.update_idletasks()
         return (self.main.winfo_x(), self.main.winfo_y())
 
-    def _place_cover(self, albums_docked=None):
+    def _place_cover(self, albums_hold=_ASK):
         """Pick the cover's side for where the main window is now: right when it fits on main's monitor, else left,
-        else slide the stack sideways until a right cover fits. A docked Albums window follows a slide and moves
-        sideways just past the cover when it would overlap it. albums_docked: whether Albums was docked before the
-        caller changed any geometry (worked out here when None). Runs when a move ends, never during a drag."""
-        if not (self._main_alive() and self._alive(self.cover)):
+        else slide the stack sideways until a right cover fits. Then keep a docked Albums window on the stack.
+        albums_hold: _albums_hold() from before the caller changed any geometry (worked out here when not given).
+        Runs when a move ends, never during a drag."""
+        if not self._main_alive():
             return
+        if albums_hold is _ASK:
+            albums_hold = self._albums_hold()
         s = self.scale()
         origin = self._main_origin()
-        if albums_docked is None:
-            albums_docked = self._albums_docked(self._stack_rects(origin))
-        main_rect = (origin[0], origin[1], 275 * s, 116 * s)
-        self._cover_side, dx = skin_math.cover_spot(main_rect, 275 * s, work_areas(self.main))
-        if dx:
-            origin = (origin[0] + dx, origin[1])
-            self._main_pos = origin          # moved here with its stack: <Configure> must not move Albums again
-            self.main.geometry(f'+{origin[0]}+{origin[1]}')
-            self.settings['positions']['main'] = list(origin)
-        self._layout_stack(origin)
-        if albums_docked and self._alive(self.albums):
-            ax, ay, aw, ah = self._rect(self.albums)
+        dx = 0
+        if self._alive(self.cover):
+            main_rect = (origin[0], origin[1], 275 * s, 116 * s)
+            self._cover_side, dx = skin_math.cover_spot(main_rect, 275 * s, work_areas(self.main))
+            if dx:
+                origin = (origin[0] + dx, origin[1])
+                self._main_pos = origin      # moved here with its stack: <Configure> must not move Albums again
+                self.main.geometry(f'+{origin[0]}+{origin[1]}')
+                self.settings['positions']['main'] = list(origin)
+            self._layout_stack(origin)
+        self._reattach_albums(albums_hold, origin, dx)
+
+    def _albums_hold(self):
+        """How a docked Albums window hangs on the stack, taken before the stack changes shape: 'right' or 'left'
+        when it sits against that outer edge of the whole stack, 'other' when docked elsewhere (above or below),
+        None when it isn't docked."""
+        if not (self._main_alive() and self._alive(self.albums)):
+            return None
+        rects = self._stack_rects(self._main_origin())
+        if not self._albums_docked(rects):
+            return None
+        ax, _ay, aw, _ah = self._rect(self.albums)
+        if ax >= max(x + w for x, _y, w, _h in rects):
+            return 'right'
+        if ax + aw <= min(x for x, _y, _w, _h in rects):
+            return 'left'
+        return 'other'
+
+    def _reattach_albums(self, hold, origin, dx=0):
+        """After the stack changed shape (cover shown, flipped, resized, stack slid): put a docked Albums window back
+        against the outer edge it was on; docked elsewhere, it follows a slide and steps sideways past the cover
+        when it would overlap it."""
+        if hold is None or not self._alive(self.albums):
+            return
+        s = self.scale()
+        ax, ay, aw, ah = self._rect(self.albums)
+        rects = self._stack_rects(origin)
+        if hold == 'right':
+            ax = max(x + w for x, _y, w, _h in rects)
+        elif hold == 'left':
+            ax = min(x for x, _y, _w, _h in rects) - aw
+        else:
             ax += dx
-            cx = origin[0] + (275 * s if self._cover_side == 'right' else -275 * s)
-            cover = (cx, origin[1], 275 * s, COVER_HEIGHT * s)
-            if _overlap((ax, ay, aw, ah), cover) > 0:
-                ax = cx + 275 * s if self._cover_side == 'right' else cx - aw
-            if (ax, ay) != (self.albums.winfo_x(), self.albums.winfo_y()):
-                self.albums.geometry(f'+{ax}+{ay}')
-                self.settings['positions']['albums'] = [ax, ay]
+            if self._alive(self.cover):
+                cx = origin[0] + (275 * s if self._cover_side == 'right' else -275 * s)
+                if _overlap((ax, ay, aw, ah), (cx, origin[1], 275 * s, COVER_HEIGHT * s)) > 0:
+                    ax = cx + 275 * s if self._cover_side == 'right' else cx - aw
+        if (ax, ay) != (self.albums.winfo_x(), self.albums.winfo_y()):
+            self.albums.geometry(f'+{ax}+{ay}')
+            self.settings['positions']['albums'] = [ax, ay]
 
     def _albums_docked(self, stack_rects):
         if not self._alive(self.albums):
@@ -1057,10 +1090,17 @@ class SkinController:
     def _keep_reachable(self):
         """Pull title bars back where the mouse can grab them (off an edge, under the taskbar, on a monitor that is
         gone). The stack moves as one and always ends with the main window reachable; Albums moves with it when
-        docked, else on its own."""
-        if not self._main_alive():
-            return
-        self._place_cover()
+        docked, else on its own. The cover's side is picked first; when the pull moved the main window (maybe onto
+        another monitor) the side is picked again and the pull re-checked, once."""
+        for _ in range(2):
+            if not self._main_alive():
+                return
+            self._place_cover()
+            if not self._pull_back():
+                return
+
+    def _pull_back(self):
+        """One reachability pass (see _keep_reachable). True when it moved the main window."""
         self.main.update_idletasks()
         areas = work_areas(self.main)
         grip = 14 * self.scale()
@@ -1104,6 +1144,7 @@ class SkinController:
             self.main.update_idletasks()
             self._main_pos = (self.main.winfo_x(), self.main.winfo_y())   # where it really is, moved or not
             self.save()
+        return (dx, dy) != (0, 0)
 
     def _on_main_configure(self, event):
         """The stack follows the main window (and its size); a docked Albums window moves with it too."""
