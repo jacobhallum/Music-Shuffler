@@ -276,6 +276,8 @@ class SkinStackTests(unittest.TestCase):
         self.c = skin_mode.SkinController(self.p)
         self.addCleanup(self.c._close_windows)
         self.c.settings['positions'] = {'main': [300, 200]}
+        # the cover has its own tests (SkinCoverTests); at 1x it sits on top of main and would push this stack down
+        self.c.settings['cover_open'] = False
 
     def open_skin(self):
         self.c.pick('syn.wsz')
@@ -450,7 +452,8 @@ RED, BLUE = (255, 0, 0), (0, 0, 255)
 
 @unittest.skipIf(_root is None or not WIN, "needs Windows and a display")
 class SkinCoverTests(unittest.TestCase):
-    """The album cover docked beside the stack (spec 2026-11-16-skin-album-art)."""
+    """The album cover docked on the stack (spec 2026-11-16-skin-album-art): on top of it at 1x, beside main at 2x and
+    up."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -462,7 +465,7 @@ class SkinCoverTests(unittest.TestCase):
         self.addCleanup(self.p.root.destroy)
         self.c = skin_mode.SkinController(self.p)
         self.addCleanup(self.c._close_windows)
-        self.c.settings['positions'] = {'main': [300, 200]}
+        self.c.settings['positions'] = {'main': [300, 400]}     # room above main for the 1x cover
         self.pics = []
         orig = skin_cover.SkinCoverWindow.set_picture
 
@@ -487,23 +490,48 @@ class SkinCoverTests(unittest.TestCase):
 
     # ---- where it is ---------------------------------------------------------------------------
 
-    def test_cover_opens_beside_main(self):
+    def test_cover_opens_above_main_at_1x(self):
         self.open_skin()
         m = rect(self.c.main)
-        self.assertEqual(rect(self.c.cover), (m[0] + 275, m[1], 275, 232))
+        self.assertEqual(rect(self.c.cover), (m[0], m[1] - 232, 275, 232))
+        self.assertEqual(self.c._cover_side, 'above')
+
+    def test_cover_opens_beside_main_at_2x(self):
+        self.c.settings['size'] = 2
+        self.open_skin()
+        m = rect(self.c.main)
+        self.assertEqual(rect(self.c.cover), (m[0] + 550, m[1], 550, 464))
 
     def test_cover_follows_size(self):
+        self.areas([(0, 0, 4000, 3000)])
         self.open_skin()
         self.c.set_size(2)
         pump(300)
         m = rect(self.c.main)
         self.assertEqual(rect(self.c.cover), (m[0] + 550, m[1], 550, 464))
         self.assertEqual(self.pics[-1].size, (348, 348))
+        self.c.set_size(1)
+        pump(300)
+        m = rect(self.c.main)
+        self.assertEqual(rect(self.c.cover), (m[0], m[1] - 232, 275, 232))
+
+    def test_cover_above_stays_above_near_the_right_edge(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['positions'] = {'main': [1700, 400]}
+        self.open_skin()
+        self.assertEqual(rect(self.c.cover)[:2], (rect(self.c.main)[0], rect(self.c.main)[1] - 232))
+
+    def test_cover_above_is_pulled_on_screen(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['positions'] = {'main': [300, 50]}
+        self.open_skin()
+        self.assertEqual(rect(self.c.cover)[1], 0)
+        self.assertEqual(rect(self.c.main)[1], 232)
 
     def test_cover_bottom_lines_up_with_eq_bottom(self):
         self.areas([(0, 0, 4000, 3000)])
         self.open_skin()
-        for size in (1, 2, 3):
+        for size in (2, 3):
             with self.subTest(size=size):
                 self.c.set_size(size)
                 pump(300)
@@ -512,11 +540,12 @@ class SkinCoverTests(unittest.TestCase):
                 self.assertEqual(cy + ch, ey + eh)
 
     def test_cover_stays_level_when_eq_toggles(self):
+        self.c.settings['size'] = 2
         self.open_skin()
         for _ in range(2):
             self.c.toggle_eq()
             pump(200)
-            self.assertEqual(rect(self.c.cover)[:2], (rect(self.c.main)[0] + 275, rect(self.c.main)[1]))
+            self.assertEqual(rect(self.c.cover)[:2], (rect(self.c.main)[0] + 550, rect(self.c.main)[1]))
 
     def test_cover_drag_moves_stack(self):
         self.open_skin()
@@ -691,11 +720,12 @@ class SkinCoverTests(unittest.TestCase):
 
     def test_cover_flips_left_near_right_edge(self):
         self.areas([(0, 0, 1920, 1040)])
-        self.c.settings['positions'] = {'main': [1500, 100]}
+        self.c.settings['size'] = 2
+        self.c.settings['positions'] = {'main': [1300, 100]}
         self.open_skin()
         self.c._keep_reachable()
         pump(100)
-        self.assertEqual(rect(self.c.cover)[:2], (rect(self.c.main)[0] - 275, 100))
+        self.assertEqual(rect(self.c.cover)[:2], (750, 100))
 
     def test_cover_slides_stack_when_neither_side_fits(self):
         self.areas([(0, 0, 1920, 1040)])
@@ -708,17 +738,18 @@ class SkinCoverTests(unittest.TestCase):
 
     def test_side_kept_during_drag(self):
         self.areas([(0, 0, 1920, 1040)])
-        self.c.settings['positions'] = {'main': [1500, 100]}
+        self.c.settings['size'] = 2
+        self.c.settings['positions'] = {'main': [1300, 100]}
         self.open_skin()
         self.assertEqual(self.c._cover_side, 'left')
         cx, cy = rect(self.c.cover)[:2]
         ev = lambda xr, yr: SimpleNamespace(x=50, y=5, x_root=xr, y_root=yr)  # noqa: E731
         self.c.cover._on_press(ev(cx + 50, cy + 5))
-        self.c.cover._on_motion(ev(cx - 1050, cy + 105))      # main would now fit a right cover
+        self.c.cover._on_motion(ev(cx - 650, cy + 105))       # main would now fit a right cover
         pump(200)
         self.assertEqual(self.c._cover_side, 'left')
-        self.assertEqual(rect(self.c.main)[:2], (400, 200))
-        self.assertEqual(rect(self.c.cover)[:2], (125, 200))
+        self.assertEqual(rect(self.c.main)[:2], (600, 200))
+        self.assertEqual(rect(self.c.cover)[:2], (50, 200))
 
     def test_side_follows_monitor_after_release(self):
         self.areas([(-1920, 0, 1920, 1040), (0, 0, 2560, 1400)])
@@ -744,23 +775,34 @@ class SkinCoverTests(unittest.TestCase):
             self.c._snap(self.c.main, 'main')
         self.assertEqual(got, [[rect(self.c.albums)]])
 
+    def test_albums_default_right_of_main_at_1x(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.assertEqual(rect(self.c.albums)[:2], (rect(self.c.main)[0] + 275, rect(self.c.main)[1]))
+
     def test_albums_default_right_of_cover(self):
         self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['size'] = 2
         self.open_skin()
         self.c.toggle_albums()
         pump(200)
-        self.assertEqual(rect(self.c.albums)[:2], (rect(self.c.cover)[0] + 275, rect(self.c.main)[1]))
+        self.assertEqual(rect(self.c.albums)[:2], (rect(self.c.cover)[0] + 550, rect(self.c.main)[1]))
 
     def test_albums_default_right_of_main_when_cover_is_left(self):
-        self.areas([(0, 0, 1920, 1040)])
-        self.c.settings['positions'] = {'main': [1500, 100]}
+        self.areas([(0, 0, 2560, 1400)])
+        self.c.settings['size'] = 2
+        self.c.settings['positions'] = {'main': [1900, 100]}
         self.open_skin()
         self.c.toggle_albums()
         pump(200)
-        self.assertEqual(rect(self.c.albums)[:2], (1775, 100))
+        self.assertEqual(self.c._cover_side, 'left')
+        self.assertEqual(rect(self.c.albums)[:2], (2450, 100))
 
     def test_albums_docked_to_cover_follows(self):
         self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['size'] = 2
         self.open_skin()
         self.c.toggle_albums()
         pump(200)
@@ -771,26 +813,39 @@ class SkinCoverTests(unittest.TestCase):
 
     def test_albums_moves_aside_when_cover_appears(self):
         self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['size'] = 2
         self.c.settings['cover_open'] = False
         self.open_skin()
         self.c.toggle_albums()
         pump(200)
-        self.assertEqual(rect(self.c.albums)[0], rect(self.c.main)[0] + 275)     # hidden cover: right of main
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.main)[0] + 550)     # hidden cover: right of main
         self.c.toggle_cover()
         pump(300)
-        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 275)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 550)
+
+    def test_albums_stays_right_of_main_when_cover_appears_at_1x(self):
+        self.areas([(0, 0, 1920, 1040)])
+        self.c.settings['cover_open'] = False
+        self.open_skin()
+        self.c.toggle_albums()
+        pump(200)
+        self.c.toggle_cover()
+        pump(300)
+        self.assertEqual(rect(self.c.albums)[:2], (rect(self.c.main)[0] + 275, rect(self.c.main)[1]))
 
     def test_albums_stays_docked_through_cover_flip(self):
-        self.areas([(0, 0, 1920, 1040)])
+        self.areas([(0, 0, 2560, 1400)])
+        self.c.settings['size'] = 2
+        self.c.settings['positions'] = {'main': [300, 100]}
         self.open_skin()
         self.c.toggle_albums()
         pump(200)                                         # right of the right-hand cover
-        self.release_main_at(1500, 100)                   # Albums follows to 2050, then the cover flips left
+        self.release_main_at(1900, 100)                   # Albums follows to 3000, then the cover flips left
         self.assertEqual(self.c._cover_side, 'left')
-        self.assertEqual(rect(self.c.albums)[:2], (1775, 100))
-        self.c.main.geometry('+1540+130')
+        self.assertEqual(rect(self.c.albums)[:2], (2450, 100))
+        self.c.main.geometry('+1940+130')
         pump(200)
-        self.assertEqual(rect(self.c.albums)[:2], (1815, 130))
+        self.assertEqual(rect(self.c.albums)[:2], (2490, 130))
 
     def test_albums_stays_docked_when_cover_shrinks(self):
         self.areas([(0, 0, 4000, 2000)])
@@ -799,9 +854,12 @@ class SkinCoverTests(unittest.TestCase):
         self.c.toggle_albums()
         pump(200)
         self.assertEqual(rect(self.c.albums)[0], 1950)
-        self.c.set_size(1)
+        self.c.set_size(2)
         pump(300)
-        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 275)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 550)
+        self.c.set_size(1)                                # the cover goes on top: Albums right of main
+        pump(300)
+        self.assertEqual(rect(self.c.albums)[0], rect(self.c.main)[0] + 275)
 
     def test_side_redecided_after_reachability_pull(self):
         areas = [(0, 0, 1920, 1040), (1920, 500, 1920, 1040)]
@@ -815,10 +873,11 @@ class SkinCoverTests(unittest.TestCase):
 
     def test_albums_moves_aside_when_cover_grows(self):
         self.areas([(0, 0, 4000, 2000)])
+        self.c.settings['size'] = 2
         self.open_skin()
         self.c.toggle_albums()
         pump(200)
-        self.c.set_size(3)                    # Albums (850) now inside the cover (1125..1950), touching nothing
+        self.c.set_size(3)                    # Albums (1400) now inside the cover (1125..1950), touching nothing
         pump(300)
         self.assertEqual(rect(self.c.albums)[0], rect(self.c.cover)[0] + 825)
 

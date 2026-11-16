@@ -237,7 +237,7 @@ class SkinController:
         self.settings = load_settings(self.settings_path)
         self.skin = None
         self.main = self.eq = self.pl = self.cover = self.albums = None
-        self._cover_side = 'right'    # which side of the stack the album cover docks on
+        self._cover_side = 'right'    # where the album cover docks: 'above' main at 1x, 'right' or 'left' of it above
         self._cover_key = None        # what the cover window shows now: (id(source), scale, skin name)
         self._cover_src = None        # ... and that source, held so its id stays unique
         self._chunks = collections.deque(maxlen=4)
@@ -974,11 +974,11 @@ class SkinController:
     def _later_keep_reachable(self):
         self.p.root.after(KEEP_MS, self._keep_reachable)
 
-    # ---- the stack: main on top, EQ under it when open, the playlist at the bottom, the cover beside main ----
+    # ---- the stack: main, EQ under it when open, the playlist at the bottom; the cover on top (1x) or beside main ----
 
     def _stack_members(self):
         """(window, dx, dy, w, h) of every window docked to the main window, from its top-left: EQ (when open) and
-        the playlist flush under it, the album cover level with it on its side."""
+        the playlist flush under it; the album cover flush on top of it at 1x, level with it on its side above 1x."""
         s = self.scale()
         out, y = [], 116 * s
         for w in (self.eq, self.pl):
@@ -987,8 +987,11 @@ class SkinController:
                 out.append((w, 0, y, 275 * s, h))
                 y += h
         if self._alive(self.cover):
-            dx = 275 * s if self._cover_side == 'right' else -275 * s
-            out.append((self.cover, dx, 0, 275 * s, COVER_HEIGHT * s))
+            if s == 1:                   # 1x: on top of the stack (Jacob 2026-11-16); 2x and up: beside main
+                out.append((self.cover, 0, -COVER_HEIGHT, 275, COVER_HEIGHT))
+            else:
+                dx = -275 * s if self._cover_side == 'left' else 275 * s
+                out.append((self.cover, dx, 0, 275 * s, COVER_HEIGHT * s))
         return out
 
     def _stack_rects(self, origin):
@@ -1020,8 +1023,9 @@ class SkinController:
         return (self.main.winfo_x(), self.main.winfo_y())
 
     def _place_cover(self, albums_hold=_ASK):
-        """Pick the cover's side for where the main window is now: right when it fits on main's monitor, else left,
-        else slide the stack sideways until a right cover fits. Then keep a docked Albums window on the stack.
+        """Pick the cover's side for where the main window is now: at 1x always on top of main; above 1x right when
+        it fits on main's monitor, else left, else slide the stack sideways until a right cover fits. Then keep a docked
+        Albums window on the stack.
         albums_hold: _albums_hold() from before the caller changed any geometry (worked out here when not given).
         Runs when a move ends, never during a drag."""
         if not self._main_alive():
@@ -1032,8 +1036,11 @@ class SkinController:
         origin = self._main_origin()
         dx = 0
         if self._alive(self.cover):
-            main_rect = (origin[0], origin[1], 275 * s, 116 * s)
-            self._cover_side, dx = skin_math.cover_spot(main_rect, 275 * s, work_areas(self.main))
+            if s == 1:
+                self._cover_side = 'above'
+            else:
+                main_rect = (origin[0], origin[1], 275 * s, 116 * s)
+                self._cover_side, dx = skin_math.cover_spot(main_rect, 275 * s, work_areas(self.main))
             if dx:
                 origin = (origin[0] + dx, origin[1])
                 self._main_pos = origin      # moved here with its stack: <Configure> must not move Albums again
@@ -1064,7 +1071,6 @@ class SkinController:
         when it would overlap it."""
         if hold is None or not self._alive(self.albums):
             return
-        s = self.scale()
         ax, ay, aw, ah = self._rect(self.albums)
         rects = self._stack_rects(origin)
         if hold == 'right':
@@ -1073,10 +1079,10 @@ class SkinController:
             ax = min(x for x, _y, _w, _h in rects) - aw
         else:
             ax += dx
-            if self._alive(self.cover):
-                cx = origin[0] + (275 * s if self._cover_side == 'right' else -275 * s)
-                if _overlap((ax, ay, aw, ah), (cx, origin[1], 275 * s, COVER_HEIGHT * s)) > 0:
-                    ax = cx + 275 * s if self._cover_side == 'right' else cx - aw
+            cover = next(((origin[0] + mdx, origin[1] + mdy, mw, mh)
+                          for w, mdx, mdy, mw, mh in self._stack_members() if w is self.cover), None)
+            if cover is not None and _overlap((ax, ay, aw, ah), cover) > 0:
+                ax = cover[0] - aw if self._cover_side == 'left' else cover[0] + cover[2]
         if (ax, ay) != (self.albums.winfo_x(), self.albums.winfo_y()):
             self.albums.geometry(f'+{ax}+{ay}')
             self.settings['positions']['albums'] = [ax, ay]
