@@ -28,6 +28,7 @@ from shuffle_core import CustomShuffleAlgorithm
 import playlist_queue
 import appcommand
 import appcommand_hook
+import cover_art
 import audio_settings
 import library_index
 import listening_log
@@ -88,6 +89,15 @@ SOUND_DIALOG_KEYS = ('transition_mode', 'transition_seconds', 'leveling_enabled'
 EQ_WINDOW_KEYS = ('eq_enabled', 'eq_preset', 'eq_bands_db', 'eq_preamp_db')
 ARTWORK_SIZE = 500  # Album artwork thumbnail size in pixels
 ICON_SIZES = (16, 32, 48, 64, 128, 256)  # Window/taskbar icon sizes to generate
+
+
+def bundle_dir(script_dir):
+    """Where the bundled files (assets/) are. PyInstaller one-file builds extract their `datas` to sys._MEIPASS at
+    runtime, NOT next to sys.executable: script_dir is the exe's own folder (right for the cache and config, wrong
+    for bundled files)."""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        return Path(sys._MEIPASS)
+    return script_dir
 
 
 def open_audio(path, easy=False):
@@ -680,12 +690,12 @@ class MusicPlayerGUI:
         # Best-effort: the app must still start if the icon file is missing/corrupt.
         self._default_icon_photos = None
         self._track_icon_photos = None
+        # The skins' cover window: the current song's cover (set per track by _load_album_artwork)
+        # and the Deep Cuts art shown when there is none.
+        self.current_artwork_image = None
+        self._fallback_artwork_image = cover_art.load_fallback(bundle_dir(self.script_dir))
         try:
-            # PyInstaller onefile builds extract bundled `datas` (assets/app_icon.ico)
-            # to sys._MEIPASS at runtime, NOT next to sys.executable - script_dir is
-            # the exe's own folder (correct for persistent cache/config, wrong here).
-            bundle_dir = Path(getattr(sys, '_MEIPASS', self.script_dir)) if getattr(sys, 'frozen', False) else self.script_dir
-            icon_path = bundle_dir / "assets" / "app_icon.ico"
+            icon_path = bundle_dir(self.script_dir) / "assets" / "app_icon.ico"
             self.root.iconbitmap(default=str(icon_path))
             default_icon_source = Image.open(io.BytesIO(icon_path.read_bytes()))
             self._default_icon_photos = [
@@ -2302,6 +2312,7 @@ class MusicPlayerGUI:
     
     def _load_album_artwork(self, track):
         """Load and display album artwork for a track"""
+        self.current_artwork_image = None      # set again below when this track has a cover
         try:
             audio = open_audio(track.meta_path)
             artwork_data = None
@@ -2363,7 +2374,9 @@ class MusicPlayerGUI:
                         pass
             
             if artwork_data:
-                image = Image.open(io.BytesIO(artwork_data))
+                with Image.open(io.BytesIO(artwork_data)) as source:
+                    self.current_artwork_image = cover_art.shrink(source)   # the skins' cover window
+                image = self.current_artwork_image.copy()
                 image.thumbnail((ARTWORK_SIZE, ARTWORK_SIZE), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(image)
                 self.current_artwork = photo
