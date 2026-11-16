@@ -3,9 +3,10 @@ skin_mode.py - runs the player in a classic Winamp skin.
 
 SkinController owns the skinned windows (main, EQ, playlist, Albums) and the saved choice in ui_settings.json. When a
 skin is picked it is saved and the default view (the root window) is withdrawn; the root keeps its title, media-key
-hook and single-instance mutex, so media keys and a second launch still reach the player (a second launch that shows
-the root is turned back into raising the skinned main window). Picking "No skin", or a saved skin that is missing or
-broken at startup, brings the default view back.
+hook and single-instance mutex, so a second launch still reaches the player (a second launch that shows the root is
+turned back into raising the skinned main window). fn-lock skips hidden windows, so while skinned it sends F5-F8 and
+the dial to the skinned main window ("Music Player V2 (skin)"), which gets the same media-key hook (appcommand_hook).
+Picking "No skin", or a saved skin that is missing or broken at startup, brings the default view back.
 
 It talks to the player only through MusicPlayerGUI's existing methods and state.
 """
@@ -20,6 +21,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 from types import SimpleNamespace
 
+import appcommand_hook
 import skin as skin_lib
 import skin_layout
 import skin_math
@@ -241,6 +243,7 @@ class SkinController:
         self._last_rows = None
         self._pl_query = ''
         self._main_pos = None
+        self._key_hook = None         # media keys (fn-lock WM_APPCOMMAND) on the skinned main window
 
     # ---- choosing a skin ---------------------------------------------------------
 
@@ -434,6 +437,7 @@ class SkinController:
         if self._map_bind is None:
             self._map_bind = p.root.bind('<Map>', self._on_root_mapped, add='+')
         set_app_window(self.main)
+        self._hook_media_keys()
         if p._engine is not None:
             p._engine.vis_tap = self._chunks.append
         self._last_icon = None
@@ -463,6 +467,9 @@ class SkinController:
             except (tk.TclError, ValueError):
                 pass
         self._jobs.clear()
+        if self._key_hook is not None:
+            self._key_hook.remove()
+            self._key_hook = None
         for name in ('albums', 'pl', 'eq', 'main'):
             w = getattr(self, name)
             if w is not None:
@@ -500,6 +507,13 @@ class SkinController:
                     pass
         if self.pl is not None:
             self.settings['pl_height'] = self.pl.height
+
+    def _hook_media_keys(self):
+        """fn-lock sends F5-F8 and the dial to the first visible window titled "Music Player V2..."; the root is hidden
+        while skinned, so that is the skinned main window. Hand its keys to the player like the root's hook does."""
+        queue = getattr(self.p, '_queue_appcommand', None)
+        if queue is not None and self.main is not None:
+            self._key_hook = appcommand_hook.install(self.main, queue)
 
     def _on_root_mapped(self, event):
         """A second launch shows the root window: while skinned, hide it again and raise the skin instead."""
