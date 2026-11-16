@@ -490,15 +490,26 @@ class SkinCoverTests(unittest.TestCase):
     def test_cover_opens_beside_main(self):
         self.open_skin()
         m = rect(self.c.main)
-        self.assertEqual(rect(self.c.cover), (m[0] + 275, m[1], 275, 301))
+        self.assertEqual(rect(self.c.cover), (m[0] + 275, m[1], 275, 232))
 
     def test_cover_follows_size(self):
         self.open_skin()
         self.c.set_size(2)
         pump(300)
         m = rect(self.c.main)
-        self.assertEqual(rect(self.c.cover), (m[0] + 550, m[1], 550, 602))
-        self.assertEqual(self.pics[-1].size, (486, 486))
+        self.assertEqual(rect(self.c.cover), (m[0] + 550, m[1], 550, 464))
+        self.assertEqual(self.pics[-1].size, (348, 348))
+
+    def test_cover_bottom_lines_up_with_eq_bottom(self):
+        self.areas([(0, 0, 4000, 3000)])
+        self.open_skin()
+        for size in (1, 2, 3):
+            with self.subTest(size=size):
+                self.c.set_size(size)
+                pump(300)
+                cx, cy, cw, ch = rect(self.c.cover)
+                ex, ey, ew, eh = rect(self.c.eq)
+                self.assertEqual(cy + ch, ey + eh)
 
     def test_cover_stays_level_when_eq_toggles(self):
         self.open_skin()
@@ -644,7 +655,7 @@ class SkinCoverTests(unittest.TestCase):
         self.assertEqual(len(self.pics), n + 1)
         self.c.set_size(2)
         self.assertEqual(len(self.pics), n + 2)
-        self.assertEqual(self.pics[-1].size, (486, 486))
+        self.assertEqual(self.pics[-1].size, (348, 348))
 
     def test_reshown_cover_shows_current_art(self):
         from PIL import Image

@@ -46,18 +46,18 @@ class SkinCoverWindowTests(unittest.TestCase):
         for s in (1, 2, 3):
             with self.subTest(scale=s):
                 w = self.window(s)
-                self.assertEqual((w.winfo_reqwidth(), w.winfo_reqheight()), (275 * s, 301 * s))
-        self.assertEqual(skin_cover.COVER_HEIGHT, 301)
+                self.assertEqual((w.winfo_reqwidth(), w.winfo_reqheight()), (275 * s, 232 * s))
+        self.assertEqual(skin_cover.COVER_HEIGHT, 232)
 
     def test_no_resize_grip(self):
         w = self.window()
-        self.assertIsNone(w._hit(ev(270, 295)))
-        w._on_press(ev(270, 295))
+        self.assertIsNone(w._hit(ev(270, 228)))
+        w._on_press(ev(270, 228))
         w._on_motion(ev(270, 400))
         w._on_release(ev(270, 400))
-        self.assertEqual(w.height, 301)
+        self.assertEqual(w.height, 232)
         w.set_height(500)
-        self.assertEqual(w.height, 301)
+        self.assertEqual(w.height, 232)
 
     def test_plain_frame(self):
         names, orig = [], self.skin.sprite

@@ -15,8 +15,8 @@ from PIL import ImageTk
 
 from skin_playlist import WIDTH, SkinPlaylistWindow
 
-COVER_HEIGHT = 301    # 243 art + 20 top + 38 bottom
-ART = 243
+COVER_HEIGHT = 232    # main + EQ (116 + 116), so the cover's bottom lines up with EQ's
+INSIDE_W, INSIDE_H = WIDTH - 32, COVER_HEIGHT - 58    # 243 x 174 inside the frame (12/20 sides, 20/38 top/bottom)
 
 COVER_LABELS = {'close': 'Hide album art'}
 
@@ -56,8 +56,8 @@ class SkinCoverWindow(SkinPlaylistWindow):
         self.canvas.delete('inner')
         if self.art is not None:
             self.art.config(bg=self.skin.pledit['normalbg'])
-            self.canvas.create_window(12 * s, 20 * s, anchor='nw', window=self.art, width=ART * s, height=ART * s,
-                                      tags=('inner',))
+            self.canvas.create_window(12 * s, 20 * s, anchor='nw', window=self.art,
+                                      width=INSIDE_W * s, height=INSIDE_H * s, tags=('inner',))
 
     def _hit(self, event):
         kind = super()._hit(event)
@@ -67,7 +67,7 @@ class SkinCoverWindow(SkinPlaylistWindow):
         """The cover never resizes."""
 
     def set_picture(self, image):
-        """Show image (an RGB PIL image ART*scale square)."""
+        """Show image (an RGB PIL image, cover_art.ART*scale square), centered in the frame."""
         self._art_photo = ImageTk.PhotoImage(image, master=self.canvas)
         self.art.config(image=self._art_photo)
 

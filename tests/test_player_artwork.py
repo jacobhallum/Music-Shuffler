@@ -74,7 +74,7 @@ class CurrentArtworkTests(unittest.TestCase):
     def test_folder_art_is_kept_capped(self):
         ok = self.p._load_album_artwork(self.track(os.path.join(self.dir, 'a'), (1500, 1500)))
         self.assertTrue(ok)
-        self.assertEqual(max(self.p.current_artwork_image.size), 729)
+        self.assertEqual(max(self.p.current_artwork_image.size), 522)
 
     def test_no_art_clears_image(self):
         self.p._load_album_artwork(self.track(os.path.join(self.dir, 'a'), (600, 600)))

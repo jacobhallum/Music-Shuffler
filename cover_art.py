@@ -11,8 +11,8 @@ from PIL import Image
 
 import skin_math
 
-ART = 243
-MAX_ART = 729
+ART = 174        # the picture's side at 1x: the cover window's inside height (main + EQ, less the frame)
+MAX_ART = 522    # the largest kept cover (ART x 3, the biggest skin size)
 
 
 def shrink(image, limit=MAX_ART):

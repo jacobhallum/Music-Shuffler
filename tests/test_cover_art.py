@@ -24,7 +24,7 @@ class ShrinkTests(unittest.TestCase):
     def test_shrink_caps_and_keeps_mode(self):
         src = Image.new('RGBA', (2000, 1000), (1, 2, 3, 255))
         out = cover_art.shrink(src)
-        self.assertEqual(max(out.size), 729)
+        self.assertEqual(max(out.size), 522)
         self.assertEqual(out.mode, 'RGBA')
         self.assertEqual(src.size, (2000, 1000))
 
@@ -92,7 +92,7 @@ class FallbackTests(unittest.TestCase):
         self.png()
         self.ico()
         out = cover_art.load_fallback(self.dir)
-        self.assertEqual(max(out.size), 729)
+        self.assertEqual(max(out.size), 522)
         self.assertEqual(out.convert('RGB').getpixel((10, 10)), BLUE)
 
     def test_fallback_ico_when_png_missing(self):
