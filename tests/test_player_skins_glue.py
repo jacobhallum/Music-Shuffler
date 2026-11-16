@@ -174,6 +174,15 @@ class SkinControllerTests(unittest.TestCase):
         self.fnlock_keys_reach_player()
 
     @unittest.skipIf(sys.platform != 'win32', 'Windows only')
+    def test_failed_enter_takes_the_key_hook_off(self):
+        loaded = skin_mode.skin_lib.load_skin(os.path.join(self.tmp.name, 'skins', 'syn.wsz'))
+        with unittest.mock.patch.object(self.c, '_later_keep_reachable', side_effect=RuntimeError('late')):
+            reason = self.c.enter(loaded)       # fails after the hook went on
+        self.assertIn('late', reason)
+        self.assertFalse(self.c.active)
+        self.assertIsNone(self.c._key_hook)
+
+    @unittest.skipIf(sys.platform != 'win32', 'Windows only')
     def test_fnlock_keys_reach_player_after_leaving_and_coming_back(self):
         self.c.pick('syn.wsz')
         _root.update()

@@ -1698,9 +1698,9 @@ class MusicPlayerGUI:
         the skinned main window (appcommand_hook explains the lookup and the reentrancy rule).
         """
         self._appcmd_hook = appcommand_hook.install(self.root, self._queue_appcommand)
-        if self._appcmd_hook is None:
-            return
-        print("✓ Media transport hook enabled — F5-F8 + dial (reacts to whatever fnlock sends)")
+        if self._appcmd_hook is not None:
+            print("✓ Media transport hook enabled — F5-F8 + dial (reacts to whatever fnlock sends)")
+        # The poller runs either way: the skinned main window's hook feeds the same queue.
         self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
 
     def _queue_appcommand(self, cmd):
