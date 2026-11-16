@@ -43,7 +43,8 @@ def _player(base):
         albums_browser=None, settings_menu=tk.Menu(win, tearoff=0), search_var=tk.StringVar(win),
         audio_settings={'eq_enabled': True, 'eq_bands_db': [0.0] * 10, 'eq_preamp_db': 0.0},
         _eq_presets=lambda: {'Flat': ([0.0] * 10, 0.0)},
-        _queue_appcommand=lambda cmd: calls.append(('appcommand', cmd)) or True)
+        _queue_appcommand=lambda cmd: calls.append(('appcommand', cmd)) or True,
+        current_artwork_image=None, _fallback_artwork_image=None)
     for name in ('previous_track', 'play', 'pause', 'stop', 'next_track', 'apply_shuffle', '_on_close',
                  'toggle_loved', 'open_stats_window', 'toggle_play_pause', '_import_eqf', 'apply_eq',
                  '_play_first_result', '_takeover_playlist', 'play_track_at_index', 'apply_theme',
@@ -224,6 +225,12 @@ class SkinControllerTests(unittest.TestCase):
             with open(self.c.settings_path, 'w', encoding='utf-8') as f:
                 f.write(text)
             self.assertEqual(skin_mode.load_settings(self.c.settings_path)['size'], want, text)
+
+    def test_cover_open_setting(self):
+        for text, want in (('{"cover_open": false}', False), ('{"cover_open": "yes"}', True), ('{}', True)):
+            with open(self.c.settings_path, 'w', encoding='utf-8') as f:
+                f.write(text)
+            self.assertIs(skin_mode.load_settings(self.c.settings_path)['cover_open'], want, text)
 
     def test_eq_window_change_goes_to_the_player(self):
         self.c.pick('syn.wsz')
