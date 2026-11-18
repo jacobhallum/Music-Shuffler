@@ -27,6 +27,7 @@ from collections import deque
 from shuffle_core import CustomShuffleAlgorithm
 import playlist_queue
 import appcommand
+import appcommand_hook
 import audio_settings
 import library_index
 import listening_log
@@ -595,11 +596,8 @@ class MusicPlayerGUI:
         self.root.resizable(False, True)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # WM_APPCOMMAND window subclass state (set up in _setup_wm_appcommand_hook)
-        self._appcmd_hwnd = None
-        self._appcmd_old_proc = None
-        self._appcmd_wndproc = None
-        self._appcmd_set_window_long = None
+        # WM_APPCOMMAND hook on the root (set up in _setup_wm_appcommand_hook; the skinned main window gets its own)
+        self._appcmd_hook = None
         # Small deque, not a single slot: a burst of dial presses within one
         # 50ms poll window must not silently overwrite/drop earlier presses.
         self._appcmd_pending = deque()
@@ -1694,102 +1692,38 @@ class MusicPlayerGUI:
         was inherently foreground-only and that fixing it would need Windows' System
         Media Transport Controls — that was wrong; SMTC is a real alternative but was
         never actually necessary here.)
+
+        fnlock picks the first *visible* window whose title starts with "Music Player V2".
+        While a skin is on the root is withdrawn, so SkinController puts the same hook on
+        the skinned main window (appcommand_hook explains the lookup and the reentrancy rule).
         """
-        try:
-            import ctypes
-            from ctypes import wintypes
-        except ImportError:
-            return
-
-        try:
-            self.root.update_idletasks()
-            raw_hwnd = self.root.winfo_id()
-
-            LRESULT = ctypes.c_ssize_t
-            LONG_PTR = ctypes.c_ssize_t
-            GWLP_WNDPROC = -4
-            GA_ROOT = 2
-
-            WNDPROC = ctypes.WINFUNCTYPE(
-                LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-            )
-
-            user32 = ctypes.WinDLL('user32', use_last_error=True)
-
-            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-            user32.GetAncestor.restype = wintypes.HWND
-
-            user32.CallWindowProcW.argtypes = [
-                LONG_PTR, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
-            ]
-            user32.CallWindowProcW.restype = LRESULT
-
-            set_window_long = getattr(user32, 'SetWindowLongPtrW', None) or user32.SetWindowLongW
-            set_window_long.argtypes = [wintypes.HWND, ctypes.c_int, LONG_PTR]
-            set_window_long.restype = LONG_PTR
-
-            # winfo_id() can return a child HWND; WM_APPCOMMAND bubbles up to the
-            # top-level via DefWindowProc, so a child-window subclass would never see it.
-            hwnd = user32.GetAncestor(raw_hwnd, GA_ROOT) or raw_hwnd
-
-            # Labels are generic (not "(dial)") because this same WM_APPCOMMAND path
-            # now handles both the hardware dial and F5-F8 (fnlock forwards both the
-            # same way) — nothing here can tell which physical control sent it.
-            actions = {
-                'play_pause': (self.toggle_play_pause, 'Play/Pause'),
-                'next': (self.next_track, 'Next'),
-                'previous': (self.previous_track, 'Previous'),
-                'stop': (self.stop, 'Stop'),
-            }
-
-            def wndproc_callback(hwnd_arg, msg, wparam, lparam):
-                # WM_APPCOMMAND arrives via a cross-process SendMessage, so Windows
-                # calls this callback reentrantly, nested inside Tcl's own blocked
-                # GetMessage wait (Tcl releases the GIL while waiting for messages).
-                # Reacquiring the GIL to run this Python code is fine (that's what
-                # ctypes' callback trampoline is for), but calling back into
-                # Tkinter/Tcl itself (e.g. root.after) from this nested context
-                # corrupts Tcl's own saved thread-state and crashes the process with
-                # an unrecoverable "GIL is released" fatal error the moment control
-                # returns to Tcl's notifier. So: touch nothing Tcl-related here.
-                # Just record the action and return — a root.after-scheduled poller
-                # (running in Tcl's own normal, non-reentrant loop) does the dispatch.
-                try:
-                    if msg == appcommand.WM_APPCOMMAND:
-                        cmd = appcommand.appcommand_from_lparam(lparam)
-                        action_name = appcommand.action_for_cmd(cmd)
-                        print(f"[APPCOMMAND] cmd={cmd} action={action_name}", flush=True)
-                        entry = actions.get(action_name)
-                        if entry is not None:
-                            self._appcmd_pending.append(entry)
-                            return 1
-                    if self._appcmd_old_proc:
-                        return user32.CallWindowProcW(self._appcmd_old_proc, hwnd_arg, msg, wparam, lparam)
-                except Exception as e:
-                    print(f"⚠ Error handling window message (msg={msg}): {e}", flush=True)
-                return 0
-
-            # Keep a strong reference before installing — a GC'd ctypes callback
-            # crashes the app on the next message delivered to this window.
-            self._appcmd_wndproc = WNDPROC(wndproc_callback)
-            callback_ptr = ctypes.cast(self._appcmd_wndproc, ctypes.c_void_p).value
-
-            ctypes.set_last_error(0)
-            old_proc = set_window_long(hwnd, GWLP_WNDPROC, callback_ptr)
-            if old_proc == 0 and ctypes.get_last_error() != 0:
-                print("⚠ Media transport hook disabled: SetWindowLong failed")
-                self._appcmd_wndproc = None
-                return
-
-            self._appcmd_hwnd = hwnd
-            self._appcmd_old_proc = old_proc
-            self._appcmd_set_window_long = set_window_long
+        self._appcmd_hook = appcommand_hook.install(self.root, self._queue_appcommand)
+        if self._appcmd_hook is not None:
             print("✓ Media transport hook enabled — F5-F8 + dial (reacts to whatever fnlock sends)")
-            self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
-        except Exception as e:
-            print(f"⚠ Media transport hook disabled: {e}")
-            self._appcmd_wndproc = None
-            self._appcmd_old_proc = None
+        # The poller runs either way: the skinned main window's hook feeds the same queue.
+        self._appcmd_poll_job = self.root.after(50, self._poll_appcommand_pending)
+
+    def _queue_appcommand(self, cmd):
+        """Record a WM_APPCOMMAND for _poll_appcommand_pending; True when it is one of ours.
+
+        Runs inside a window procedure, reentrantly within Tcl's message wait: it must not
+        touch Tk at all (see appcommand_hook), so it only appends to the deque.
+        """
+        action_name = appcommand.action_for_cmd(cmd)
+        print(f"[APPCOMMAND] cmd={cmd} action={action_name}", flush=True)
+        # Labels are generic (not "(dial)") because this same WM_APPCOMMAND path
+        # handles both the hardware dial and F5-F8 (fnlock forwards both the
+        # same way) — nothing here can tell which physical control sent it.
+        entry = {
+            'play_pause': (self.toggle_play_pause, 'Play/Pause'),
+            'next': (self.next_track, 'Next'),
+            'previous': (self.previous_track, 'Previous'),
+            'stop': (self.stop, 'Stop'),
+        }.get(action_name)
+        if entry is None:
+            return False
+        self._appcmd_pending.append(entry)
+        return True
 
     def _poll_appcommand_pending(self):
         """Dispatch media-dial actions recorded by the WNDPROC hook.

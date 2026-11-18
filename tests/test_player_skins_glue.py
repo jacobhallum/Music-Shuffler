@@ -42,13 +42,46 @@ def _player(base):
         is_temp_view=False, filtered_playlist=[], queued_count=0, library_index=None, _album_browsers=[],
         albums_browser=None, settings_menu=tk.Menu(win, tearoff=0), search_var=tk.StringVar(win),
         audio_settings={'eq_enabled': True, 'eq_bands_db': [0.0] * 10, 'eq_preamp_db': 0.0},
-        _eq_presets=lambda: {'Flat': ([0.0] * 10, 0.0)})
+        _eq_presets=lambda: {'Flat': ([0.0] * 10, 0.0)},
+        _queue_appcommand=lambda cmd: calls.append(('appcommand', cmd)) or True)
     for name in ('previous_track', 'play', 'pause', 'stop', 'next_track', 'apply_shuffle', '_on_close',
                  'toggle_loved', 'open_stats_window', 'toggle_play_pause', '_import_eqf', 'apply_eq',
                  '_play_first_result', '_takeover_playlist', 'play_track_at_index', 'apply_theme',
                  'queue_track', '_album_action'):
         setattr(p, name, stub(name))
     return p
+
+
+def _user32():
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.WinDLL('user32')
+    u.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+    u.GetAncestor.restype = wintypes.HWND
+    u.IsWindowVisible.argtypes = [wintypes.HWND]
+    u.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    u.SendMessageW.restype = ctypes.c_ssize_t
+    return u
+
+
+def _fnlock_targets(windows):
+    """Frames of the given Tk windows that fn-lock's lookup could pick: visible, title starting "Music Player V2"."""
+    import ctypes
+    u, out = _user32(), []
+    for w in windows:
+        if w is None:
+            continue
+        hwnd = u.GetAncestor(w.winfo_id(), 2)
+        buf = ctypes.create_unicode_buffer(256)
+        u.GetWindowTextW(hwnd, buf, 256)
+        if u.IsWindowVisible(hwnd) and buf.value.startswith('Music Player V2'):
+            out.append(hwnd)
+    return out
+
+
+def _send_appcommand(hwnd, cmd):
+    _user32().SendMessageW(hwnd, 0x0319, hwnd, cmd << 16)
 
 
 @unittest.skipIf(_root is None, "no display")
@@ -117,6 +150,46 @@ class SkinControllerTests(unittest.TestCase):
         self.c.pick('syn.wsz')
         self.assertEqual(self.p.root.title(), 'Music Player V2')
         self.assertNotEqual(self.c.main.title(), 'Music Player V2')
+
+    def fnlock_keys_reach_player(self):
+        """fn-lock (AutoHotkey) sends F5-F8 / the dial to the first *visible* window whose title *starts with*
+        "Music Player V2". Every window of ours it could pick must hand the key to the player."""
+        _root.update()
+        targets = _fnlock_targets([self.p.root, self.c.main, self.c.eq, self.c.pl])
+        self.assertTrue(targets, 'fn-lock finds no window while skinned')
+        before = self.p.calls.count(('appcommand', 14))
+        for hwnd in targets:
+            _send_appcommand(hwnd, 14)
+        self.assertEqual(self.p.calls.count(('appcommand', 14)) - before, len(targets))
+
+    @unittest.skipIf(sys.platform != 'win32', 'Windows only')
+    def test_fnlock_keys_reach_player_while_skinned(self):
+        self.c.pick('syn.wsz')
+        self.fnlock_keys_reach_player()
+
+    @unittest.skipIf(sys.platform != 'win32', 'Windows only')
+    def test_fnlock_keys_reach_player_after_size_change(self):
+        self.c.pick('syn.wsz')
+        self.c.set_size(3)
+        self.fnlock_keys_reach_player()
+
+    @unittest.skipIf(sys.platform != 'win32', 'Windows only')
+    def test_failed_enter_takes_the_key_hook_off(self):
+        loaded = skin_mode.skin_lib.load_skin(os.path.join(self.tmp.name, 'skins', 'syn.wsz'))
+        with unittest.mock.patch.object(self.c, '_later_keep_reachable', side_effect=RuntimeError('late')):
+            reason = self.c.enter(loaded)       # fails after the hook went on
+        self.assertIn('late', reason)
+        self.assertFalse(self.c.active)
+        self.assertIsNone(self.c._key_hook)
+
+    @unittest.skipIf(sys.platform != 'win32', 'Windows only')
+    def test_fnlock_keys_reach_player_after_leaving_and_coming_back(self):
+        self.c.pick('syn.wsz')
+        _root.update()
+        self.c.pick(None)
+        self.assertIsNone(self.c._key_hook)
+        self.c.pick('syn.wsz')
+        self.fnlock_keys_reach_player()
 
     def test_status_goes_to_marquee_while_skinned(self):
         self.c.pick('syn.wsz')
