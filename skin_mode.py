@@ -1,7 +1,7 @@
 """
 skin_mode.py - runs the player in a classic Winamp skin.
 
-SkinController owns the skinned windows (main, EQ, playlist, Albums) and the saved choice in ui_settings.json. When a
+SkinController owns the skinned windows (main, EQ, playlist, album cover, Albums) and the saved choice in ui_settings.json. When a
 skin is picked it is saved and the default view (the root window) is withdrawn; the root keeps its title, media-key
 hook and single-instance mutex, so a second launch still reaches the player (a second launch that shows the root is
 turned back into raising the skinned main window). fn-lock skips hidden windows, so while skinned it sends F5-F8 and
@@ -22,10 +22,12 @@ from tkinter import messagebox, ttk
 from types import SimpleNamespace
 
 import appcommand_hook
+import cover_art
 import skin as skin_lib
 import skin_layout
 import skin_math
 from albums_browser import AlbumsBrowser
+from skin_cover import COVER_HEIGHT, SkinCoverWindow
 from skin_playlist import SkinPlaylistWindow
 from skin_ui import SkinEqWindow, SkinMainWindow
 
@@ -33,10 +35,11 @@ REFRESH_MS = 250
 VIS_MS = 33
 KEEP_MS = 60          # after a move: let docked windows follow before pulling title bars back on screen
 VIS_MODES = ('spectrum', 'scope', 'off')
+_ASK = object()               # _place_cover: work out the Albums snapshot itself
 SAMPLE_RATE = 48000          # the engine's output format: 48 kHz stereo float32
 SIZES = (1, 2, 3)     # whole-number scales only: nearest-neighbour pixels stay crisp
 DEFAULTS = {'skin': None, 'size': 1, 'always_on_top': False, 'vis_mode': 'spectrum',
-            'eq_open': True, 'pl_open': True, 'positions': {}, 'pl_height': 232}
+            'eq_open': True, 'pl_open': True, 'cover_open': True, 'positions': {}, 'pl_height': 232}
 
 
 def _log(text):
@@ -69,7 +72,7 @@ def load_settings(path):
     if isinstance(name, str) and name.lower().endswith('.wsz') and os.path.basename(name) == name \
             and '/' not in name and '\\' not in name:
         out['skin'] = name
-    for k in ('always_on_top', 'eq_open', 'pl_open'):
+    for k in ('always_on_top', 'eq_open', 'pl_open', 'cover_open'):
         if isinstance(data.get(k), bool):
             out[k] = data[k]
     if _is_int(data.get('size')) and data['size'] in SIZES:
@@ -233,7 +236,10 @@ class SkinController:
         self.settings_path = os.path.join(base, 'ui_settings.json')
         self.settings = load_settings(self.settings_path)
         self.skin = None
-        self.main = self.eq = self.pl = self.albums = None
+        self.main = self.eq = self.pl = self.cover = self.albums = None
+        self._cover_side = 'right'    # where the album cover docks: 'above' main at 1x, 'right' or 'left' of it above
+        self._cover_key = None        # what the cover window shows now: (id(source), scale, skin name)
+        self._cover_src = None        # ... and that source, held so its id stays unique
         self._chunks = collections.deque(maxlen=4)
         self._jobs = {}               # loop name -> its pending after() id
         self._map_bind = None
@@ -362,19 +368,19 @@ class SkinController:
         return self._alive(self.main)
 
     def _check_windows(self):
-        """A skinned window destroyed behind our back: forget a lost EQ/playlist/Albums; a lost main window brings
-        the default view back. Returns False when skin mode ended."""
+        """A skinned window destroyed behind our back: forget a lost EQ/playlist/cover/Albums; a lost main window
+        brings the default view back. Returns False when skin mode ended."""
         if not self._main_alive():
             _log("⚠ The skin's main window was closed from outside - back to the default view")
             self._back_to_default("The skin window was closed - default view")
             return False
         lost = False
-        for name in ('eq', 'pl', 'albums'):
+        for name in ('eq', 'pl', 'cover', 'albums'):
             if getattr(self, name) is not None and not self._alive(getattr(self, name)):
                 setattr(self, name, None)
                 lost = True
-                if name == 'eq':
-                    self.settings['eq_open'] = False
+                if name in ('eq', 'cover'):
+                    self.settings[f'{name}_open'] = False
         if self.pl is None:              # the playlist is always open: bring it back
             self._open_pl()
             self._apply_topmost()
@@ -432,6 +438,8 @@ class SkinController:
         if self.settings['eq_open']:
             self._open_eq()
         self._open_pl()                  # always open while skinned
+        if self.settings['cover_open']:
+            self._open_cover()
         self._apply_topmost()
         p.root.withdraw()
         if self._map_bind is None:
@@ -470,7 +478,7 @@ class SkinController:
         if self._key_hook is not None:
             self._key_hook.remove()
             self._key_hook = None
-        for name in ('albums', 'pl', 'eq', 'main'):
+        for name in ('albums', 'cover', 'pl', 'eq', 'main'):
             w = getattr(self, name)
             if w is not None:
                 try:
@@ -593,6 +601,50 @@ class SkinController:
         self._layout_stack()
         self._last_rows = None
 
+    def _open_cover(self):
+        """The current song's album cover in a plain playlist frame, docked beside the stack."""
+        self.cover = SkinCoverWindow(self.p.root, self.skin, self.scale(), {
+            'close': self.toggle_cover, 'menu': self._menu_adapter,
+            'drag': lambda x, y: self._drag_stack(self.cover, x, y),
+            'moved': lambda x, y: self._snap(self.main, 'main')})
+        self._skin_toplevel(self.cover, self.toggle_cover)
+        self._cover_key = None
+        self._layout_stack()
+        self._paint_cover()
+
+    def toggle_cover(self):
+        if self.cover is not None:
+            self.cover.destroy()
+            self.cover = None
+            self._cover_key = self._cover_src = None
+        else:
+            hold = self._albums_hold()
+            self._open_cover()
+            self._place_cover(hold)
+            self._apply_topmost()
+            self._later_keep_reachable()
+        self.settings['cover_open'] = self.cover is not None
+        self.save()
+
+    def _cover_source(self):
+        """The song's own cover while one is playing or paused, else the app's Deep Cuts art (None: plain)."""
+        p = self.p
+        art = getattr(p, 'current_artwork_image', None)
+        if p._playback_state in ('playing', 'paused') and art is not None:
+            return art
+        return getattr(p, '_fallback_artwork_image', None)
+
+    def _paint_cover(self):
+        """Render the cover into its window, only when the picture, the size or the skin changed."""
+        if not self._alive(self.cover):
+            return
+        src, s = self._cover_source(), self.scale()
+        key = (id(src), s, getattr(self.skin, 'name', None))
+        if key == self._cover_key:
+            return
+        self.cover.set_picture(cover_art.render_square(src, cover_art.ART * s, self.skin.pledit['normalbg']))
+        self._cover_key, self._cover_src = key, src
+
     def toggle_eq(self):
         if self.eq is not None:
             self.eq.destroy()
@@ -617,12 +669,12 @@ class SkinController:
             self.albums = None
             return
         s = self.scale()
-        win = SkinFrameWindow(self.p.root, self.skin, s, {'close': self.toggle_albums, 'menu': self.show_menu},
+        win = SkinFrameWindow(self.p.root, self.skin, s, {'close': self.toggle_albums, 'menu': self._menu_adapter},
                               height=290)
         pos = self.settings['positions'].get('albums')
-        if pos is None:
-            self.main.update_idletasks()
-            pos = (self.main.winfo_x() + 275 * s, self.main.winfo_y())
+        if pos is None:                  # right of the whole stack: of the cover when it's on the right, else of main
+            origin = self._main_origin()
+            pos = (max(x + w for x, _y, w, _h in self._stack_rects(origin)), origin[1])
         win.geometry(f'+{pos[0]}+{pos[1]}')
         self._skin_toplevel(win, self.toggle_albums)
         c = self.skin.pledit
@@ -648,9 +700,8 @@ class SkinController:
 
     def _apply_topmost(self):
         on = self.settings['always_on_top']
-        for w in (self.main, self.eq, self.pl, self.albums):
-            if w is not None:
-                w.attributes('-topmost', on)
+        for w in self._windows():
+            w.attributes('-topmost', on)
 
     def cycle_size(self):
         """The D button: 1x -> 2x -> 3x -> 1x."""
@@ -660,12 +711,13 @@ class SkinController:
         if size not in SIZES:
             return
         self._remember_positions()
+        hold = self._albums_hold()
         self.settings['size'] = size
         s = self.scale()
-        for w in (self.main, self.eq, self.pl, self.albums):
-            if w is not None:
-                w.set_skin(self.skin, s)
+        for w in self._windows():
+            w.set_skin(self.skin, s)
         self._layout_stack()
+        self._place_cover(hold)
         self.save()
         self._refresh()
         self._later_keep_reachable()
@@ -686,6 +738,10 @@ class SkinController:
 
     # ---- menus -------------------------------------------------------------------------
 
+    def _menu_adapter(self, x_root, y_root, *_):
+        """The cover and Albums frames report a right-click as (x_root, y_root, row): both get the main menu."""
+        self.show_menu(x_root, y_root)
+
     def show_menu(self, x_root, y_root):
         p = self.p
         menu = tk.Menu(self.main, tearoff=0)
@@ -698,6 +754,9 @@ class SkinController:
         menu.add_command(label="Listening Stats…", command=p.open_stats_window)
         menu.add_checkbutton(label="Equalizer", command=self.toggle_eq,
                              variable=tk.BooleanVar(menu, value=self.eq is not None))
+        cover_var = tk.BooleanVar(menu, value=self.cover is not None)
+        menu._cover_var = cover_var          # keep the variable alive while the menu is up
+        menu.add_checkbutton(label="Album art", command=self.toggle_cover, variable=cover_var)
         menu.add_separator()
         skins = tk.Menu(menu, tearoff=0)
         self.fill_skins_menu(skins)
@@ -871,6 +930,7 @@ class SkinController:
             self._last_icon = icon
         if self.pl is not None:
             self._sync_pl()
+        self._paint_cover()
 
     def _vis_tick(self):
         mode = self.settings['vis_mode']
@@ -895,13 +955,14 @@ class SkinController:
     # ---- snapping and docking ----------------------------------------------------------------
 
     def _windows(self):
-        return [w for w in (self.main, self.eq, self.pl, self.albums) if w is not None]
+        return [w for w in (self.main, self.eq, self.pl, self.cover, self.albums) if w is not None]
 
     def _rect(self, w):
         return (w.winfo_x(), w.winfo_y(), w.winfo_width(), w.winfo_height())
 
     def _snap(self, win, name):
-        others = [self._rect(w) for w in self._windows() if w is not win]
+        own = [m[0] for m in self._stack_members()] if win is self.main else []    # never snap to its own stack
+        others = [self._rect(w) for w in self._windows() if w is not win and not any(w is o for o in own)]
         r = self._rect(win)
         screen = _area_of(r, work_areas(win)) or (0, 0, win.winfo_screenwidth(), win.winfo_screenheight())
         x, y = skin_math.snap(r, others, screen)
@@ -913,42 +974,118 @@ class SkinController:
     def _later_keep_reachable(self):
         self.p.root.after(KEEP_MS, self._keep_reachable)
 
-    # ---- the stack: main on top, EQ under it when open, the playlist at the bottom ----------
+    # ---- the stack: main, EQ under it when open, the playlist at the bottom; the cover on top (1x) or beside main ----
 
-    def _stack_offsets(self):
-        """(window, y offset under the main window's top, height) for EQ (when open) and the playlist, in order."""
+    def _stack_members(self):
+        """(window, dx, dy, w, h) of every window docked to the main window, from its top-left: EQ (when open) and
+        the playlist flush under it; the album cover flush on top of it at 1x, level with it on its side above 1x."""
         s = self.scale()
         out, y = [], 116 * s
         for w in (self.eq, self.pl):
             if self._alive(w):
                 h = (116 if w is self.eq else w.height) * s
-                out.append((w, y, h))
+                out.append((w, 0, y, 275 * s, h))
                 y += h
+        if self._alive(self.cover):
+            if s == 1:                   # 1x: on top of the stack (Jacob 2026-11-16); 2x and up: beside main
+                out.append((self.cover, 0, -COVER_HEIGHT, 275, COVER_HEIGHT))
+            else:
+                dx = -275 * s if self._cover_side == 'left' else 275 * s
+                out.append((self.cover, dx, 0, 275 * s, COVER_HEIGHT * s))
         return out
 
     def _stack_rects(self, origin):
         x, y = origin
         s = self.scale()
-        return [(x, y, 275 * s, 116 * s)] + [(x, y + off, 275 * s, h) for _w, off, h in self._stack_offsets()]
+        return [(x, y, 275 * s, 116 * s)] + [(x + dx, y + dy, w, h) for _w, dx, dy, w, h in self._stack_members()]
 
     def _layout_stack(self, origin=None):
-        """Put EQ and the playlist flush under the main window (same left edge). origin: the main window's
-        top-left when it was just moved and Tk doesn't report the new spot yet."""
+        """Put every stack member in its spot around the main window. origin: the main window's top-left when it
+        was just moved and Tk doesn't report the new spot yet."""
         if not self._main_alive():
             return
         if origin is None:
             self.main.update_idletasks()
             origin = (self.main.winfo_x(), self.main.winfo_y())
         mx, my = origin
-        for w, off, _h in self._stack_offsets():
-            if (w.winfo_x(), w.winfo_y()) != (mx, my + off):
-                w.geometry(f'+{mx}+{my + off}')
+        for w, dx, dy, _w, _h in self._stack_members():
+            if (w.winfo_x(), w.winfo_y()) != (mx + dx, my + dy):
+                w.geometry(f'+{mx + dx}+{my + dy}')
 
     def _drag_stack(self, win, x, y):
-        """EQ's or the playlist's title bar dragged so the window would sit at (x, y): move the whole stack."""
-        off = next((o for w, o, _h in self._stack_offsets() if w is win), None)
+        """A stack member's title bar dragged so the window would sit at (x, y): move the whole stack."""
+        off = next(((dx, dy) for w, dx, dy, _w, _h in self._stack_members() if w is win), None)
         if off is not None and self._main_alive():
-            self.main.geometry(f'+{x}+{y - off}')
+            self.main.geometry(f'+{x - off[0]}+{y - off[1]}')
+
+    def _main_origin(self):
+        self.main.update_idletasks()
+        return (self.main.winfo_x(), self.main.winfo_y())
+
+    def _place_cover(self, albums_hold=_ASK):
+        """Pick the cover's side for where the main window is now: at 1x always on top of main; above 1x right when
+        it fits on main's monitor, else left, else slide the stack sideways until a right cover fits. Then keep a docked
+        Albums window on the stack.
+        albums_hold: _albums_hold() from before the caller changed any geometry (worked out here when not given).
+        Runs when a move ends, never during a drag."""
+        if not self._main_alive():
+            return
+        if albums_hold is _ASK:
+            albums_hold = self._albums_hold()
+        s = self.scale()
+        origin = self._main_origin()
+        dx = 0
+        if self._alive(self.cover):
+            if s == 1:
+                self._cover_side = 'above'
+            else:
+                main_rect = (origin[0], origin[1], 275 * s, 116 * s)
+                self._cover_side, dx = skin_math.cover_spot(main_rect, 275 * s, work_areas(self.main))
+            if dx:
+                origin = (origin[0] + dx, origin[1])
+                self._main_pos = origin      # moved here with its stack: <Configure> must not move Albums again
+                self.main.geometry(f'+{origin[0]}+{origin[1]}')
+                self.settings['positions']['main'] = list(origin)
+            self._layout_stack(origin)
+        self._reattach_albums(albums_hold, origin, dx)
+
+    def _albums_hold(self):
+        """How a docked Albums window hangs on the stack, taken before the stack changes shape: 'right' or 'left'
+        when it sits against that outer edge of the whole stack, 'other' when docked elsewhere (above or below),
+        None when it isn't docked."""
+        if not (self._main_alive() and self._alive(self.albums)):
+            return None
+        rects = self._stack_rects(self._main_origin())
+        if not self._albums_docked(rects):
+            return None
+        ax, _ay, aw, _ah = self._rect(self.albums)
+        if ax >= max(x + w for x, _y, w, _h in rects):
+            return 'right'
+        if ax + aw <= min(x for x, _y, _w, _h in rects):
+            return 'left'
+        return 'other'
+
+    def _reattach_albums(self, hold, origin, dx=0):
+        """After the stack changed shape (cover shown, flipped, resized, stack slid): put a docked Albums window back
+        against the outer edge it was on; docked elsewhere, it follows a slide and steps sideways past the cover
+        when it would overlap it."""
+        if hold is None or not self._alive(self.albums):
+            return
+        ax, ay, aw, ah = self._rect(self.albums)
+        rects = self._stack_rects(origin)
+        if hold == 'right':
+            ax = max(x + w for x, _y, w, _h in rects)
+        elif hold == 'left':
+            ax = min(x for x, _y, _w, _h in rects) - aw
+        else:
+            ax += dx
+            cover = next(((origin[0] + mdx, origin[1] + mdy, mw, mh)
+                          for w, mdx, mdy, mw, mh in self._stack_members() if w is self.cover), None)
+            if cover is not None and _overlap((ax, ay, aw, ah), cover) > 0:
+                ax = cover[0] - aw if self._cover_side == 'left' else cover[0] + cover[2]
+        if (ax, ay) != (self.albums.winfo_x(), self.albums.winfo_y()):
+            self.albums.geometry(f'+{ax}+{ay}')
+            self.settings['positions']['albums'] = [ax, ay]
 
     def _albums_docked(self, stack_rects):
         if not self._alive(self.albums):
@@ -959,9 +1096,17 @@ class SkinController:
     def _keep_reachable(self):
         """Pull title bars back where the mouse can grab them (off an edge, under the taskbar, on a monitor that is
         gone). The stack moves as one and always ends with the main window reachable; Albums moves with it when
-        docked, else on its own."""
-        if not self._main_alive():
-            return
+        docked, else on its own. The cover's side is picked first; when the pull moved the main window (maybe onto
+        another monitor) the side is picked again and the pull re-checked, once."""
+        for _ in range(2):
+            if not self._main_alive():
+                return
+            self._place_cover()
+            if not self._pull_back():
+                return
+
+    def _pull_back(self):
+        """One reachability pass (see _keep_reachable). True when it moved the main window."""
         self.main.update_idletasks()
         areas = work_areas(self.main)
         grip = 14 * self.scale()
@@ -1005,6 +1150,7 @@ class SkinController:
             self.main.update_idletasks()
             self._main_pos = (self.main.winfo_x(), self.main.winfo_y())   # where it really is, moved or not
             self.save()
+        return (dx, dy) != (0, 0)
 
     def _on_main_configure(self, event):
         """The stack follows the main window (and its size); a docked Albums window moves with it too."""

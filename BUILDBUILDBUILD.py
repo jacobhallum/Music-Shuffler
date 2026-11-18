@@ -46,8 +46,11 @@ def build_exe():
         "--clean",                          # Clean cache
         f"--icon={icon_path}",              # Exe file icon
         f"--add-data={icon_path};assets",   # Bundle for the live taskbar-icon fallback (sys._MEIPASS)
-        str(script_path)
     ]
+    cover_path = Path(__file__).parent / "assets" / "app_icon_1024.png"
+    if cover_path.exists():                 # the skins' cover window shows it when a song has no cover
+        cmd.append(f"--add-data={cover_path};assets")
+    cmd.append(str(script_path))
     
     # Run PyInstaller
     try:

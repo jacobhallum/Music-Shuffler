@@ -1,6 +1,7 @@
 """
 skin_math.py - math for Winamp-style skinned windows: snapping, docking and
 the classic visualizer (19-bar spectrum and oscilloscope line, 76x16 pixels).
+Also: where an album-cover window docks (area_for, cover_spot) and how a picture fits a square (fit_box).
 
 Pure functions, standard library only.
 """
@@ -89,6 +90,54 @@ def dock_group(index, rects):
                 group.add(other)
                 frontier.append(other)
     return group
+
+
+def area_for(rect, areas):
+    """The area of `areas` that overlaps `rect` most; when none overlaps, the nearest one (smallest sum of the
+    x and y gaps). None when `areas` is empty."""
+    x, y, w, h = rect
+    best_overlap = 0
+    best_gap = None
+    best = None
+    for area in areas:
+        ax, ay, aw, ah = area
+        overlap = max(0, min(x + w, ax + aw) - max(x, ax)) * max(0, min(y + h, ay + ah) - max(y, ay))
+        gap_x = max(0, ax - (x + w), x - (ax + aw))
+        gap_y = max(0, ay - (y + h), y - (ay + ah))
+        gap = gap_x + gap_y
+        if best is None or overlap > best_overlap or (overlap == best_overlap and overlap == 0 and gap < best_gap):
+            best_overlap = overlap
+            best_gap = gap
+            best = area
+    return best
+
+
+def cover_spot(main_rect, cover_w, areas):
+    """('right' or 'left', dx): the side of the main window the cover goes on, and how far the main window
+    slides sideways (0 unless neither side fits)."""
+    mx, my, mw, mh = main_rect
+    area = area_for(main_rect, areas)
+    if area is None:
+        return ('right', 0)
+    ax, ay, aw, ah = area
+    if ax <= mx + mw and mx + mw + cover_w <= ax + aw:
+        return ('right', 0)
+    elif ax <= mx - cover_w and mx <= ax + aw:
+        return ('left', 0)
+    elif mw + cover_w <= aw:
+        nx = min(max(mx, ax), ax + aw - mw - cover_w)
+        return ('right', int(nx - mx))
+    else:
+        return ('right', 0)
+
+
+def fit_box(src_w, src_h, size):
+    """(x, y, w, h) of a src_w x src_h picture scaled to fit inside a size x size square, centered; never
+    narrower or shorter than 1 px."""
+    k = min(size / src_w, size / src_h)
+    w = max(1, round(src_w * k))
+    h = max(1, round(src_h * k))
+    return ((size - w) // 2, (size - h) // 2, w, h)
 
 
 def fft(values):
